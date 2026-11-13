@@ -1,0 +1,24 @@
+1 ICON "../launcher/Assets/Jinra.ico"
+1 VERSIONINFO
+FILEVERSION 0,1,6,0
+PRODUCTVERSION 0,1,6,0
+FILEFLAGSMASK 0x3fL
+FILEOS 0x40004L
+FILETYPE 0x1L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "FileDescription", "Jinra-Recomp"
+            VALUE "ProductName", "Jinra-Recomp"
+            VALUE "FileVersion", "0.1.6"
+            VALUE "ProductVersion", "0.1.6"
+            VALUE "OriginalFilename", "Jinra-Recomp.exe"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

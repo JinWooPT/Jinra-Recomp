@@ -1,0 +1,26 @@
+[
+  {
+    "name": "python",
+    "file": "python/python.exe",
+    "prefix": "python/",
+    "packaged_tools": true,
+    "size": 55961280,
+    "sha256": "c0eb2e3fbabae82cb7d3dc61ec4b0e9b4b854269d9c38c3bbcc5a08e4497bd12"
+  },
+  {
+    "name": "cpm",
+    "file": "cpm/dav1d/1.5.4/lib/libdav1d.a",
+    "prefix": "cpm/",
+    "packaged_tools": true,
+    "size": 19584775,
+    "sha256": "73d3c9f5a31d715296060d0faa12b0235b226696364d3e118f6cea6ea96cbcfa"
+  },
+  {
+    "name": "llvm",
+    "file": "llvm/bin/clang.exe",
+    "prefix": "llvm-mingw-20261104-ucrt-x86_64/",
+    "size": 191037046,
+    "sha256": "552191b5754c49a5a20723276a6fc56541ea1922c4c50b7b669022333fc1b40f",
+    "url": "https://github.com/mstorsjo/llvm-mingw/releases/download/20261104/llvm-mingw-20261104-ucrt-x86_64.zip"
+  }
+]

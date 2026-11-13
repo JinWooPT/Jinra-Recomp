@@ -198,7 +198,7 @@ def version_text(folder, log=None):
     """The version the game's last run said (its log's first line: the version and its source), else jinra_version.txt's"""
     log = _log_lines(folder) if log is None else log
     for line in log[:5]:
-        m = re.search(r"\bjinra (\S+(?: \(source [0-9a-f]+\))?)", line)
+        m = re.search(r"\bJinra-Recomp (\S+(?: \(source [0-9a-f]+\))?)", line)
         if m:
             return m.group(1)
     try:

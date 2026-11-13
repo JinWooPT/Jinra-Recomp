@@ -1,5 +1,5 @@
 """Offline profile of a thread sampled with HOS_SAMPLE + HOS_SAMPLE_FILE (host/mkw_glue.c, mkw-recomp work/prof.py): each line is a stack of
-module+offset frames, leaf first. Frames in jinra_vk.dll / jinra.exe are named from the linker maps beside them;
+module+offset frames, leaf first. Frames in jinra_vk.dll / Jinra-Ocarina.exe are named from the linker maps beside them;
 on Linux, frames in jinra_vk.so / jinra from the binaries' own symbols (nm). RX_MAPS=<folder>: another build's
 maps or binaries (on Linux, the game folder).
 
@@ -29,7 +29,7 @@ def load_map(path, base):
 
 
 # The modules whose frames are Jinra's own code (the game and the runtime, the renderer): Windows, then Linux
-GAME_MODS = ("jinra.exe", "jinra")
+GAME_MODS = ("Jinra-Ocarina.exe", "jinra")
 VK_MODS = ("jinra_vk.dll", "jinra_vk.so")
 RUN_MODS = GAME_MODS + VK_MODS
 # A sample whose leaf is outside Jinra is a wait only when a wait is on its stack: libc's memcpy and the driver's own
@@ -45,7 +45,7 @@ def waiting(leaf_module, names):
     if leaf_module in RUN_MODS:
         return False
     for n in names:
-        if n.startswith(("jinra:", "jinra_vk:", "jinra.exe:", "jinra_vk.dll:")):
+        if n.startswith(("jinra:", "jinra_vk:", "Jinra-Ocarina.exe:", "jinra_vk.dll:")):
             return n.endswith(WAIT_FRAMES)
     return True   # (no frame of Jinra's at all: a thread blocked outside it)
 
@@ -72,7 +72,7 @@ def load_symbols(folder=None):
     Windows build, the binaries of the Linux one"""
     folder = folder or os.environ.get("RX_MAPS", BUILD)
     maps = {}
-    for mod in ("jinra_vk.dll", "jinra.exe"):
+    for mod in ("jinra_vk.dll", "Jinra-Ocarina.exe"):
         mp = os.path.join(folder, mod[:-4] + ".map")
         if os.path.exists(mp):
             maps[mod] = load_map(mp, 0x180000000 if mod.endswith(".dll") else 0x140000000)

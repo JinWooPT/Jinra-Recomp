@@ -3,7 +3,7 @@ and renderer thread, "<ms> <name>|<frames>" (module+offset, leaf first).
 
     python -I scripts/crit.py work/runs/<run>_all.txt [top]
 
-A thread is blocked at an instant when its leaf is outside jinra.exe / jinra_vk.dll (on Linux jinra /
+A thread is blocked at an instant when its leaf is outside Jinra-Ocarina.exe / jinra_vk.dll (on Linux jinra /
 jinra_vk.so) and the innermost frame of Jinra's under it is a wait (prof.WAIT_FRAMES: a condition variable, a
 sleep, a fence, the present); running otherwise, libc's copies and the driver's own work included. RX_MAPS=<folder>: another build's linker maps, or on Linux the game folder (its binaries' symbols). Prints each thread's running share;
 then for the instants when no game thread runs (the frame waits on something outside the game's CPU work): what each

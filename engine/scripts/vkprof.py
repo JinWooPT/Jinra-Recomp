@@ -1,6 +1,6 @@
 """The renderer's threads from an all-thread sample (host/mkw_glue.c HOS_SAMPLE_ALL): for the threads whose name starts
 with a prefix (default mkw_vk), the share of samples running, and the functions by inclusive and self share of the
-running samples (leaf in jinra_vk.dll, jinra.exe or the driver; on Linux jinra_vk.so, jinra or the driver).
+running samples (leaf in jinra_vk.dll, Jinra-Ocarina.exe or the driver; on Linux jinra_vk.so, jinra or the driver).
 
     python -I scripts/vkprof.py work/runs/<run>_all.txt [top 40] [prefix mkw_vk]
     (RX_MAPS=<folder>: another build's linker maps, or on Linux the game folder)

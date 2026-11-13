@@ -1,6 +1,6 @@
 """The CPU report: where the game's CPU time goes, by category, thread and function, from all-thread sampled runs.
 
-    python -I scripts/cpu_report.py <run folder>... --maps <folder with jinra.map, jinra_vk.map> --out report.md
+    python -I scripts/cpu_report.py <run folder>... --maps <folder with Jinra-Ocarina.map, jinra_vk.map> --out report.md
         [--csv <folder>] [--functions scripts/cpu_functions.json] [--readobj <llvm-readobj>] [--top 40] [--cover 0.9]
 
 A run folder holds the sampler's file (HOS_SAMPLE_ALL: `all.txt`, or `*_all.txt`), and, when the run was measured by
@@ -91,7 +91,7 @@ class Names:
     def __init__(self, maps_dir, readobj=None, game_detail=False):
         self.game_detail = game_detail   # (False: every lifted function is one row, LIFTED; no guest address is printed)
         self.syms = {}
-        for mod, mp in (("jinra.exe", "jinra.map"), ("jinra_vk.dll", "jinra_vk.map")):
+        for mod, mp in (("Jinra-Ocarina.exe", "Jinra-Ocarina.map"), ("jinra_vk.dll", "jinra_vk.map")):
             p = os.path.join(maps_dir, mp)
             if os.path.exists(p):
                 self.syms[mod] = load_map(p)
@@ -214,7 +214,7 @@ def guest_trust(sym):
 
 
 OURS = ("game/", "runtime/", "os/", "render/", "tooling/", "unclassified")
-OUR_MODULES = ("jinra.exe", "jinra_vk.dll", "jinra", "jinra_vk.so")
+OUR_MODULES = ("Jinra-Ocarina.exe", "jinra_vk.dll", "jinra", "jinra_vk.so")
 
 
 def is_ours(cat):
@@ -533,7 +533,7 @@ def main():
         raise SystemExit("no runs")
     if not any(m in names.syms and names.syms[m][0] for m in OUR_MODULES):
         # (a Linux capture names jinra / jinra_vk.so, whose ELF maps this script does not read yet)
-        raise SystemExit("no linker map of jinra.exe or jinra_vk.dll in --maps: cpu_report.py reads Windows captures "
+        raise SystemExit("no linker map of Jinra-Ocarina.exe or jinra_vk.dll in --maps: cpu_report.py reads Windows captures "
                          "with lld-link maps only")
 
     def share(run, view, key):   # (% of one core)

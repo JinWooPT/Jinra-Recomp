@@ -1,9 +1,9 @@
-# A test run of the standalone build (mkw-recomp's work/run-vk.ps1, for jinra.exe): the Vulkan back end
+# A test run of the standalone build (mkw-recomp's work/run-vk.ps1, for Jinra-Ocarina.exe): the Vulkan back end
 # (RX_BACKEND=vulkan), headless unless -Window (then it never takes focus), High priority (-Priority), muted unless
 # -Sound, screenshots every -ShotEvery presents into work\runs\<name>\shots. Extra environment: -Env "A=1;B=2".
 #
 # Guards (the PC is the user's, and one game runs at a time): no run while Rainbow Six Siege is open, nor while
-# another session's mkw.exe or jinra.exe runs (-Force overrides both); the game is stopped when its working set passes
+# another session's mkw.exe or Jinra-Ocarina.exe runs (-Force overrides both); the game is stopped when its working set passes
 # -MaxGB. Delete work\runs\<name>\shots once the shots are looked at: they reach gigabytes.
 param([int]$Seconds = 120, [string]$Name = "vk", [int]$ShotEvery = 300, [string]$Env = "", [switch]$Window,
       [int]$MaxGB = 10, [switch]$Force, [switch]$Sound, [string]$Romfs = "", [string]$Priority = "High")
@@ -22,7 +22,7 @@ if (-not $Romfs) {   # (the dump's romfs, from work\dump.txt: nx2/dump.py --set)
     $dump = (Get-Content $cfg | Where-Object { $_ -and -not $_.StartsWith("#") } | Select-Object -First 1).Trim()
     $Romfs = Join-Path $dump "romfs"
 }
-$exe = Join-Path $root "work\sa\build\jinra.exe"
+$exe = Join-Path $root "work\sa\build\Jinra-Ocarina.exe"
 $image = Join-Path $root "work\sa\image\image.bin"
 $user = Join-Path $root "work\sa\user"
 $out = Join-Path $root "work\runs\$Name"

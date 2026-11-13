@@ -470,7 +470,7 @@ def copy_save(src, data, slot=None):
 def launch(a):
     """The game in GAME_DIR with HOS_CONTROL set, its socket in a run folder of its own; waits until it answers"""
     game = os.path.abspath(a.game_dir)
-    exe = os.path.join(game, "jinra.exe" if WINDOWS else "jinra")
+    exe = os.path.join(game, "Jinra-Ocarina.exe" if WINDOWS else "jinra")
     if not os.path.isfile(exe):
         raise Failed("no game at %s" % exe, 2)
     run_dir = os.path.abspath(a.run) if a.run else tempfile.mkdtemp(prefix="jinra-control-",

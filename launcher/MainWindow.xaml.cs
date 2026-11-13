@@ -9,6 +9,8 @@ namespace JinraRecomp;
 
 public partial class MainWindow : Window
 {
+    private ResourceDictionary? languageResources;
+    private int selectedSaveCount;
     private const string NvidiaLicense = "https://github.com/NVIDIA/DLSS/blob/9981c6350dc58c0ce21f024fd65e31e851c31689/LICENSE.txt";
     private const string AmdLicense = "https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/blob/7539ae8b6568ad29ed78a753404351daf3b5cca7/Kits/FidelityFX/docs/license.md";
     private readonly Builder builder = new();
@@ -23,8 +25,11 @@ public partial class MainWindow : Window
 
     public MainWindow(string? source)
     {
+        SetupLanguage.Load(builder.Home);
         InitializeComponent();
-        VersionLabel.Text = $"Versão {Builder.Version}";
+        LoadLanguageResources();
+        LanguagePicker.SelectedIndex = SetupLanguage.English ? 0 : 1;
+        VersionLabel.Text = T($"Versão {Builder.Version}", $"Version {Builder.Version}");
         HardwareInfo.Text = BuildProfile.Detect().Description;
         logTimer = new(TimeSpan.FromMilliseconds(240), System.Windows.Threading.DispatcherPriority.Background,
             (_, _) => FlushLog(), Dispatcher);
@@ -49,6 +54,33 @@ public partial class MainWindow : Window
         EnableDlss.IsChecked = Builder.HasDlss(DestinationBox.Text);
         SelectSource(source ?? FindSource());
         ShowBuild(this, new RoutedEventArgs());
+        RefreshButtons();
+    }
+
+    private static string T(string portuguese, string english) => SetupLanguage.Text(portuguese, english);
+
+    private void LoadLanguageResources()
+    {
+        var dictionaries = SetupRoot.Resources.MergedDictionaries;
+        if (languageResources is not null) dictionaries.Remove(languageResources);
+        languageResources = new ResourceDictionary { Source = new Uri(SetupLanguage.English ? "SetupEnglish.xaml" : "SetupPortuguese.xaml", UriKind.Relative) };
+        dictionaries.Add(languageResources);
+    }
+
+    private void ChangeLanguage(object sender, RoutedEventArgs e)
+    {
+        if (LanguagePicker is null || LanguagePicker.SelectedIndex < 0 || SetupLanguage.English == (LanguagePicker.SelectedIndex == 0)) return;
+        try { SetupLanguage.Set(builder.Home, LanguagePicker.SelectedIndex == 0); }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException) { AppendLog(error.Message); }
+        LoadLanguageResources();
+        VersionLabel.Text = T($"Versão {Builder.Version}", $"Version {Builder.Version}");
+        HardwareInfo.Text = BuildProfile.Detect().Description;
+        Status.Text = T("Escolhe a tua cópia do jogo", "Choose your game copy");
+        Detail.Text = T("As ferramentas são preparadas no primeiro uso.", "Tools are prepared on first use.");
+        SourceHint.Text = T("Arquivo .nx, .nup ou pasta com exefs e romfs. Podes arrastar a cópia para aqui.",
+            "Select an .nx or .nup file, or a folder with exefs and romfs. You can drag the game copy here.");
+        if (SourceBox.Text.Length > 0) SelectSource(SourceBox.Text);
+        SetPendingSave(saveToImport, selectedSaveCount);
         RefreshButtons();
     }
 
@@ -79,25 +111,25 @@ public partial class MainWindow : Window
     {
         if (source is null) return;
         SourceBox.Text = source;
-        Status.Text = "Cópia selecionada";
-        SourceHint.Text = "Verifica a versão ou inicia a compilação.";
+        Status.Text = T("Cópia selecionada", "Game copy selected");
+        SourceHint.Text = T("Verifica a versão ou inicia a compilação.", "Verify the version or start the build.");
     }
 
     private void ChooseFile(object sender, RoutedEventArgs e)
     {
-        var picker = new OpenFileDialog { Title = "Escolher a cópia do Zelda", Filter = "Cópia Switch 2|*.nx;*.nup|Todos os ficheiros|*.*" };
+        var picker = new OpenFileDialog { Title = T("Escolher a cópia do Zelda", "Choose your Zelda game copy"), Filter = T("Cópia Switch 2|*.nx;*.nup|Todos os ficheiros|*.*", "Switch 2 game copy|*.nx;*.nup|All files|*.*") };
         if (picker.ShowDialog(this) == true) SelectSource(picker.FileName);
     }
 
     private void ChooseFolder(object sender, RoutedEventArgs e)
     {
-        var picker = new OpenFolderDialog { Title = "Escolher pasta com exefs e romfs" };
+        var picker = new OpenFolderDialog { Title = T("Escolher pasta com exefs e romfs", "Choose a folder containing exefs and romfs") };
         if (picker.ShowDialog(this) == true) SelectSource(picker.FolderName);
     }
 
     private void ChooseDestination(object sender, RoutedEventArgs e)
     {
-        var picker = new OpenFolderDialog { Title = "Escolher o destino da compilação" };
+        var picker = new OpenFolderDialog { Title = T("Escolher o destino da compilação", "Choose the build destination") };
         if (picker.ShowDialog(this) != true) return;
         DestinationBox.Text = picker.FolderName;
         EnableFsr4.IsChecked = Builder.HasFsr4(DestinationBox.Text);
@@ -111,10 +143,11 @@ public partial class MainWindow : Window
     {
         var idle = running is null;
         var playing = game is { HasExited: false };
+        LanguagePicker.IsEnabled = idle && !playing;
         FileButton.IsEnabled = FolderButton.IsEnabled = DestinationButton.IsEnabled = WarmShaders.IsEnabled = EnableDlss.IsEnabled = EnableFsr4.IsEnabled = idle;
         CheckButton.IsEnabled = idle && SourceBox.Text.Length > 0;
         var updating = Builder.CanUpdate(DestinationBox.Text);
-        BuildButton.Content = updating ? "Atualizar jogo" : "Compilar jogo";
+        BuildButton.Content = updating ? T("Atualizar jogo", "Update game") : T("Compilar jogo", "Build game");
         BuildButton.IsEnabled = idle && !playing && (updating || SourceBox.Text.Length > 0);
         PlayButton.IsEnabled = idle && !playing && DestinationBox.Text.Length > 0 && Builder.Ready(DestinationBox.Text);
         ImportButton.IsEnabled = idle && !playing;
@@ -132,7 +165,7 @@ public partial class MainWindow : Window
             SetPendingSave(null);
             return;
         }
-        var picker = new OpenFolderDialog { Title = "Escolhe a pasta de saves que contém slot_00, slot_01, etc." };
+        var picker = new OpenFolderDialog { Title = T("Escolhe a pasta de saves que contém slot_00, slot_01, etc.", "Choose the save folder containing slot_00, slot_01, and the other slots.") };
         if (picker.ShowDialog(this) != true) return;
         var destination = DestinationBox.Text;
         try
@@ -146,11 +179,11 @@ public partial class MainWindow : Window
             running = new CancellationTokenSource();
             RefreshButtons();
             Status.Text = await CopySavesAsync(picker.FolderName, destination);
-            Detail.Text = "Os saves estão disponíveis ao abrir o jogo.";
+            Detail.Text = T("Os saves estão disponíveis ao abrir o jogo.", "The saves are ready for the next time you open the game.");
         }
         catch (Exception error)
         {
-            Status.Text = "Não foi possível importar os saves";
+            Status.Text = T("Não foi possível importar os saves", "Could not import saves");
             Detail.Text = error.Message;
         }
         finally { FinishUpdateOperation(); }
@@ -159,16 +192,17 @@ public partial class MainWindow : Window
     private void SetPendingSave(string? path, int slots = 0)
     {
         saveToImport = path;
+        selectedSaveCount = slots;
         SaveSelection.Visibility = path is null ? Visibility.Collapsed : Visibility.Visible;
-        SaveSelection.Text = path is null ? "" : $"{slots} slots selecionados. Serão importados depois da compilação.";
-        ImportButton.Content = path is null ? "Importar saves" : "Limpar seleção";
+        SaveSelection.Text = path is null ? "" : T($"{slots} slots selecionados. Serão importados depois da compilação.", $"{slots} slots selected. The saves will be imported after building.");
+        ImportButton.Content = path is null ? T("Importar saves", "Import saves") : T("Limpar seleção", "Clear selection");
     }
 
     private async Task<string> CopySavesAsync(string source, string destination)
     {
         var result = await Task.Run(() => builder.ImportSaves(source, destination));
-        if (result.Backup is not null) AppendLog($"Cópia de segurança dos saves em {result.Backup}");
-        return $"Partidas importadas: {result.Slots}";
+        if (result.Backup is not null) AppendLog(T($"Cópia de segurança dos saves em {result.Backup}", $"Save backup in {result.Backup}"));
+        return T($"Partidas importadas: {result.Slots}", $"Saves imported: {result.Slots}");
     }
 
     private async void CheckUpdates(object sender, RoutedEventArgs e)
@@ -176,7 +210,7 @@ public partial class MainWindow : Window
         running = new CancellationTokenSource();
         RefreshButtons();
         ShowBuild(this, new RoutedEventArgs());
-        Status.Text = "A procurar atualizações";
+        Status.Text = T("A procurar atualizações", "Checking for updates");
         Detail.Text = "";
         ProgressBar.Value = 0;
         Percent.Text = "";
@@ -188,22 +222,22 @@ public partial class MainWindow : Window
             var release = await ReleaseUpdater.FindAsync(running.Token);
             if (release is null)
             {
-                Status.Text = "O launcher está atualizado";
+                Status.Text = T("O launcher está atualizado", "The launcher is up to date");
                 if (Builder.NeedsGameUpdate(destination))
-                    Detail.Text = "Seleciona Atualizar jogo para aplicar esta versão à instalação.";
+                    Detail.Text = T("Seleciona Atualizar jogo para aplicar esta versão à instalação.", "Select Update game to apply this version to the installation.");
                 return;
             }
             var gameUpdate = Builder.CanUpdate(destination) &&
                 (!Version.TryParse(Builder.InstalledVersion(destination), out var installed) || installed < release.Version);
             var message = gameUpdate
-                ? "Descarregar a nova versão? Se houver alterações ao motor, o Jinra atualiza o jogo na pasta atual e reutiliza os ficheiros existentes."
-                : "Descarregar e abrir a nova versão do launcher?";
+                ? T("Descarregar a nova versão? Se houver alterações ao motor, o Jinra atualiza o jogo na pasta atual e reutiliza os ficheiros existentes.", "Download the new version? If the engine has changed, Jinra updates the game in its current folder and reuses existing files.")
+                : T("Descarregar e abrir a nova versão do launcher?", "Download and open the new launcher version?");
             if (MessageBox.Show(this, message, $"Jinra-Recomp {release.Version}", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes)
             {
-                Status.Text = $"Versão {release.Version} disponível";
+                Status.Text = T($"Versão {release.Version} disponível", $"Version {release.Version} is available");
                 return;
             }
-            Status.Text = $"A descarregar Jinra-Recomp {release.Version}";
+            Status.Text = T($"A descarregar Jinra-Recomp {release.Version}", $"Downloading Jinra-Recomp {release.Version}");
             ProgressBar.IsIndeterminate = false;
             var progress = new Progress<double>(fraction => { ProgressBar.Value = fraction; Percent.Text = $"{fraction:P0}"; });
             package = await ReleaseUpdater.DownloadAsync(release, builder.Home, progress, running.Token);
@@ -212,8 +246,8 @@ public partial class MainWindow : Window
             using var process = ReleaseUpdater.Start(package, builder.Home, gameUpdate ? "--apply-update" : "--open-update",
                 gameUpdate ? destination : null);
         }
-        catch (OperationCanceledException) { Status.Text = "Atualização cancelada"; package = null; }
-        catch (Exception error) { Status.Text = "Não foi possível atualizar"; Detail.Text = error.Message; package = null; }
+        catch (OperationCanceledException) { Status.Text = T("Atualização cancelada", "Update canceled"); package = null; }
+        catch (Exception error) { Status.Text = T("Não foi possível atualizar", "Could not update"); Detail.Text = error.Message; package = null; }
         finally { ProgressBar.IsIndeterminate = false; FinishUpdateOperation(); }
         if (package is not null && !closeAfterOperation) Close();
     }
@@ -237,7 +271,7 @@ public partial class MainWindow : Window
     private async void BuildGame(object sender, RoutedEventArgs e)
     {
         if (EnableDlss.IsChecked == true && MessageBox.Show(this,
-                "O Jinra vai descarregar e usar o SDK oficial da NVIDIA neste PC. Aceitas a licença NVIDIA RTX SDKs disponível na ligação junto à opção DLSS?",
+                T("O Jinra vai descarregar e usar o SDK oficial da NVIDIA neste PC. Aceitas a licença NVIDIA RTX SDKs disponível na ligação junto à opção DLSS?", "Jinra will download and use the official NVIDIA SDK on this PC. Do you accept the NVIDIA RTX SDKs license linked beside the DLSS option?"),
                 "NVIDIA DLSS 4.5", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes)
             return;
         await RunOperation(true);
@@ -257,7 +291,7 @@ public partial class MainWindow : Window
         ProgressBar.Value = 0;
         ProgressBar.IsIndeterminate = true;
         Percent.Text = "";
-        Status.Text = build ? "A preparar a compilação" : "A verificar a cópia do jogo";
+        Status.Text = build ? T("A preparar a compilação", "Preparing the build") : T("A verificar a cópia do jogo", "Verifying the game copy");
         Detail.Text = "";
         LogBox.Clear();
         try
@@ -278,8 +312,8 @@ public partial class MainWindow : Window
             ProgressBar.IsIndeterminate = false;
             ProgressBar.Value = 1;
             Percent.Text = "100%";
-            Status.Text = build ? "Jogo pronto a abrir" : "Cópia compatível";
-            Detail.Text = build ? "Podes abrir o jogo em Jogar." : "Ocarina of Time · versão 1.1.1 (e0f3ccfa)";
+            Status.Text = build ? T("Jogo pronto a abrir", "Game ready to play") : T("Cópia compatível", "Supported game copy");
+            Detail.Text = build ? T("Podes abrir o jogo em Jogar.", "Select Play to open the game.") : T("Ocarina of Time · versão 1.1.1 (e0f3ccfa)", "Ocarina of Time · version 1.1.1 (e0f3ccfa)");
             if (build && saveToImport is string selectedSave)
             {
                 try
@@ -289,7 +323,7 @@ public partial class MainWindow : Window
                 }
                 catch (Exception error) when (error is IOException or UnauthorizedAccessException)
                 {
-                    Detail.Text = $"O jogo está pronto. A importação dos saves falhou. {error.Message}";
+                    Detail.Text = T($"O jogo está pronto. A importação dos saves falhou. {error.Message}", $"The game is ready. Save import failed. {error.Message}");
                     SetPendingSave(null);
                 }
             }
@@ -297,13 +331,13 @@ public partial class MainWindow : Window
         }
         catch (OperationCanceledException)
         {
-            Status.Text = "Operação cancelada";
-            Detail.Text = "Podes voltar a tentar com a mesma pasta de destino.";
+            Status.Text = T("Operação cancelada", "Operation canceled");
+            Detail.Text = T("Podes voltar a tentar com a mesma pasta de destino.", "You can retry with the same destination folder.");
             AppendLog(Status.Text);
         }
         catch (Exception error)
         {
-            Status.Text = build ? "A compilação parou" : "A verificação falhou";
+            Status.Text = build ? T("A compilação parou", "Build stopped") : T("A verificação falhou", "Verification failed");
             Detail.Text = error.Message;
             AppendLog(error.Message);
         }
@@ -365,19 +399,19 @@ public partial class MainWindow : Window
             using var launched = session.Process;
             game = launched;
             RefreshButtons();
-            Status.Text = "Jogo aberto";
+            Status.Text = T("Jogo aberto", "Game running");
             var exited = launched.WaitForExitAsync();
             var memory = session.MemoryLog is string file ? Builder.RecordMemoryAsync(launched, file, exited) : Task.CompletedTask;
             await exited;
-            Status.Text = launched.ExitCode == 0 ? "Jogo fechado" : "O jogo terminou com um erro";
-            if (launched.ExitCode != 0) Detail.Text = "Consulta logs\\jinra_log.txt na pasta do jogo.";
+            Status.Text = launched.ExitCode == 0 ? T("Jogo fechado", "Game closed") : T("O jogo terminou com um erro", "The game exited with an error");
+            if (launched.ExitCode != 0) Detail.Text = T("Consulta logs\\jinra_log.txt na pasta do jogo.", "See logs\\jinra_log.txt in the game folder.");
             try { await memory; }
             catch (Exception error) when (error is IOException or UnauthorizedAccessException or Win32Exception or InvalidOperationException)
             {
-                AppendLog($"O registo de memória parou. {error.Message}");
+                AppendLog(T($"O registo de memória parou. {error.Message}", $"Memory logging stopped. {error.Message}"));
             }
         }
-        catch (Exception error) { Status.Text = "Não foi possível abrir o jogo"; Detail.Text = error.Message; }
+        catch (Exception error) { Status.Text = T("Não foi possível abrir o jogo", "Could not open the game"); Detail.Text = error.Message; }
         finally { game = null; RefreshButtons(); }
     }
 
@@ -400,7 +434,7 @@ public partial class MainWindow : Window
         try
         {
             if (File.Exists(path) || Directory.Exists(path)) Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
-            else MessageBox.Show(this, "Este item fica disponível depois de começares a compilação.", Title, MessageBoxButton.OK, MessageBoxImage.Information);
+            else MessageBox.Show(this, T("Este item fica disponível depois de começares a compilação.", "This item becomes available once the build starts."), Title, MessageBoxButton.OK, MessageBoxImage.Information);
         }
         catch (Win32Exception error) { MessageBox.Show(this, error.Message, Title); }
     }
@@ -410,7 +444,7 @@ public partial class MainWindow : Window
         if (running is not null)
         {
             e.Cancel = true;
-            if (MessageBox.Show(this, "Cancelar a operação e fechar a janela?", Title,
+            if (MessageBox.Show(this, T("Cancelar a operação e fechar a janela?", "Cancel the operation and close the window?"), Title,
                 MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes)
             {
                 closeAfterOperation = true;

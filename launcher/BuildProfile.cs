@@ -18,11 +18,13 @@ internal sealed record BuildProfile(int Jobs, ulong TotalRam, ulong FreeRam, ulo
     }
 
     internal string Description => TotalRam == 0
-        ? "Compilação automática · 1 tarefa em paralelo"
-        : $"Compilação automática · até {Jobs} tarefas · {TotalRam / GiB:0.#} GB de RAM";
+        ? SetupLanguage.Text("Compilação automática · 1 tarefa em paralelo", "Automatic build · 1 parallel job")
+        : SetupLanguage.Text($"Compilação automática · até {Jobs} tarefas · {TotalRam / GiB:0.#} GB de RAM",
+            $"Automatic build · up to {Jobs} jobs · {TotalRam / GiB:0.#} GB of RAM");
 
     internal string LogLine => TotalRam == 0 ? Description
-        : $"{Description} · {FreeRam / GiB:0.#} GB livres · {FreeCommit / GiB:0.#} GB de memória virtual disponível · reserva de {Reserve:0.#} GB";
+        : SetupLanguage.Text($"{Description} · {FreeRam / GiB:0.#} GB livres · {FreeCommit / GiB:0.#} GB de memória virtual disponível · reserva de {Reserve:0.#} GB",
+            $"{Description} · {FreeRam / GiB:0.#} GB free · {FreeCommit / GiB:0.#} GB of virtual memory available · {Reserve:0.#} GB reserved");
 
     internal void Apply(Dictionary<string, string> environment)
     {

@@ -1,4 +1,5 @@
 using System.IO;
+using static JinraRecomp.SetupLanguage;
 
 namespace JinraRecomp;
 
@@ -14,7 +15,7 @@ internal static class SaveImporter
         var parent = Path.Combine(game, "user", "save");
         var destination = Path.Combine(parent, UserId);
         if (source.Equals(destination, StringComparison.OrdinalIgnoreCase))
-            throw new IOException("Esta pasta já é a pasta de saves do Jinra.");
+            throw new IOException(Text("Esta pasta já é a pasta de saves do Jinra.", "This is already the Jinra save folder."));
         for (var folder = new DirectoryInfo(parent); folder is not null && folder.Exists; folder = folder.Parent)
             RejectLink(folder);
         Directory.CreateDirectory(parent);
@@ -66,7 +67,8 @@ internal static class SaveImporter
                 dir.Name.Length > 5 && dir.Name[5..].All(char.IsAsciiDigit) &&
                 File.Exists(Path.Combine(dir.FullName, "progress.sav"))).ToArray();
         if (slots.Length == 0)
-            throw new IOException("Escolhe a pasta de saves do Ocarina of Time que contém as subpastas slot_00, slot_01, etc.");
+            throw new IOException(Text("Escolhe a pasta de saves do Ocarina of Time que contém as subpastas slot_00, slot_01, etc.",
+                "Choose the Ocarina of Time save folder containing slot_00, slot_01, and any other slot folders."));
         return slots;
     }
 
@@ -86,6 +88,7 @@ internal static class SaveImporter
     private static void RejectLink(FileSystemInfo item)
     {
         if (item.Attributes.HasFlag(FileAttributes.ReparsePoint))
-            throw new IOException("Seleciona a pasta de saves original, sem atalhos ou ligações para outras pastas.");
+            throw new IOException(Text("Seleciona a pasta de saves original, sem atalhos ou ligações para outras pastas.",
+                "Select the original save folder without shortcuts or links to other folders."));
     }
 }

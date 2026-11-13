@@ -6,6 +6,7 @@ using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using static JinraRecomp.SetupLanguage;
 
 namespace JinraRecomp;
 
@@ -94,15 +95,17 @@ internal sealed class Builder
         source = string.IsNullOrWhiteSpace(source) ? "" : Path.GetFullPath(source);
         if (Path.GetPathRoot(output) == output || Inside(output, Payload) || Inside(output, Tools) ||
             (Directory.Exists(source) && (Inside(output, source) || Inside(source, output))))
-            throw new InvalidOperationException("Escolhe uma pasta de destino independente dos ficheiros do jogo e das ferramentas.");
+            throw new InvalidOperationException(Text("Escolhe uma pasta de destino independente dos ficheiros do jogo e das ferramentas.",
+                "Choose a destination folder outside the game files and tools."));
 
         Directory.CreateDirectory(home);
         using var builderLock = new FileStream(Path.Combine(home, "build.lock"), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
         CheckDestination(output);
-        if (GameRunning(output)) throw new IOException("Fecha o jogo antes de atualizar esta instalação.");
+        if (GameRunning(output)) throw new IOException(Text("Fecha o jogo antes de atualizar esta instalação.", "Close the game before updating this installation."));
         var update = CanUpdate(output);
         if (update && System.Version.TryParse(InstalledVersion(output), out var installed) && installed > System.Version.Parse(GameVersion))
-            throw new IOException("Esta instalação já tem um motor mais recente. Abre o launcher mais recente para a atualizar.");
+            throw new IOException(Text("Esta instalação já tem um motor mais recente. Abre o launcher mais recente para a atualizar.",
+                "This installation already has a newer engine. Open the latest launcher to update it."));
         var isFolder = Directory.Exists(source);
         var kind = update ? "update" : isFolder ? "folder" : await IdentifyAsync(source, token);
         if (!update && isFolder)
@@ -120,7 +123,8 @@ internal sealed class Builder
         {
             var identity = kind == "folder" ? source : FileIdentity(source);
             if (File.Exists(sourceStamp) && await File.ReadAllTextAsync(sourceStamp, token) != identity)
-                throw new InvalidOperationException("Este destino está associado a outra cópia. Escolhe uma pasta vazia para a nova cópia.");
+                throw new InvalidOperationException(Text("Este destino está associado a outra cópia. Escolhe uma pasta vazia para a nova cópia.",
+                    "This destination belongs to another game copy. Choose an empty folder for the new copy."));
             await WriteAtomicAsync(sourceStamp, identity, token);
         }
         var id = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(output.ToUpperInvariant())))[..16];
@@ -136,7 +140,7 @@ internal sealed class Builder
             if (update) args.AddRange(["--update", output]);
             else if (kind == "NXAR")
             {
-                report.Report(new("A extrair o arquivo NX", 0, true));
+                report.Report(new(Text("A extrair o arquivo NX", "Extracting the NX archive"), 0, true));
                 RemoveOwnedDirectory(extractionPartial);
                 if (!Directory.Exists(extract))
                 {
@@ -151,7 +155,7 @@ internal sealed class Builder
                 args.AddRange(["--game", source]);
             }
 
-            report.Report(new("A preparar a recompilação", 0, true));
+            report.Report(new(Text("A preparar a recompilação", "Preparing the recompilation"), 0, true));
             var env = EngineEnvironment();
             profile.Apply(env);
             env["JINRA_VERSION"] = GameVersion;
@@ -174,16 +178,17 @@ internal sealed class Builder
             await RunAsync(Python, args, Payload, report, token, env);
             if (!File.Exists(GameExecutable(output)) || !File.Exists(Path.Combine(output, "image.bin")) ||
                 !File.Exists(Path.Combine(output, "jinra_vk.dll")))
-                throw new IOException("A compilação terminou sem todos os ficheiros necessários para jogar.");
+                throw new IOException(Text("A compilação terminou sem todos os ficheiros necessários para jogar.", "The build finished without all the files needed to play."));
             await WriteAtomicAsync(Path.Combine(output, ".jinra-built"), EngineVersion, token);
             try
             {
                 await CreateDesktopLauncherAsync(output, token);
-                report.Report(new("Jinra-Ocarina.exe criado no Ambiente de Trabalho."));
+                report.Report(new(Text("Jinra-Ocarina.exe criado no Ambiente de Trabalho.", "Jinra-Ocarina.exe created on the desktop.")));
             }
             catch (Exception error) when (error is IOException or UnauthorizedAccessException)
             {
-                report.Report(new($"O jogo está pronto. Não foi possível criar o executável no Ambiente de Trabalho: {error.Message}"));
+                report.Report(new(Text($"O jogo está pronto. Não foi possível criar o executável no Ambiente de Trabalho: {error.Message}",
+                    $"The game is ready. The desktop executable could not be created: {error.Message}")));
             }
             RemoveOwnedDirectory(extract);
         }
@@ -214,8 +219,8 @@ internal sealed class Builder
     {
         Directory.CreateDirectory(home);
         using var builderLock = new FileStream(Path.Combine(home, "build.lock"), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
-        if (!CanUpdate(output)) throw new IOException("Seleciona primeiro uma instalação do Jinra-Recomp.");
-        if (GameRunning(output)) throw new IOException("Fecha o jogo antes de importar as partidas.");
+        if (!CanUpdate(output)) throw new IOException(Text("Seleciona primeiro uma instalação do Jinra-Recomp.", "Select a Jinra-Recomp installation first."));
+        if (GameRunning(output)) throw new IOException(Text("Fecha o jogo antes de importar as partidas.", "Close the game before importing saves."));
         return SaveImporter.Import(source, output);
     }
 
@@ -224,7 +229,7 @@ internal sealed class Builder
     private async Task CreateDesktopLauncherAsync(string output, CancellationToken token)
     {
         var desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
-        if (!Directory.Exists(desktop)) throw new DirectoryNotFoundException("Pasta do Ambiente de Trabalho indisponível.");
+        if (!Directory.Exists(desktop)) throw new DirectoryNotFoundException(Text("Pasta do Ambiente de Trabalho indisponível.", "The desktop folder is unavailable."));
         var path = Path.Combine(desktop, "Jinra-Ocarina.exe");
         var temporary = path + ".partial-" + Guid.NewGuid().ToString("N");
         try
@@ -245,7 +250,7 @@ internal sealed class Builder
 
     internal (Process Process, string? MemoryLog) StartGame(string output, bool diagnostics, bool lowMemory)
     {
-        if (!Ready(output)) throw new InvalidOperationException("Compila o jogo antes de o abrir.");
+        if (!Ready(output)) throw new InvalidOperationException(Text("Compila o jogo antes de o abrir.", "Build the game before launching it."));
         var start = new ProcessStartInfo(GameExecutable(output)) { WorkingDirectory = output, UseShellExecute = false };
         start.Environment["JINRA_NO_UPDATE_CHECK"] = "1";
         start.Environment["RX_VK_PRECOMPILE"] = "0";
@@ -261,7 +266,7 @@ internal sealed class Builder
             start.Environment["RX_VK_FRAMEGEN"] = "0";
             memoryLog = Path.Combine(path, $"memoria-{session}.csv");
         }
-        return (Process.Start(start) ?? throw new IOException("Não foi possível abrir o jogo."), memoryLog);
+        return (Process.Start(start) ?? throw new IOException(Text("Não foi possível abrir o jogo.", "The game could not be launched.")), memoryLog);
     }
 
     internal static async Task RecordMemoryAsync(Process process, string file, Task exited)
@@ -288,7 +293,7 @@ internal sealed class Builder
 
     internal async Task PrepareToolsAsync(IProgress<BuildUpdate> report, CancellationToken token, bool pythonOnly = false)
     {
-        report.Report(new("A preparar as ferramentas incluídas", 0, true));
+        report.Report(new(Text("A preparar as ferramentas incluídas", "Preparing the bundled tools"), 0, true));
         await InstallPayloadAsync(token);
         Directory.CreateDirectory(Tools);
         await using var stream = File.OpenRead(Path.Combine(Kit, "tools.json"));
@@ -297,8 +302,9 @@ internal sealed class Builder
         {
             if (pythonOnly && tool.Name != "python") continue;
             if (!File.Exists(Path.Combine(Tools, tool.File)))
-                throw new IOException($"A ferramenta {tool.Name} está em falta. Volta a abrir o executável completo.");
-            report.Report(new($"{tool.Name} disponível"));
+                throw new IOException(Text($"A ferramenta {tool.Name} está em falta. Volta a abrir o executável completo.",
+                    $"The {tool.Name} tool is missing. Open the full installer again."));
+            report.Report(new(Text($"{tool.Name} disponível", $"{tool.Name} is ready")));
         }
     }
 
@@ -342,11 +348,11 @@ internal sealed class Builder
                 token.ThrowIfCancellationRequested();
                 if (!entry.FullName.StartsWith(prefix, StringComparison.Ordinal) || string.IsNullOrEmpty(entry.Name)) continue;
                 var path = Path.GetFullPath(Path.Combine(temp, entry.FullName[prefix.Length..]));
-                if (!Inside(path, temp) || path == temp) throw new IOException("O pacote contém um caminho inválido.");
+                if (!Inside(path, temp) || path == temp) throw new IOException(Text("O pacote contém um caminho inválido.", "The package contains an invalid path."));
                 Directory.CreateDirectory(Path.GetDirectoryName(path)!);
                 entry.ExtractToFile(path);
             }
-            if (!File.Exists(Path.Combine(temp, required))) throw new IOException("O pacote está incompleto.");
+            if (!File.Exists(Path.Combine(temp, required))) throw new IOException(Text("O pacote está incompleto.", "The package is incomplete."));
             File.WriteAllText(Path.Combine(temp, marker), stamp);
             token.ThrowIfCancellationRequested();
             if (Directory.Exists(target) && File.Exists(Path.Combine(target, required)) &&
@@ -374,7 +380,7 @@ internal sealed class Builder
                 start.Environment.Remove(key);
             foreach (var (key, value) in env) start.Environment[key] = value;
         }
-        using var process = Process.Start(start) ?? throw new IOException("Não foi possível iniciar uma ferramenta.");
+        using var process = Process.Start(start) ?? throw new IOException(Text("Não foi possível iniciar uma ferramenta.", "A build tool could not be started."));
         using var cancel = token.Register(() => { try { process.Kill(entireProcessTree: true); } catch (InvalidOperationException) { } });
         string? error = null;
         async Task ReadAsync(StreamReader reader)
@@ -392,35 +398,37 @@ internal sealed class Builder
         await Task.WhenAll(ReadAsync(process.StandardOutput), ReadAsync(process.StandardError), process.WaitForExitAsync());
         token.ThrowIfCancellationRequested();
         if (process.ExitCode != 0 || error is not null)
-            throw new IOException(error ?? $"A ferramenta {Path.GetFileName(file)} terminou com o código {process.ExitCode}. Consulta o registo.");
+            throw new IOException(error ?? Text($"A ferramenta {Path.GetFileName(file)} terminou com o código {process.ExitCode}. Consulta o registo.",
+                $"{Path.GetFileName(file)} exited with code {process.ExitCode}. Check the log."));
     }
 
     private static string StageName(string stage) => stage switch
     {
-        "read" => "A preparar os ficheiros do jogo",
-        "lift" => "A traduzir o código da Switch 2",
-        "compile" => "A compilar o jogo para Windows",
-        "finish" => "A montar o jogo e preparar os shaders",
-        "shaders" => "A preparar os shaders",
-        _ => "A preparar o jogo"
+        "read" => Text("A preparar os ficheiros do jogo", "Preparing the game files"),
+        "lift" => Text("A traduzir o código da Switch 2", "Translating the Switch 2 code"),
+        "compile" => Text("A compilar o jogo para Windows", "Building the game for Windows"),
+        "finish" => Text("A montar o jogo e preparar os shaders", "Assembling the game and preparing shaders"),
+        "shaders" => Text("A preparar os shaders", "Preparing shaders"),
+        _ => Text("A preparar o jogo", "Preparing the game")
     };
 
     private static string InputFolder(string source)
     {
         foreach (var folder in new[] { source, Path.Combine(source, "base") })
             if (File.Exists(Path.Combine(folder, "exefs", "main")) && Directory.Exists(Path.Combine(folder, "romfs"))) return folder;
-        throw new IOException("Escolhe uma pasta que contenha exefs e romfs da versão 1.1.1.");
+        throw new IOException(Text("Escolhe uma pasta que contenha exefs e romfs da versão 1.1.1.", "Choose a folder containing exefs and romfs from version 1.1.1."));
     }
 
     private static async Task<string> IdentifyAsync(string source, CancellationToken token)
     {
-        if (!File.Exists(source)) throw new IOException("Escolhe o arquivo .nx ou .nup do jogo, ou a pasta extraída.");
+        if (!File.Exists(source)) throw new IOException(Text("Escolhe o arquivo .nx ou .nup do jogo, ou a pasta extraída.",
+            "Choose the game's .nx or .nup archive or its extracted folder."));
         var bytes = new byte[4];
         await using var input = File.OpenRead(source);
         await input.ReadExactlyAsync(bytes, token);
         if (bytes.AsSpan().SequenceEqual("NXAR"u8)) return "NXAR";
         if (bytes.AsSpan().SequenceEqual("NUP\x01"u8)) return "NUP";
-        throw new IOException("O ficheiro escolhido não tem o formato NX ou NUP.");
+        throw new IOException(Text("O ficheiro escolhido não tem o formato NX ou NUP.", "The selected file is not in NX or NUP format."));
     }
 
     private static async Task VerifyMainAsync(string file, CancellationToken token)
@@ -429,7 +437,7 @@ internal sealed class Builder
         await using var stream = File.OpenRead(file);
         await stream.ReadExactlyAsync(bytes, token);
         if (!bytes.AsSpan(0, 4).SequenceEqual("NSO0"u8) || Convert.ToHexString(bytes.AsSpan(0x40, 16)) != ExpectedBuild)
-            throw new IOException("A versão suportada é o Zelda da Switch 2 1.1.1 (e0f3ccfa).");
+            throw new IOException(Text("A versão suportada é o Zelda da Switch 2 1.1.1 (e0f3ccfa).", "The supported version is Zelda for Switch 2, 1.1.1 (e0f3ccfa)."));
     }
 
     private static string FileIdentity(string file)
@@ -442,12 +450,14 @@ internal sealed class Builder
     {
         if (!Directory.Exists(output)) return;
         if ((File.GetAttributes(output) & FileAttributes.ReparsePoint) != 0)
-            throw new IOException("Escolhe uma pasta de destino local sem redirecionamento.");
+            throw new IOException(Text("Escolhe uma pasta de destino local sem redirecionamento.", "Choose a local destination folder without redirection."));
         if (Directory.EnumerateFileSystemEntries(output).Any() && !File.Exists(Path.Combine(output, ".jinra-source")))
-            throw new IOException("Escolhe uma pasta vazia ou uma instalação criada pelo Jinra-Recomp.");
+            throw new IOException(Text("Escolhe uma pasta vazia ou uma instalação criada pelo Jinra-Recomp.",
+                "Choose an empty folder or an existing Jinra-Recomp installation."));
         foreach (var entry in Directory.EnumerateFileSystemEntries(output))
             if ((File.GetAttributes(entry) & FileAttributes.ReparsePoint) != 0)
-                throw new IOException("A pasta de destino contém um redirecionamento. Escolhe outro destino.");
+                throw new IOException(Text("A pasta de destino contém um redirecionamento. Escolhe outro destino.",
+                    "The destination folder contains a redirected path. Choose another destination."));
     }
 
     private static bool Inside(string child, string parent)

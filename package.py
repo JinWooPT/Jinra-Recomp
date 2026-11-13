@@ -112,7 +112,6 @@ def package(stage):
         *restore, f"-p:Payload={kit_zip}", "-o", publish)
     (publish / "Jinra-Recomp.UI.pdb").unlink(missing_ok=True)
     shutil.copy2(ROOT / "LICENSE", publish / "LICENSE.txt")
-    shutil.copy2(ROOT / "THIRD-PARTY-NOTICES.md", publish / "THIRD-PARTY-NOTICES.md")
     packed = stage / "launcher.zip"
     print("A montar o executável final…", flush=True)
     zip_tree(packed, publish)

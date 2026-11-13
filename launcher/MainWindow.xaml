@@ -2,7 +2,7 @@
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Title="Jinra-Recomp" Icon="Assets/Jinra.ico"
     Width="990" Height="715" MinWidth="820" MinHeight="590" WindowStartupLocation="CenterScreen"
     Background="{StaticResource Base}" FontFamily="Segoe UI" FontSize="13" UseLayoutRounding="True">
-    <Grid Background="{StaticResource Base}">
+    <Grid x:Name="SetupRoot" Background="{StaticResource Base}">
         <Grid.ColumnDefinitions><ColumnDefinition Width="184"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
         <Border Background="{StaticResource Sidebar}" BorderBrush="{StaticResource Line}" BorderThickness="0,0,1,0">
             <DockPanel Margin="16,25,16,18">
@@ -11,13 +11,19 @@
                     <TextBlock Text="Jinra-Recomp" FontWeight="Bold" FontSize="15" VerticalAlignment="Center"/>
                 </StackPanel>
                 <StackPanel DockPanel.Dock="Bottom" Margin="4,0,0,0">
+                    <TextBlock Text="{DynamicResource SetupLanguageLabel}" Foreground="{StaticResource Muted}" Margin="0,0,0,5"/>
+                    <ComboBox x:Name="LanguagePicker" Margin="0,0,0,14" SelectionChanged="ChangeLanguage"
+                              AutomationProperties.Name="{DynamicResource SetupLanguageLabel}">
+                        <ComboBoxItem><TextBlock Text="English" Foreground="{DynamicResource {x:Static SystemColors.ControlTextBrushKey}}"/></ComboBoxItem>
+                        <ComboBoxItem><TextBlock Text="Português" Foreground="{DynamicResource {x:Static SystemColors.ControlTextBrushKey}}"/></ComboBoxItem>
+                    </ComboBox>
                     <TextBlock x:Name="VersionLabel" Foreground="{StaticResource Muted}"/>
                     <TextBlock Text="Windows · Vulkan" Foreground="{StaticResource Muted}" Margin="0,5,0,0" FontSize="12"/>
                 </StackPanel>
                 <StackPanel>
-                    <Button x:Name="BuildNav" Style="{StaticResource Nav}" Click="ShowBuild" Content="Compilação"/>
-                    <Button x:Name="LogNav" Style="{StaticResource Nav}" Click="ShowLog" Content="Registo"/>
-                    <Button x:Name="UpdateButton" Style="{StaticResource Nav}" Click="CheckUpdates" Content="Atualizações"/>
+                    <Button x:Name="BuildNav" Style="{StaticResource Nav}" Click="ShowBuild" Content="{DynamicResource BuildNavText}"/>
+                    <Button x:Name="LogNav" Style="{StaticResource Nav}" Click="ShowLog" Content="{DynamicResource LogNavText}"/>
+                    <Button x:Name="UpdateButton" Style="{StaticResource Nav}" Click="CheckUpdates" Content="{DynamicResource UpdateNavText}"/>
                 </StackPanel>
             </DockPanel>
         </Border>
@@ -39,54 +45,54 @@
                             <StackPanel Margin="22,19,22,21">
                                 <TextBlock Text="THE LEGEND OF ZELDA" Foreground="{StaticResource Cyan}" FontSize="11" FontWeight="Bold"/>
                                 <TextBlock Text="Ocarina of Time" FontWeight="Bold" FontSize="32" Margin="0,2,0,3"/>
-                                <TextBlock Text="Nintendo Switch 2 · Versão 1.1.1" Foreground="{StaticResource Muted}" FontSize="13"/>
+                                <TextBlock Text="{DynamicResource PlatformText}" Foreground="{StaticResource Muted}" FontSize="13"/>
                             </StackPanel>
                         </Grid>
                     </Border>
 
                     <Border Style="{StaticResource Card}" Margin="0,15,0,0">
                         <StackPanel>
-                            <TextBlock Text="Cópia do jogo" FontSize="15" FontWeight="SemiBold" Margin="0,0,0,7"/>
+                            <TextBlock Text="{DynamicResource SourceLabel}" FontSize="15" FontWeight="SemiBold" Margin="0,0,0,7"/>
                             <Grid>
                                 <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
                                 <TextBox x:Name="SourceBox" IsReadOnly="True" VerticalContentAlignment="Center" MinHeight="38"
-                                         AutomationProperties.Name="Caminho da cópia do jogo" TextChanged="SourceChanged"
+                                         AutomationProperties.Name="{DynamicResource SourcePathLabel}" TextChanged="SourceChanged"
                                          ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}"/>
-                                <Button x:Name="FileButton" Grid.Column="1" Margin="8,0,0,0" Content="Ficheiro…" Click="ChooseFile"/>
-                                <Button x:Name="FolderButton" Grid.Column="2" Margin="8,0,0,0" Content="Pasta…" Click="ChooseFolder"/>
+                                <Button x:Name="FileButton" Grid.Column="1" Margin="8,0,0,0" Content="{DynamicResource SourceFile}" Click="ChooseFile"/>
+                                <Button x:Name="FolderButton" Grid.Column="2" Margin="8,0,0,0" Content="{DynamicResource SourceFolder}" Click="ChooseFolder"/>
                             </Grid>
-                            <TextBlock x:Name="SourceHint" Text="Arquivo .nx, .nup ou pasta com exefs e romfs. Podes arrastar a cópia para aqui."
+                            <TextBlock x:Name="SourceHint" Text="{DynamicResource InitialSourceHint}"
                                        Foreground="{StaticResource Muted}" TextWrapping="Wrap" Margin="0,7,0,12"/>
-                            <TextBlock Text="Destino" FontSize="15" FontWeight="SemiBold" Margin="0,0,0,7"/>
+                            <TextBlock Text="{DynamicResource DestinationLabel}" FontSize="15" FontWeight="SemiBold" Margin="0,0,0,7"/>
                             <Grid>
                                 <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
                                 <TextBox x:Name="DestinationBox" IsReadOnly="True" VerticalContentAlignment="Center" MinHeight="38"
-                                         AutomationProperties.Name="Pasta de destino"
+                                         AutomationProperties.Name="{DynamicResource DestinationPathLabel}"
                                          ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}"/>
-                                <Button x:Name="DestinationButton" Grid.Column="1" Margin="8,0,0,0" Content="Alterar…" Click="ChooseDestination"/>
+                                <Button x:Name="DestinationButton" Grid.Column="1" Margin="8,0,0,0" Content="{DynamicResource ChangeDestination}" Click="ChooseDestination"/>
                             </Grid>
                             <WrapPanel Margin="0,13,0,0">
-                                <CheckBox x:Name="WarmShaders" IsChecked="True" Margin="0,0,20,5" Content="Preparar shaders na compilação"/>
-                                <CheckBox x:Name="Diagnostics" Margin="0,0,20,5" Content="Medir fluidez e RAM ao jogar"
-                                          ToolTip="Grava os tempos dos fotogramas, as causas das pausas e o uso de RAM. Desliga a geração de fotogramas durante a medição."/>
-                                <CheckBox x:Name="LowMemory" Margin="0,0,0,5" Content="Poupar RAM ao jogar"
-                                          ToolTip="Evita carregar a cache Vulkan do jogo. Pode haver mais pausas a compilar efeitos gráficos durante a partida."/>
+                                <CheckBox x:Name="WarmShaders" IsChecked="True" Margin="0,0,20,5" Content="{DynamicResource WarmShadersText}"/>
+                                <CheckBox x:Name="Diagnostics" Margin="0,0,20,5" Content="{DynamicResource MeasureText}"
+                                          ToolTip="{DynamicResource MeasureHint}"/>
+                                <CheckBox x:Name="LowMemory" Margin="0,0,0,5" Content="{DynamicResource LowMemoryText}"
+                                          ToolTip="{DynamicResource LowMemoryHint}"/>
                             </WrapPanel>
                             <WrapPanel Margin="0,4,0,0">
-                                <CheckBox x:Name="EnableDlss" Content="NVIDIA DLSS 4.5 e Multi Frame Generation"
-                                          ToolTip="Descarrega o SDK oficial da NVIDIA ao compilar ou atualizar."/>
+                                <CheckBox x:Name="EnableDlss" Content="{DynamicResource DlssText}"
+                                          ToolTip="{DynamicResource DlssHint}"/>
                                 <TextBlock Margin="10,0,0,0">
-                                    <Hyperlink Foreground="{StaticResource Cyan}" Click="OpenNvidiaLicense">Licença NVIDIA</Hyperlink>
+                                    <Hyperlink Foreground="{StaticResource Cyan}" Click="OpenNvidiaLicense"><Run Text="{DynamicResource NvidiaLicenseText}"/></Hyperlink>
                                 </TextBlock>
                             </WrapPanel>
                             <WrapPanel Margin="0,5,0,0">
-                                <CheckBox x:Name="EnableFsr4" Content="AMD FSR 4 em placas compatíveis"
-                                          ToolTip="Descarrega os componentes AMD para reconstrução de imagem FSR 4. Podes preparar a instalação noutro PC."/>
+                                <CheckBox x:Name="EnableFsr4" Content="{DynamicResource FsrText}"
+                                          ToolTip="{DynamicResource FsrHint}"/>
                                 <TextBlock Margin="10,0,0,0">
-                                    <Hyperlink Foreground="{StaticResource Cyan}" Click="OpenAmdLicense">Licença AMD</Hyperlink>
+                                    <Hyperlink Foreground="{StaticResource Cyan}" Click="OpenAmdLicense"><Run Text="{DynamicResource AmdLicenseText}"/></Hyperlink>
                                 </TextBlock>
                             </WrapPanel>
-                            <TextBlock Text="O FSR 3.1, incluindo a geração de fotogramas 2×, vem incluído e pode ser selecionado no jogo."
+                            <TextBlock Text="{DynamicResource FsrIncluded}"
                                        Foreground="{StaticResource Muted}" TextWrapping="Wrap" Margin="0,5,0,0"/>
                             <TextBlock x:Name="HardwareInfo" Foreground="{StaticResource Muted}" TextWrapping="Wrap" Margin="0,5,0,0"/>
                         </StackPanel>
@@ -95,9 +101,9 @@
                     <Border Style="{StaticResource Card}" Margin="0,12,0,0">
                         <DockPanel>
                             <Button x:Name="ImportButton" DockPanel.Dock="Right" VerticalAlignment="Center" Margin="12,0,0,0"
-                                    Content="Importar saves" Click="ImportSaves"/>
+                                    Content="{DynamicResource ImportSavesText}" Click="ImportSaves"/>
                             <StackPanel VerticalAlignment="Center">
-                                <TextBlock Text="No emulador, abre a pasta de saves do Ocarina of Time. Seleciona a pasta que contém as subpastas slot_00, slot_01, etc."
+                                <TextBlock Text="{DynamicResource ImportSavesHint}"
                                            TextWrapping="Wrap" Foreground="{StaticResource Muted}"/>
                                 <TextBlock x:Name="SaveSelection" Visibility="Collapsed" TextWrapping="Wrap" Margin="0,5,0,0"/>
                             </StackPanel>
@@ -108,34 +114,34 @@
                         <StackPanel>
                             <Grid>
                                 <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-                                <TextBlock x:Name="Status" Text="Escolhe a tua cópia do jogo" FontWeight="SemiBold" TextWrapping="Wrap"/>
+                                <TextBlock x:Name="Status" Text="{DynamicResource InitialStatus}" FontWeight="SemiBold" TextWrapping="Wrap"/>
                                 <TextBlock x:Name="Percent" Grid.Column="1" Foreground="{StaticResource Cyan}" Margin="12,0,0,0"/>
                             </Grid>
                             <ProgressBar x:Name="ProgressBar" Height="5" Margin="0,9,0,0" Maximum="1"
                                          Foreground="{StaticResource Cyan}" Background="#263956" BorderThickness="0"/>
-                            <TextBlock x:Name="Detail" Text="As ferramentas são preparadas no primeiro uso." Foreground="{StaticResource Muted}"
+                            <TextBlock x:Name="Detail" Text="{DynamicResource InitialDetail}" Foreground="{StaticResource Muted}"
                                        Margin="0,7,0,0" TextWrapping="Wrap" MaxHeight="60" TextTrimming="CharacterEllipsis"/>
                         </StackPanel>
                     </Border>
 
                     <WrapPanel HorizontalAlignment="Right" Margin="0,12,0,0">
-                        <Button x:Name="CheckButton" Content="Verificar cópia" Click="CheckGame" Margin="0,0,8,0"/>
-                        <Button x:Name="CancelButton" Content="Cancelar" Click="CancelOperation" Visibility="Collapsed" Margin="0,0,8,0"/>
-                        <Button x:Name="PlayButton" Content="Jogar" Click="PlayGame" Margin="0,0,8,0"/>
-                        <Button x:Name="BuildButton" Style="{StaticResource Primary}" Content="Compilar jogo" Click="BuildGame" MinWidth="132"/>
+                        <Button x:Name="CheckButton" Content="{DynamicResource VerifyText}" Click="CheckGame" Margin="0,0,8,0"/>
+                        <Button x:Name="CancelButton" Content="{DynamicResource CancelText}" Click="CancelOperation" Visibility="Collapsed" Margin="0,0,8,0"/>
+                        <Button x:Name="PlayButton" Content="{DynamicResource PlayText}" Click="PlayGame" Margin="0,0,8,0"/>
+                        <Button x:Name="BuildButton" Style="{StaticResource Primary}" Content="{DynamicResource BuildText}" Click="BuildGame" MinWidth="132"/>
                     </WrapPanel>
                 </StackPanel>
             </ScrollViewer>
 
             <Grid x:Name="LogPage" Visibility="Collapsed" Margin="26,24,26,22">
                 <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
-                <TextBlock Text="Registo de compilação" FontSize="25" FontWeight="SemiBold" Margin="0,0,0,12"/>
+                <TextBlock Text="{DynamicResource LogTitle}" FontSize="25" FontWeight="SemiBold" Margin="0,0,0,12"/>
                 <TextBox x:Name="LogBox" Grid.Row="1" IsReadOnly="True" AcceptsReturn="True" FontFamily="Consolas" FontSize="12"
-                         TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" AutomationProperties.Name="Registo de compilação"/>
+                         TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" AutomationProperties.Name="{DynamicResource LogTitle}"/>
                 <WrapPanel Grid.Row="2" HorizontalAlignment="Right" Margin="0,12,0,0">
-                    <Button Content="Abrir pasta do jogo" Click="OpenGameFolder" Margin="0,0,8,0"/>
-                    <Button Content="Logs do jogo" Click="OpenGameLogs" Margin="0,0,8,0"/>
-                    <Button Content="Abrir registo de compilação" Click="OpenLogFile"/>
+                    <Button Content="{DynamicResource GameFolderText}" Click="OpenGameFolder" Margin="0,0,8,0"/>
+                    <Button Content="{DynamicResource GameLogsText}" Click="OpenGameLogs" Margin="0,0,8,0"/>
+                    <Button Content="{DynamicResource BuildLogText}" Click="OpenLogFile"/>
                 </WrapPanel>
             </Grid>
         </Grid>

@@ -5,6 +5,7 @@ using System.Net.Http;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using static JinraRecomp.SetupLanguage;
 
 namespace JinraRecomp;
 
@@ -70,7 +71,7 @@ internal static class ReleaseUpdater
         start.Environment["JINRA_RECOMP_HOME"] = home;
         start.ArgumentList.Add(mode);
         if (argument is not null) start.ArgumentList.Add(argument);
-        return Process.Start(start) ?? throw new IOException("O novo launcher não abriu.");
+        return Process.Start(start) ?? throw new IOException(Text("O novo launcher não abriu.", "The new launcher could not be opened."));
     }
 
     internal static async Task<ReleaseUpdate?> FindAsync(CancellationToken token)
@@ -92,7 +93,7 @@ internal static class ReleaseUpdater
         if (asset is null || asset.Url != url || asset.Size is <= 0 or > 2_000_000_000 ||
             asset.Digest is not { Length: 71 } || !asset.Digest.StartsWith("sha256:", StringComparison.Ordinal) ||
             !asset.Digest[7..].All(Uri.IsHexDigit))
-            throw new IOException("A versão publicada ainda não tem um pacote válido para Windows.");
+            throw new IOException(Text("A versão publicada ainda não tem um pacote válido para Windows.", "The published release has no valid Windows package yet."));
         return new ReleaseUpdate(version, new Uri(url), asset.Size, asset.Digest[7..]);
     }
 
@@ -107,9 +108,9 @@ internal static class ReleaseUpdater
             response.EnsureSuccessStatusCode();
             if (response.RequestMessage?.RequestUri is not { Scheme: "https" } final ||
                 final.Host is not ("github.com" or "release-assets.githubusercontent.com" or "objects.githubusercontent.com"))
-                throw new IOException("O GitHub encaminhou o pacote para um endereço inesperado.");
+                throw new IOException(Text("O GitHub encaminhou o pacote para um endereço inesperado.", "GitHub redirected the package to an unexpected address."));
             if (response.Content.Headers.ContentLength is long length && length != release.Size)
-                throw new IOException("O tamanho do pacote difere do indicado na versão publicada.");
+                throw new IOException(Text("O tamanho do pacote difere do indicado na versão publicada.", "The package size differs from the published release information."));
             using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
             await using var source = await response.Content.ReadAsStreamAsync(token);
             long received = 0;
@@ -121,14 +122,14 @@ internal static class ReleaseUpdater
                     var count = await source.ReadAsync(buffer, token).AsTask().WaitAsync(TimeSpan.FromSeconds(30), token);
                     if (count == 0) break;
                     received += count;
-                    if (received > release.Size) throw new IOException("O pacote excede o tamanho indicado.");
+                    if (received > release.Size) throw new IOException(Text("O pacote excede o tamanho indicado.", "The package exceeds the published size."));
                     hash.AppendData(buffer, 0, count);
                     await output.WriteAsync(buffer.AsMemory(0, count), token);
                     progress.Report((double)received / release.Size);
                 }
             }
             if (received != release.Size || !Convert.ToHexString(hash.GetHashAndReset()).Equals(release.Sha256, StringComparison.OrdinalIgnoreCase))
-                throw new IOException("A verificação do pacote falhou. Volta a tentar descarregá-lo.");
+                throw new IOException(Text("A verificação do pacote falhou. Volta a tentar descarregá-lo.", "Package verification failed. Try downloading it again."));
             token.ThrowIfCancellationRequested();
             File.Move(partial, path, overwrite: true);
             return path;

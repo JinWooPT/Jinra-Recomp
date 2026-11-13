@@ -1,5 +1,7 @@
 # Jinra-Recomp
 
+[English](README.en.md) · Português
+
 Compilador local para **The Legend of Zelda: Ocarina of Time** da Nintendo Switch 2, versão 1.1.1 (`e0f3ccfa`), para Windows x64 com Vulkan.
 
 ## Primeira compilação
@@ -18,11 +20,13 @@ Abre **Atualizações** no launcher para procurar a versão estável no GitHub. 
 
 No emulador, abre a pasta de saves do Ocarina of Time. No launcher, usa **Importar saves** e seleciona a pasta que contém diretamente `slot_00`, `slot_01` e as restantes subpastas de partidas. O Jinra importa todos os slots válidos dessa pasta. Podes selecionar a pasta antes da primeira compilação ou importar numa instalação existente com o jogo fechado. Os slots importados substituem os que têm o mesmo número. A cópia anterior fica em `saves-backup` na pasta do jogo.
 
+Podes escolher **English** ou **Português** no seletor de idioma do setup. O launcher guarda a escolha. O idioma das definições dentro do jogo é escolhido no próprio jogo.
+
 O jogo guarda o registo atual em `logs/jinra_log.txt` e conserva os quatro anteriores na mesma pasta. No launcher, abre **Registo → Logs do jogo**. Durante o jogo, **F1 → Diagnóstico → Guardar relatório de diagnóstico** reúne os registos recentes, as definições, os dados do PC e uma captura em `logs/reports`. A cópia preparada para partilha omite o nome de utilizador e a pasta pessoal.
 
 ## NVIDIA DLSS 4.5
 
-Ativa **NVIDIA DLSS 4.5 e Multi Frame Generation** antes de compilar ou atualizar. Depois de aceitares a licença, o launcher descarrega o SDK 310.9.16 diretamente da NVIDIA e valida os ficheiros. Em **F1 → Imagem**, escolhe **Método de reconstrução → NVIDIA DLSS**, o **Modelo de reconstrução DLSS** e a **Resolução 3D**. Em **Desempenho**, escolhe o **Multiplicador de fotogramas** e o **Motor de geração de fotogramas**. Os multiplicadores NVIDIA disponíveis dependem da placa e do controlador.
+Ativa **NVIDIA DLSS 4 / 4.5 e Multi Frame Generation** antes de compilar ou atualizar. Depois de aceitares a licença, o launcher descarrega o SDK 310.9.16 diretamente da NVIDIA e valida os ficheiros. Em **F1 → Imagem**, escolhe **Método de reconstrução → NVIDIA DLSS**, o **Modelo de reconstrução DLSS** e a **Resolução 3D**. O modelo **K** corresponde ao DLSS 4. Os modelos **M/L** correspondem ao DLSS 4.5. Em **Desempenho**, escolhe o **Multiplicador de fotogramas** e o **Motor de geração de fotogramas**. Os multiplicadores NVIDIA disponíveis dependem da placa e do controlador.
 
 ## AMD FSR
 

@@ -46,11 +46,11 @@ O launcher guarda as ferramentas e o registo de compilação em `%LOCALAPPDATA%\
 - **Motor.** O código em `engine/` trata da tradução ARM64, dos serviços da consola e da renderização Vulkan. A RomFS fica diretamente no destino da instalação.
 - **Entrada NX.** O importador usa o leitor MIT do [NXFormat 1.0.3](https://github.com/fab918/nxformat/releases/tag/V1.0.3). Valida a edição do jogo, seleciona a atualização correspondente, reúne a base e a atualização e verifica a integridade dos ficheiros ao extrair. A RomFS importada fica diretamente no destino, dispensando uma segunda cópia completa.
 
-O código do projeto e a integração do motor seguem GPL-3.0-or-later. Consulta [os avisos de terceiros](THIRD-PARTY-NOTICES.md) para as origens e licenças dos componentes incorporados.
+O código do projeto e a integração do motor seguem GPL-3.0-or-later. Os componentes incorporados conservam os avisos e as licenças junto do respetivo código.
 
 ## Empacotar o instalador
 
-`python package.py` recompila o launcher e gera `dist/Jinra-Recomp.exe`. Precisa de Python 3.12 ou mais recente e do .NET SDK 10 com os pacotes Windows x64 de distribuição autónoma. Os ZIP `python.zip`, `cpm.zip`, `llvm.zip`, `app.zip` e `third_party.zip` em `.local` são verificados pelo SHA-256 antes de serem usados. Consulta os avisos de terceiros para obter os componentes da compilação.
+`python package.py` recompila o launcher e gera `dist/Jinra-Recomp.exe`. Precisa de Python 3.12 ou mais recente e do .NET SDK 10 com os pacotes Windows x64 de distribuição autónoma. Os ZIP `python.zip`, `cpm.zip`, `llvm.zip`, `app.zip` e `third_party.zip` em `.local` são verificados pelo SHA-256 antes de serem usados. O LLVM está indicado em launcher/tools.json.
 
 Para publicar uma versão, usa uma tag `v` seguida da versão do launcher e anexa `Jinra-Recomp.exe` e `SHA256SUMS.txt` à release estável. Mantém `GameVersion` em `launcher/Builder.cs` quando a alteração for só ao launcher.
 

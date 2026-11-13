@@ -1,5 +1,6 @@
 <Window x:Class="JinraRecomp.MainWindow" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Title="Jinra-Recomp" Icon="Assets/Jinra.ico"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" xmlns:sys="clr-namespace:System;assembly=System.Runtime"
+    Title="Jinra-Recomp" Icon="Assets/Jinra.ico"
     Width="990" Height="715" MinWidth="820" MinHeight="590" WindowStartupLocation="CenterScreen"
     Background="{StaticResource Base}" FontFamily="Segoe UI" FontSize="13" UseLayoutRounding="True">
     <Grid x:Name="SetupRoot" Background="{StaticResource Base}">
@@ -12,10 +13,15 @@
                 </StackPanel>
                 <StackPanel DockPanel.Dock="Bottom" Margin="4,0,0,0">
                     <TextBlock Text="{DynamicResource SetupLanguageLabel}" Foreground="{StaticResource Muted}" Margin="0,0,0,5"/>
-                    <ComboBox x:Name="LanguagePicker" Margin="0,0,0,14" SelectionChanged="ChangeLanguage"
+                    <ComboBox x:Name="LanguagePicker" MinHeight="24" Margin="0,0,0,14" SelectionChanged="ChangeLanguage"
                               AutomationProperties.Name="{DynamicResource SetupLanguageLabel}">
-                        <ComboBoxItem><TextBlock Text="English" Foreground="{DynamicResource {x:Static SystemColors.ControlTextBrushKey}}"/></ComboBoxItem>
-                        <ComboBoxItem><TextBlock Text="Português" Foreground="{DynamicResource {x:Static SystemColors.ControlTextBrushKey}}"/></ComboBoxItem>
+                        <ComboBox.ItemTemplate>
+                            <DataTemplate>
+                                <TextBlock Text="{Binding}" Foreground="{DynamicResource {x:Static SystemColors.ControlTextBrushKey}}"/>
+                            </DataTemplate>
+                        </ComboBox.ItemTemplate>
+                        <sys:String>English</sys:String>
+                        <sys:String>Português</sys:String>
                     </ComboBox>
                     <TextBlock x:Name="VersionLabel" Foreground="{StaticResource Muted}"/>
                     <TextBlock Text="Windows · Vulkan" Foreground="{StaticResource Muted}" Margin="0,5,0,0" FontSize="12"/>

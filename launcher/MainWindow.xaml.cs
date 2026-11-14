@@ -20,11 +20,13 @@ public partial class MainWindow : Window
     private Process? game;
     private StreamWriter? log;
     private bool closeAfterOperation;
+    private readonly bool installedMode;
     private string? saveToImport;
     private string Preferences => Path.Combine(builder.Home, "preferencias.txt");
 
-    public MainWindow(string? source)
+    public MainWindow(string? source, string? installedDestination = null, bool repairDesktop = true)
     {
+        installedMode = installedDestination is not null;
         SetupLanguage.Load(builder.Home);
         InitializeComponent();
         LoadLanguageResources();
@@ -34,7 +36,7 @@ public partial class MainWindow : Window
         logTimer = new(TimeSpan.FromMilliseconds(240), System.Windows.Threading.DispatcherPriority.Background,
             (_, _) => FlushLog(), Dispatcher);
         logTimer.Start();
-        AllowDrop = true;
+        AllowDrop = !installedMode;
         DragOver += (_, e) => e.Effects = running is null && e.Data.GetDataPresent(DataFormats.FileDrop)
             ? DragDropEffects.Copy : DragDropEffects.None;
         Drop += (_, e) => { if (running is null && e.Data.GetData(DataFormats.FileDrop) is string[] paths && paths.Length == 1) SelectSource(paths[0]); };
@@ -48,11 +50,36 @@ public partial class MainWindow : Window
                 if (source is null && prefs.Length > 1 && (File.Exists(prefs[1]) || Directory.Exists(prefs[1]))) source = prefs[1];
             }
             if (File.Exists(builder.BuildLog)) LogBox.Text = string.Join(Environment.NewLine, File.ReadLines(builder.BuildLog).TakeLast(120));
+            var optionsFile = Path.Combine(builder.Home, "play-options.txt");
+            if (File.Exists(optionsFile))
+            {
+                var options = File.ReadAllLines(optionsFile);
+                LowMemory.IsChecked = options.Contains("low-memory");
+                Diagnostics.IsChecked = options.Contains("diagnostics");
+            }
         }
         catch (IOException) { }
+        if (installedDestination is not null)
+        {
+            DestinationBox.Text = Path.GetFullPath(installedDestination);
+            SetupCard.Visibility = ImportCard.Visibility = CheckButton.Visibility = BuildButton.Visibility =
+                BuildLogButton.Visibility = Visibility.Collapsed;
+            BuildNav.SetResourceReference(ContentProperty, "PlayNavText");
+            LogHeading.SetResourceReference(System.Windows.Controls.TextBlock.TextProperty, "InstalledLogsText");
+            PlayButton.Style = (Style)FindResource("Primary");
+            Width = 920;
+            Height = 630;
+            SetInstalledStatus();
+        }
+        else if (Builder.Ready(DestinationBox.Text))
+        {
+            SelectSource(source);
+        }
+        else SelectSource(source ?? FindSource());
+
         EnableFsr4.IsChecked = Builder.HasFsr4(DestinationBox.Text);
         EnableDlss.IsChecked = Builder.HasDlss(DestinationBox.Text);
-        SelectSource(source ?? FindSource());
+        if (repairDesktop && Builder.Ready(DestinationBox.Text)) InstallDesktopLauncher();
         ShowBuild(this, new RoutedEventArgs());
         RefreshButtons();
     }
@@ -79,9 +106,29 @@ public partial class MainWindow : Window
         Detail.Text = T("As ferramentas são preparadas no primeiro uso.", "Tools are prepared on first use.");
         SourceHint.Text = T("Arquivo .nx, .nup ou pasta com exefs e romfs. Podes arrastar a cópia para aqui.",
             "Select an .nx or .nup file, or a folder with exefs and romfs. You can drag the game copy here.");
-        if (SourceBox.Text.Length > 0) SelectSource(SourceBox.Text);
+        if (installedMode) SetInstalledStatus();
+        else if (SourceBox.Text.Length > 0) SelectSource(SourceBox.Text);
         SetPendingSave(saveToImport, selectedSaveCount);
         RefreshButtons();
+    }
+
+    private void SetInstalledStatus()
+    {
+        var ready = Builder.Ready(DestinationBox.Text);
+        Status.Text = ready ? T("Jogo pronto a abrir", "Game ready to play") : T("Instalação indisponível", "Installation unavailable");
+        Detail.Text = ready ? "" : T("Confirma a pasta do jogo ou abre o setup para recuperar a instalação.",
+            "Check the game folder or open setup to restore the installation.");
+    }
+
+    private void InstallDesktopLauncher()
+    {
+        try { DesktopLauncher.Install(DestinationBox.Text); }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            Detail.Text = T($"Não foi possível criar o launcher no Ambiente de Trabalho. {error.Message}",
+                $"Could not create the desktop launcher. {error.Message}");
+            AppendLog(Detail.Text);
+        }
     }
 
     private static string? FindSource()
@@ -150,6 +197,7 @@ public partial class MainWindow : Window
         BuildButton.Content = updating ? T("Atualizar jogo", "Update game") : T("Compilar jogo", "Build game");
         BuildButton.IsEnabled = idle && !playing && (updating || SourceBox.Text.Length > 0);
         PlayButton.IsEnabled = idle && !playing && DestinationBox.Text.Length > 0 && Builder.Ready(DestinationBox.Text);
+        Diagnostics.IsEnabled = LowMemory.IsEnabled = idle && !playing;
         ImportButton.IsEnabled = idle && !playing;
         UpdateButton.IsEnabled = idle && !playing;
         CancelButton.Visibility = idle ? Visibility.Collapsed : Visibility.Visible;
@@ -216,40 +264,44 @@ public partial class MainWindow : Window
         Percent.Text = "";
         ProgressBar.IsIndeterminate = true;
         string? package = null;
+        var applyPending = false;
         var destination = DestinationBox.Text;
         try
         {
+            if (Builder.Ready(destination) && Builder.GameRunning(destination))
+                throw new IOException(T("Fecha o jogo antes de procurar atualizações.", "Close the game before checking for updates."));
             var release = await ReleaseUpdater.FindAsync(running.Token);
             if (release is null)
             {
                 Status.Text = T("O launcher está atualizado", "The launcher is up to date");
-                if (Builder.NeedsGameUpdate(destination))
-                    Detail.Text = T("Seleciona Atualizar jogo para aplicar esta versão à instalação.", "Select Update game to apply this version to the installation.");
-                return;
+                applyPending = Builder.NeedsGameUpdate(destination);
+                if (!applyPending) Detail.Text = T("Tens a versão mais recente.", "You are on the latest version.");
             }
-            var gameUpdate = Builder.CanUpdate(destination) &&
-                (!Version.TryParse(Builder.InstalledVersion(destination), out var installed) || installed < release.Version);
-            var message = gameUpdate
-                ? T("Descarregar a nova versão? Se houver alterações ao motor, o Jinra atualiza o jogo na pasta atual e reutiliza os ficheiros existentes.", "Download the new version? If the engine has changed, Jinra updates the game in its current folder and reuses existing files.")
-                : T("Descarregar e abrir a nova versão do launcher?", "Download and open the new launcher version?");
-            if (MessageBox.Show(this, message, $"Jinra-Recomp {release.Version}", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes)
+            else
             {
-                Status.Text = T($"Versão {release.Version} disponível", $"Version {release.Version} is available");
-                return;
+                var message = T("Descarregar o novo launcher? Se o motor tiver mudado, o jogo instalado também será atualizado.",
+                    "Download the new launcher? If the engine has changed, the installed game will be updated too.");
+                if (MessageBox.Show(this, message, $"Jinra-Recomp {release.Version}", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes)
+                {
+                    Status.Text = T($"Versão {release.Version} disponível", $"Version {release.Version} is available");
+                    return;
+                }
+                Status.Text = T($"A descarregar Jinra-Recomp {release.Version}", $"Downloading Jinra-Recomp {release.Version}");
+                ProgressBar.IsIndeterminate = false;
+                var progress = new Progress<double>(fraction => { ProgressBar.Value = fraction; Percent.Text = $"{fraction:P0}"; });
+                package = await ReleaseUpdater.DownloadAsync(release, builder.Home, progress, running.Token);
+                Directory.CreateDirectory(builder.Home);
+                await File.WriteAllLinesAsync(Preferences, [destination, SourceBox.Text], running.Token);
+                using var process = installedMode || Builder.CanUpdate(destination)
+                    ? ReleaseUpdater.Start(package, builder.Home, "--apply-update", destination)
+                    : ReleaseUpdater.Start(package, builder.Home, "--open-update");
             }
-            Status.Text = T($"A descarregar Jinra-Recomp {release.Version}", $"Downloading Jinra-Recomp {release.Version}");
-            ProgressBar.IsIndeterminate = false;
-            var progress = new Progress<double>(fraction => { ProgressBar.Value = fraction; Percent.Text = $"{fraction:P0}"; });
-            package = await ReleaseUpdater.DownloadAsync(release, builder.Home, progress, running.Token);
-            Directory.CreateDirectory(builder.Home);
-            await File.WriteAllLinesAsync(Preferences, [destination, SourceBox.Text], running.Token);
-            using var process = ReleaseUpdater.Start(package, builder.Home, gameUpdate ? "--apply-update" : "--open-update",
-                gameUpdate ? destination : null);
         }
         catch (OperationCanceledException) { Status.Text = T("Atualização cancelada", "Update canceled"); package = null; }
         catch (Exception error) { Status.Text = T("Não foi possível atualizar", "Could not update"); Detail.Text = error.Message; package = null; }
         finally { ProgressBar.IsIndeterminate = false; FinishUpdateOperation(); }
         if (package is not null && !closeAfterOperation) Close();
+        else if (applyPending && !closeAfterOperation) await ApplyUpdateAsync(destination);
     }
 
     private void FinishUpdateOperation()
@@ -291,7 +343,8 @@ public partial class MainWindow : Window
         ProgressBar.Value = 0;
         ProgressBar.IsIndeterminate = true;
         Percent.Text = "";
-        Status.Text = build ? T("A preparar a compilação", "Preparing the build") : T("A verificar a cópia do jogo", "Verifying the game copy");
+        Status.Text = installedMode ? T("A atualizar o jogo", "Updating the game") :
+            build ? T("A preparar a compilação", "Preparing the build") : T("A verificar a cópia do jogo", "Verifying the game copy");
         Detail.Text = "";
         LogBox.Clear();
         try
@@ -328,6 +381,7 @@ public partial class MainWindow : Window
                 }
             }
             AppendLog(Detail.Text);
+            if (build) InstallDesktopLauncher();
         }
         catch (OperationCanceledException)
         {
@@ -337,7 +391,8 @@ public partial class MainWindow : Window
         }
         catch (Exception error)
         {
-            Status.Text = build ? T("A compilação parou", "Build stopped") : T("A verificação falhou", "Verification failed");
+            Status.Text = installedMode ? T("A atualização do jogo parou", "Game update stopped") :
+                build ? T("A compilação parou", "Build stopped") : T("A verificação falhou", "Verification failed");
             Detail.Text = error.Message;
             AppendLog(error.Message);
         }
@@ -395,7 +450,15 @@ public partial class MainWindow : Window
     {
         try
         {
-            var session = builder.StartGame(DestinationBox.Text, Diagnostics.IsChecked == true, LowMemory.IsChecked == true);
+            var diagnostics = Diagnostics.IsChecked == true;
+            var lowMemory = LowMemory.IsChecked == true;
+            var session = builder.StartGame(DestinationBox.Text, diagnostics, lowMemory);
+            try
+            {
+                string[] options = [lowMemory ? "low-memory" : "", diagnostics ? "diagnostics" : ""];
+                File.WriteAllLines(Path.Combine(builder.Home, "play-options.txt"), options);
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException) { AppendLog(error.Message); }
             using var launched = session.Process;
             game = launched;
             RefreshButtons();
@@ -404,6 +467,7 @@ public partial class MainWindow : Window
             var memory = session.MemoryLog is string file ? Builder.RecordMemoryAsync(launched, file, exited) : Task.CompletedTask;
             await exited;
             Status.Text = launched.ExitCode == 0 ? T("Jogo fechado", "Game closed") : T("O jogo terminou com um erro", "The game exited with an error");
+            if (launched.ExitCode == 0) Detail.Text = "";
             if (launched.ExitCode != 0) Detail.Text = T("Consulta logs\\jinra_log.txt na pasta do jogo.", "See logs\\jinra_log.txt in the game folder.");
             try { await memory; }
             catch (Exception error) when (error is IOException or UnauthorizedAccessException or Win32Exception or InvalidOperationException)
@@ -428,6 +492,7 @@ public partial class MainWindow : Window
 
     private void OpenGameFolder(object sender, RoutedEventArgs e) => OpenExisting(DestinationBox.Text);
     private void OpenGameLogs(object sender, RoutedEventArgs e) => OpenExisting(Path.Combine(DestinationBox.Text, "logs"));
+    private void OpenMeasurements(object sender, RoutedEventArgs e) => OpenExisting(Path.Combine(DestinationBox.Text, "diagnostico"));
     private void OpenLogFile(object sender, RoutedEventArgs e) => OpenExisting(builder.BuildLog);
     private void OpenExisting(string path)
     {

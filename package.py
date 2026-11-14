@@ -99,7 +99,7 @@ def package(stage):
     run(compiler / "clang++.exe", "-std=c++20", "-O2", "-static", "-municode", "-mwindows",
         ROOT / "native/bootstrap.cpp", resource, "-o", stub)
     run(compiler / "clang++.exe", "-std=c++20", "-O2", "-static", "-municode", "-mwindows",
-        ROOT / "native/play.cpp", resource, "-o", engine / "jinra-play.exe")
+        ROOT / "native/play.cpp", resource, "-o", stage / "jinra-play.exe")
     kit_zip = stage / "kit.zip"
     print("A empacotar o motor e as ferramentas…", flush=True)
     zip_tree(kit_zip, kit)
@@ -110,6 +110,7 @@ def package(stage):
     run("dotnet", "publish", ROOT / "launcher/Jinra-Recomp.csproj", "-c", "Release", "-r", "win-x64",
         "--self-contained", "true", "-p:NuGetAudit=false", "-p:RestoreIgnoreFailedSources=true",
         *restore, f"-p:Payload={kit_zip}", "-o", publish)
+    shutil.copy2(stage / "jinra-play.exe", publish / "jinra-play.exe")
     (publish / "Jinra-Recomp.UI.pdb").unlink(missing_ok=True)
     shutil.copy2(ROOT / "LICENSE", publish / "LICENSE.txt")
     packed = stage / "launcher.zip"

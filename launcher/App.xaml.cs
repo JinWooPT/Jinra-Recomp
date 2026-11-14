@@ -25,7 +25,7 @@ public partial class App : Application
         if (e.Args is ["--preview", var screenshot])
         {
             ShutdownMode = ShutdownMode.OnExplicitShutdown;
-            var window = new MainWindow(null);
+            var window = new MainWindow(null, repairDesktop: false);
             var content = (FrameworkElement)window.Content;
             window.Content = null;
             content.Measure(new Size(976, 676));
@@ -42,14 +42,20 @@ public partial class App : Application
         }
         var update = e.Args is ["--apply-update", _];
         var updatedLauncher = e.Args is ["--open-update"] or ["--open-update", _];
-        var sourcePath = update ? null : updatedLauncher ? e.Args.ElementAtOrDefault(1) : e.Args.FirstOrDefault();
+        var installedLauncher = e.Args is ["--play-installed", _];
+        var destination = update || installedLauncher ? e.Args[1] : null;
+        var sourcePath = destination is not null ? null : updatedLauncher ? e.Args.ElementAtOrDefault(1) : e.Args.FirstOrDefault();
         var home = new Builder().Home;
         if (update || updatedLauncher) ReleaseUpdater.RememberInstalledUpdate(home);
-        else if (ReleaseUpdater.OpenInstalledUpdate(home, sourcePath)) { Shutdown(); return; }
-        var launcher = new MainWindow(sourcePath);
+        else
+        {
+            var arguments = installedLauncher ? e.Args : sourcePath is null ? ["--open-update"] : new[] { "--open-update", sourcePath };
+            if (ReleaseUpdater.OpenInstalledUpdate(home, arguments)) { Shutdown(); return; }
+        }
+        var launcher = new MainWindow(sourcePath, destination, repairDesktop: !installedLauncher);
         MainWindow = launcher;
         launcher.Show();
-        if (update) _ = launcher.ApplyUpdateAsync(e.Args[1]);
+        if (update && destination is not null) _ = launcher.ApplyUpdateAsync(destination);
     }
 
     private async Task ProbeAsync(string? source, string log)

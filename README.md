@@ -12,11 +12,11 @@ Compilador local para **The Legend of Zelda: Ocarina of Time** da Nintendo Switc
 4. Quando a compilação terminar, seleciona **Jogar**. **Medir fluidez e RAM ao jogar** desativa a geração de fotogramas e guarda três CSV por sessão em `diagnostico` na pasta do jogo. Os ficheiros registam os tempos de fotograma, o tempo gasto em operações como preparar shaders e carregar texturas, e o uso de RAM pelo processo a cada cinco segundos. Mantém o launcher aberto durante a medição.
 5. **Poupar RAM ao jogar** evita carregar a cache Vulkan do jogo. Este modo pode aumentar as pausas ao encontrar efeitos gráficos novos. A opção começa desativada.
 
-Se já tens o jogo compilado, deixa o mesmo destino e escolhe **Atualizar jogo**. A atualização usa a extração existente e reaproveita os ficheiros compilados compatíveis. No fim, o launcher cria `Jinra-Ocarina.exe` no Ambiente de Trabalho para abrir o jogo diretamente.
+Depois de compilar, abre `Jinra-Ocarina.exe` no Ambiente de Trabalho. Este executável abre o launcher instalado, onde podes escolher **Jogar**, **Atualizações**, **Poupar RAM ao jogar** ou **Medir fluidez e RAM ao jogar**. Podes apagar o ficheiro de setup que descarregaste.
 
 ## Atualizações e saves
 
-Abre **Atualizações** no launcher para procurar a versão estável no GitHub. O Jinra valida o tamanho e o SHA-256 do pacote antes de o abrir. Se o motor tiver mudado, recompila na instalação existente e reutiliza a extração e os ficheiros compilados compatíveis. Uma atualização que mude só o launcher pode manter a versão do motor. Os saves e as definições ficam na pasta do jogo.
+Abre **Atualizações** no launcher para procurar a versão estável no GitHub. O Jinra valida o tamanho e o SHA-256 do pacote antes de o abrir. Se o motor tiver mudado, recompila na instalação existente e reutiliza a extração e os ficheiros compilados compatíveis. Uma atualização só do launcher mantém o motor instalado. Ao atualizar da 0.1.6 para a 0.1.7, o executável do Ambiente de Trabalho passa a abrir o launcher e o jogo já compilado é reutilizado. Os saves e as definições ficam na pasta do jogo.
 
 No emulador, abre a pasta de saves do Ocarina of Time. No launcher, usa **Importar saves** e seleciona a pasta que contém diretamente `slot_00`, `slot_01` e as restantes subpastas de partidas. O Jinra importa todos os slots válidos dessa pasta. Podes selecionar a pasta antes da primeira compilação ou importar numa instalação existente com o jogo fechado. Os slots importados substituem os que têm o mesmo número. A cópia anterior fica em `saves-backup` na pasta do jogo.
 

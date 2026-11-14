@@ -6,24 +6,11 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include "command_line.h"
 
 namespace fs = std::filesystem;
-constexpr wchar_t PayloadId[] = L"0.1.6-4aee236";
+constexpr wchar_t PayloadId[] = L"0.1.7-4aee236";
 constexpr char Trailer[] = "JINRAPK1";
-
-std::wstring quote(const std::wstring& value) {
-    std::wstring result = L"\"";
-    size_t slashes = 0;
-    for (const auto c : value) {
-        if (c == L'\\') { ++slashes; continue; }
-        result.append(slashes * (c == L'\"' ? 2 : 1), L'\\');
-        slashes = 0;
-        if (c == L'\"') result += L'\\';
-        result += c;
-    }
-    result.append(slashes * 2, L'\\');
-    return result + L'\"';
-}
 
 bool unpack_payload(const fs::path& executable, const fs::path& path) {
     std::ifstream input(executable, std::ios::binary);
@@ -105,7 +92,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR arguments, int) {
             fs::remove_all(staging, ignored);
         }
         const std::wstring tail(arguments ? arguments : L"");
-        return static_cast<int>(run(app, quote(app.wstring()) + L" " + tail, root, tail.starts_with(L"--")));
+        const bool wait = tail.starts_with(L"--probe ") || tail.starts_with(L"--prepare-tools ") || tail.starts_with(L"--preview ");
+        return static_cast<int>(run(app, quote(app.wstring()) + L" " + tail, root, wait));
     } catch (...) {
         MessageBoxW(nullptr, L"N\u00e3o foi poss\u00edvel abrir o pacote do Jinra-Recomp. Verifica o espa\u00e7o livre e volta a abrir o execut\u00e1vel completo.",
             L"Jinra-Recomp", MB_OK | MB_ICONERROR);

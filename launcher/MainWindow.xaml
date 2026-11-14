@@ -56,7 +56,7 @@
                         </Grid>
                     </Border>
 
-                    <Border Style="{StaticResource Card}" Margin="0,15,0,0">
+                    <Border x:Name="SetupCard" Style="{StaticResource Card}" Margin="0,15,0,0">
                         <StackPanel>
                             <TextBlock Text="{DynamicResource SourceLabel}" FontSize="15" FontWeight="SemiBold" Margin="0,0,0,7"/>
                             <Grid>
@@ -79,10 +79,6 @@
                             </Grid>
                             <WrapPanel Margin="0,13,0,0">
                                 <CheckBox x:Name="WarmShaders" IsChecked="True" Margin="0,0,20,5" Content="{DynamicResource WarmShadersText}"/>
-                                <CheckBox x:Name="Diagnostics" Margin="0,0,20,5" Content="{DynamicResource MeasureText}"
-                                          ToolTip="{DynamicResource MeasureHint}"/>
-                                <CheckBox x:Name="LowMemory" Margin="0,0,0,5" Content="{DynamicResource LowMemoryText}"
-                                          ToolTip="{DynamicResource LowMemoryHint}"/>
                             </WrapPanel>
                             <WrapPanel Margin="0,4,0,0">
                                 <CheckBox x:Name="EnableDlss" Content="{DynamicResource DlssText}"
@@ -104,7 +100,7 @@
                         </StackPanel>
                     </Border>
 
-                    <Border Style="{StaticResource Card}" Margin="0,12,0,0">
+                    <Border x:Name="ImportCard" Style="{StaticResource Card}" Margin="0,12,0,0">
                         <DockPanel>
                             <Button x:Name="ImportButton" DockPanel.Dock="Right" VerticalAlignment="Center" Margin="12,0,0,0"
                                     Content="{DynamicResource ImportSavesText}" Click="ImportSaves"/>
@@ -114,6 +110,18 @@
                                 <TextBlock x:Name="SaveSelection" Visibility="Collapsed" TextWrapping="Wrap" Margin="0,5,0,0"/>
                             </StackPanel>
                         </DockPanel>
+                    </Border>
+
+                    <Border Style="{StaticResource Card}" Margin="0,12,0,0">
+                        <StackPanel>
+                            <TextBlock Text="{DynamicResource PlayOptionsText}" FontSize="15" FontWeight="SemiBold" Margin="0,0,0,10"/>
+                            <CheckBox x:Name="LowMemory" Margin="0,0,0,4" Content="{DynamicResource LowMemoryText}"/>
+                            <TextBlock Text="{DynamicResource LowMemoryHint}" TextWrapping="Wrap"
+                                       Foreground="{StaticResource Muted}" Margin="0,0,0,12"/>
+                            <CheckBox x:Name="Diagnostics" Margin="0,0,0,4" Content="{DynamicResource MeasureText}"/>
+                            <TextBlock Text="{DynamicResource MeasureHint}" TextWrapping="Wrap"
+                                       Foreground="{StaticResource Muted}"/>
+                        </StackPanel>
                     </Border>
 
                     <Border Style="{StaticResource Card}" Margin="0,12,0,0">
@@ -141,13 +149,14 @@
 
             <Grid x:Name="LogPage" Visibility="Collapsed" Margin="26,24,26,22">
                 <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
-                <TextBlock Text="{DynamicResource LogTitle}" FontSize="25" FontWeight="SemiBold" Margin="0,0,0,12"/>
+                <TextBlock x:Name="LogHeading" Text="{DynamicResource LogTitle}" FontSize="25" FontWeight="SemiBold" Margin="0,0,0,12"/>
                 <TextBox x:Name="LogBox" Grid.Row="1" IsReadOnly="True" AcceptsReturn="True" FontFamily="Consolas" FontSize="12"
                          TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" AutomationProperties.Name="{DynamicResource LogTitle}"/>
                 <WrapPanel Grid.Row="2" HorizontalAlignment="Right" Margin="0,12,0,0">
                     <Button Content="{DynamicResource GameFolderText}" Click="OpenGameFolder" Margin="0,0,8,0"/>
                     <Button Content="{DynamicResource GameLogsText}" Click="OpenGameLogs" Margin="0,0,8,0"/>
-                    <Button Content="{DynamicResource BuildLogText}" Click="OpenLogFile"/>
+                    <Button Content="{DynamicResource MeasurementsFolderText}" Click="OpenMeasurements" Margin="0,0,8,0"/>
+                    <Button x:Name="BuildLogButton" Content="{DynamicResource BuildLogText}" Click="OpenLogFile"/>
                 </WrapPanel>
             </Grid>
         </Grid>

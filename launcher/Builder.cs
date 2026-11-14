@@ -14,7 +14,7 @@ internal sealed record BuildUpdate(string Text, double? Progress = null, bool Is
 
 internal sealed class Builder
 {
-    internal const string Version = "0.1.6";
+    internal const string Version = "0.1.7";
     internal const string GameVersion = "0.1.6";
     private const string EngineVersion = GameVersion + "-4aee236";
     private const string ExpectedBuild = "E0F3CCFAF50065AE4EA01EB5AEB13B1A";
@@ -180,16 +180,6 @@ internal sealed class Builder
                 !File.Exists(Path.Combine(output, "jinra_vk.dll")))
                 throw new IOException(Text("A compilação terminou sem todos os ficheiros necessários para jogar.", "The build finished without all the files needed to play."));
             await WriteAtomicAsync(Path.Combine(output, ".jinra-built"), EngineVersion, token);
-            try
-            {
-                await CreateDesktopLauncherAsync(output, token);
-                report.Report(new(Text("Jinra-Ocarina.exe criado no Ambiente de Trabalho.", "Jinra-Ocarina.exe created on the desktop.")));
-            }
-            catch (Exception error) when (error is IOException or UnauthorizedAccessException)
-            {
-                report.Report(new(Text($"O jogo está pronto. Não foi possível criar o executável no Ambiente de Trabalho: {error.Message}",
-                    $"The game is ready. The desktop executable could not be created: {error.Message}")));
-            }
             RemoveOwnedDirectory(extract);
         }
         finally { RemoveOwnedDirectory(extractionPartial); }
@@ -226,31 +216,12 @@ internal sealed class Builder
 
     private static string GameExecutable(string output) => Path.Combine(output, "Jinra-Ocarina.exe");
 
-    private async Task CreateDesktopLauncherAsync(string output, CancellationToken token)
-    {
-        var desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
-        if (!Directory.Exists(desktop)) throw new DirectoryNotFoundException(Text("Pasta do Ambiente de Trabalho indisponível.", "The desktop folder is unavailable."));
-        var path = Path.Combine(desktop, "Jinra-Ocarina.exe");
-        var temporary = path + ".partial-" + Guid.NewGuid().ToString("N");
-        try
-        {
-            await using (var file = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-            {
-                await using var launcher = File.OpenRead(Path.Combine(Payload, "jinra-play.exe"));
-                await launcher.CopyToAsync(file, token);
-                var target = Encoding.Unicode.GetBytes(GameExecutable(output));
-                await file.WriteAsync(target, token);
-                await file.WriteAsync(BitConverter.GetBytes(target.Length), token);
-                await file.WriteAsync("JINRAPLY"u8.ToArray(), token);
-            }
-            File.Move(temporary, path, true);
-        }
-        finally { File.Delete(temporary); }
-    }
-
     internal (Process Process, string? MemoryLog) StartGame(string output, bool diagnostics, bool lowMemory)
     {
         if (!Ready(output)) throw new InvalidOperationException(Text("Compila o jogo antes de o abrir.", "Build the game before launching it."));
+        Directory.CreateDirectory(home);
+        using var builderLock = new FileStream(Path.Combine(home, "build.lock"), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+        if (GameRunning(output)) throw new IOException(Text("O jogo já está aberto.", "The game is already running."));
         var start = new ProcessStartInfo(GameExecutable(output)) { WorkingDirectory = output, UseShellExecute = false };
         start.Environment["JINRA_NO_UPDATE_CHECK"] = "1";
         start.Environment["RX_VK_PRECOMPILE"] = "0";

@@ -3,6 +3,10 @@
                     xmlns:sys="clr-namespace:System;assembly=System.Runtime">
     <sys:String x:Key="SetupLanguageLabel">Idioma do setup</sys:String>
     <sys:String x:Key="BuildNavText">Compilação</sys:String>
+    <sys:String x:Key="PlayNavText">Jogo</sys:String>
+    <sys:String x:Key="PlayOptionsText">Opções ao jogar</sys:String>
+    <sys:String x:Key="InstalledLogsText">Registos</sys:String>
+    <sys:String x:Key="MeasurementsFolderText">Medições</sys:String>
     <sys:String x:Key="LogNavText">Registo</sys:String>
     <sys:String x:Key="UpdateNavText">Atualizações</sys:String>
     <sys:String x:Key="PlatformText">Nintendo Switch 2 · Versão 1.1.1</sys:String>

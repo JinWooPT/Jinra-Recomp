@@ -26,7 +26,7 @@ internal static class ReleaseUpdater
     private sealed record Release([property: JsonPropertyName("tag_name")] string Tag, bool Draft, bool Prerelease, Asset[] Assets);
     private sealed record Asset(string Name, long Size, string Digest, [property: JsonPropertyName("browser_download_url")] string Url);
 
-    internal static bool OpenInstalledUpdate(string home, string? source)
+    internal static bool OpenInstalledUpdate(string home, string[] arguments)
     {
         try
         {
@@ -35,7 +35,7 @@ internal static class ReleaseUpdater
                 version <= Version.Parse(Builder.Version)) return false;
             var package = Path.Combine(home, "updates", version.ToString(), PackageName);
             if (!File.Exists(package)) return false;
-            using var process = Start(package, home, "--open-update", source);
+            using var process = Start(package, home, arguments);
             return true;
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or System.ComponentModel.Win32Exception)
@@ -65,12 +65,11 @@ internal static class ReleaseUpdater
         }
     }
 
-    internal static Process Start(string package, string home, string mode, string? argument)
+    internal static Process Start(string package, string home, params string[] arguments)
     {
         var start = new ProcessStartInfo(package) { UseShellExecute = false, WorkingDirectory = Path.GetDirectoryName(package)! };
         start.Environment["JINRA_RECOMP_HOME"] = home;
-        start.ArgumentList.Add(mode);
-        if (argument is not null) start.ArgumentList.Add(argument);
+        foreach (var argument in arguments) start.ArgumentList.Add(argument);
         return Process.Start(start) ?? throw new IOException(Text("O novo launcher não abriu.", "The new launcher could not be opened."));
     }
 

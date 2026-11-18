@@ -317,11 +317,12 @@ public partial class MainWindow : Window
     internal async Task ApplyUpdateAsync(string destination)
     {
         DestinationBox.Text = destination;
-        WarmShaders.IsChecked = false;
+        if (!Builder.NeedsGameUpdate(destination)) return;
+        WarmShaders.IsChecked = Builder.PrepareShadersOnUpdate(destination);
         EnableDlss.IsChecked = Builder.HasDlss(destination);
         EnableAnr.IsChecked = Builder.HasAnr(destination);
         EnableFsr4.IsChecked = Builder.HasFsr4(destination);
-        if (Builder.NeedsGameUpdate(destination)) await RunOperation(true);
+        await RunOperation(true);
     }
     private async void BuildGame(object sender, RoutedEventArgs e)
     {

@@ -27,6 +27,28 @@ internal sealed class Builder
     internal static bool HasFsr4(string output) => File.Exists(Path.Combine(output, ".jinra-fsr"));
     internal static bool HasAnr(string output) => File.Exists(Path.Combine(output, "anr", "jinra_anr_bridge.dll"));
     internal static bool HasDlss(string output) => File.Exists(Path.Combine(output, "ngx", "nvngx_dlss.dll"));
+    private const string ShaderPreparationChoice = ".jinra-prepare-shaders";
+
+    internal static bool PrepareShadersOnUpdate(string output)
+    {
+        try
+        {
+            var choice = Path.Combine(output, ShaderPreparationChoice);
+            if (File.Exists(choice))
+            {
+                var value = File.ReadAllText(choice).Trim();
+                if (value == "1") return true;
+                if (value == "0") return false;
+            }
+            // Older versions recorded completed preparation in the game folder. The first word is the translator stamp.
+            var prepared = Path.Combine(output, "jinra_prepared.bin");
+            if (!File.Exists(prepared)) return false;
+            using var reader = new BinaryReader(File.OpenRead(prepared));
+            return reader.BaseStream.Length >= sizeof(ulong) && reader.ReadUInt64() != 0;
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException) { return false; }
+    }
+
     internal static string? InstalledVersion(string output)
     {
         var marker = Path.Combine(output, ".jinra-built");
@@ -185,6 +207,7 @@ internal sealed class Builder
                 report.Report(new(Text("A preparar a geração de fotogramas ANR", "Preparing ANR frame generation"), null, true));
                 await RunAsync(Python, ["-I", "scripts/anr_provider.py", "--game", output], Payload, report, token, env);
             }
+            await WriteAtomicAsync(Path.Combine(output, ShaderPreparationChoice), prepareShaders ? "1" : "0", token);
             await WriteAtomicAsync(Path.Combine(output, ".jinra-built"), EngineVersion, token);
             RemoveOwnedDirectory(extract);
         }

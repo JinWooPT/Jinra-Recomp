@@ -146,10 +146,15 @@ uint64_t memory_guest_pages();                        // (the device address of 
 void memory_sync();                                   // (at each submit: pools the game made or let go)
 extern std::atomic<int64_t> memsync_lock_wait_ns;     // (diagnostics: time memory_sync waited for its two locks; the slow-submit line)
 extern std::atomic<int64_t> memsync_part_ns[3];       // (diagnostics: submit_memory_work's memory_sync, memory_take_capture, memory_collect_written)
-BufferRef gpu_buffer(uint64_t gpu, uint64_t size);   // (empty when no pool holds the range)
+BufferRef gpu_buffer(uint64_t gpu, uint64_t size, bool allow_import = true);   // (empty when no pool holds the range)
 /// A range as a binding of the replay sees it: the pool's VRAM mirror when it has one (vk_memory.cpp), else the
 /// imported pool. written: the GPU may write it (copied back to guest memory at the submission's end).
 BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written);
+extern thread_local uint64_t diagnostic_compute_program;
+void diagnostic_memory_frame(uint64_t frame);
+void diagnostic_copy_frame(FILE* file, uint64_t frame);
+void diagnostic_import_stats(uint64_t& count, uint64_t& ns);
+void diagnostic_target_frame(uint64_t frame);
 BufferRef stream_copy(const void* src, uint64_t n);   // vk_draw.cpp: bytes in the recording's stream, as a binding
 /// Authored constants in the recording's stream: never recycled until its recording completes.
 /// Fill mapped, then flush memory through binding.offset + binding.size before GPU use.
@@ -273,7 +278,8 @@ void memory_note_gpu_write(uint64_t gpu, uint64_t size);
 uint64_t vk_timeline_completed();
 /// A future submission completion covering images retired during replay; zero: no safe value.
 uint64_t vk_retirement_value();
-void vk_timeline_wait(uint64_t v);
+namespace capture_trace { struct Wait; }
+void vk_timeline_wait(uint64_t v, capture_trace::Wait* diagnostic = nullptr);
 uint32_t memory_generation();
 /// 1: a page of [guest, guest + size) was written after generation gen; 0: none was
 bool memory_written_since(uint64_t guest, uint64_t size, uint32_t gen);
@@ -335,7 +341,8 @@ bool vram_usage(uint64_t* used, uint64_t* budget, uint64_t* block_free = nullptr
 /// gives no budget (VK_EXT_memory_budget): used is then the game's own allocations
 bool vram_usage_now(uint64_t* used, uint64_t* budget);
 void vma_log_heaps();
-void vma_log_image_blocks();   // (the image pools' blocks: what they hold, and their free ranges)
+void vma_log_image_blocks();
+void diagnostic_memory_census(uint64_t frame);   // (the image pools' blocks: what they hold, and their free ranges)
 PFN_vkGetInstanceProcAddr instance_proc();   // vk_main.cpp
 /// (the Insert menu's Bug report) The device the game runs on and its driver, as the issue form asks them: "NVIDIA
 /// GeForce RTX 4090, NVIDIA 580.95.05" (vk_main.cpp; the log has only the driver's packed number)
@@ -436,10 +443,89 @@ struct ProfThread {
     int64_t exact;   // (the nanoseconds PROF / PROF_EXACT timed on this thread so far)
 };
 inline thread_local ProfThread prof_t;
+#ifdef _WIN32
+namespace capture_trace { uint64_t frame(); }
+enum LoadDetail {
+    LOAD_PIPE_WAIT = PROF_COUNT, LOAD_BANK, LOAD_C1, LOAD_UBO, LOAD_STORAGE, LOAD_SAMPLED,
+    LOAD_VIEW_CREATE, LOAD_SAMPLER_CREATE, LOAD_DETAIL_END
+};
+struct LoadPhase {
+    LoadPhase* parent;
+    uint64_t begin, start_cycles, child_ticks = 0, child_cycles = 0;
+    int phase;
+};
+inline thread_local LoadPhase* load_phase_top;
+inline bool load_path_on() {
+    static const bool enabled = env_on("JINRA_TEST_LOAD_PATH");
+    return enabled;
+}
+inline uint64_t load_path_qpc() {
+    LARGE_INTEGER value{};
+    QueryPerformanceCounter(&value);
+    return uint64_t(value.QuadPart);
+}
+inline uint64_t load_path_cycles() {
+    ULONG64 value = 0;
+    QueryThreadCycleTime(GetCurrentThread(), &value);
+    return value;
+}
+void load_path_emit(int phase, uint64_t start, uint64_t ticks, uint64_t cycles);
+void load_path_flush(uint64_t frame);
+struct LoadPhaseScope {
+    LoadPhase state{};
+    explicit LoadPhaseScope(int phase) {
+        if (!load_path_on() || phase < 0 || !load_phase_top) return;
+        state = {load_phase_top, load_path_qpc(), load_path_cycles(), 0, 0, phase};
+        load_phase_top = &state;
+    }
+    ~LoadPhaseScope() {
+        if (!state.begin) return;
+        const uint64_t end_cycles = load_path_cycles();
+        const uint64_t end = load_path_qpc();
+        const uint64_t duration = end - state.begin;
+        const uint64_t cycles = end_cycles - state.start_cycles;
+        load_phase_top = state.parent;
+        if (state.parent) {
+            state.parent->child_ticks += duration;
+            state.parent->child_cycles += cycles;
+        }
+        load_path_emit(state.phase, state.begin, duration - std::min(duration, state.child_ticks),
+                       cycles - std::min(cycles, state.child_cycles));
+    }
+};
+struct LoadPathFrame {
+    LoadPhase state{};
+    uint64_t frame = 0;
+    LoadPathFrame() {
+        if (!load_path_on() || load_phase_top) return;
+        frame = capture_trace::frame();
+        if (frame < 1000 || frame > 1400) return;
+        state = {nullptr, load_path_qpc(), load_path_cycles(), 0, 0, -1};
+        load_phase_top = &state;
+    }
+    ~LoadPathFrame() {
+        if (!state.begin) return;
+        const uint64_t cycles = load_path_cycles() - state.start_cycles;
+        const uint64_t duration = load_path_qpc() - state.begin;
+        load_phase_top = nullptr;
+        load_path_emit(-1, state.begin, duration, cycles);
+        load_path_emit(-2, state.begin, duration - std::min(duration, state.child_ticks),
+                       cycles - std::min(cycles, state.child_cycles));
+        load_path_flush(frame);
+    }
+};
+#endif
+
 struct ProfScope {
     int phase;   // (-1: PROF_EXACT, no phase of its own)
     int64_t t0, x0;
+#ifdef _WIN32
+    LoadPhaseScope timing;
+    explicit ProfScope(int p) : ProfScope(p, 0) {}
+    ProfScope(int p, int) : phase(p), t0(prof_now()), x0(prof_t.exact), timing(p) {}
+#else
     explicit ProfScope(int p) : phase(p), t0(prof_now()), x0(prof_t.exact) {}
+#endif
     ~ProfScope() {
         const int64_t dt = prof_now() - t0;
         if (phase >= 0) prof_ns[phase] += dt;
@@ -463,7 +549,13 @@ inline int prof_pick(ProfThread& t) {   // (the weight: 8 one time in eight, els
 struct ProfScopeHot {
     int phase, k;
     int64_t t0, x0;
+#ifdef _WIN32
+    LoadPhaseScope timing;
+    explicit ProfScopeHot(int p) : ProfScopeHot(p, 0) {}
+    ProfScopeHot(int p, int) : phase(p), timing(p) {
+#else
     explicit ProfScopeHot(int p) : phase(p) {
+#endif
         ProfThread& t = prof_t;
         if (!t.open++) t.k = prof_pick(t);
         k = t.k, x0 = t.exact, t0 = k ? prof_now() : 0;

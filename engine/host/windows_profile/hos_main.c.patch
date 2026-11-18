@@ -1,0 +1,245 @@
+--- hos_main.c
++++ hos_main.c
+@@ -431,6 +431,8 @@
+     static const char *const prefixes[] = {"RX_", "HOS_", "JINRA_", "EDEN_", "NVN_", "SDL_"};
+     int ok = 0;
+     for (size_t i = 0; i < sizeof prefixes / sizeof *prefixes; i++) ok |= !strncmp(name, prefixes[i], strlen(prefixes[i]));
++    if (!strcmp(name, "JINRA_PROFILE_PYTHON") || !strcmp(name, "JINRA_RESOURCE_HELPER_LOG") ||
++        !strncmp(name, "JINRA_TEST_", 11) || !strcmp(name, "JINRA_PRIVATE_RESOURCE_PIPE")) return 0;
+     if (!ok || !strcmp(name, "HOS_ENV_FILE") || !strcmp(name, "SDL_DYNAMIC_API")) return 0;
+     /* nor the libraries SDL loads by name (SDL_VULKAN_LIBRARY, SDL_OPENGL_LIBRARY, SDL_VIDEO_GL_DRIVER,
+        SDL_VIDEO_EGL_DRIVER...): a bare file name is looked for beside the game and in the current folder on Windows */
+@@ -1119,6 +1121,40 @@
+     oot_gamedata_bool(c, 0xcea220d3u, &child);     /* Sequence_IsChildhood */
+     const uint64_t events = oot_singleton(c, OOT_EVENTMGR_SLOT);
+     const int flags = (events && recomp_load64(c, events + 104) ? 1 : 0) | (loading ? 2 : 0) | (child ? 4 : 0);
++#ifdef _WIN32
++    static int preview_profile = -1;
++    static int64_t preview_frames, preview_draws;
++    static int preview_low_draw_samples;
++    static int preview_requested;
++    if (preview_profile < 0) preview_profile = env_on("JINRA_PREVIEW_RAM");
++    if (preview_profile && !preview_requested && (flags & 1) &&
++        (!strcmp(map, "KakarikoVillage_Child") || !strcmp(map, "KakarikoVillage_Adult"))) {
++        char destination[80];
++        int64_t frames = 0, draws = 0;
++        int width = 0, height = 0;
++        int rx_control_frame_info(int64_t *, int64_t *, int *, int *);
++        if (oot_gamedata_string(c, 0xee27bf71u, destination, sizeof destination) &&
++            (!strcmp(destination, "HyruleField_Child") || !strcmp(destination, "HyruleField_Adult")) &&
++            rx_control_frame_info(&frames, &draws, &width, &height)) {
++            const int64_t advance = frames - preview_frames;
++            const int64_t work = draws - preview_draws;
++            if (preview_frames && advance > 0 && work >= 0 && work < 11 * advance) ++preview_low_draw_samples;
++            else preview_low_draw_samples = 0;
++            preview_frames = frames;
++            preview_draws = draws;
++            if (preview_low_draw_samples >= 2) {
++                HMODULE renderer = GetModuleHandleW(L"jinra_vk.dll");
++                if (renderer) {
++                    void (*request)(void) = (void (*)(void))GetProcAddress(renderer, "jinra_preview_request_capture_trim");
++                    if (request) {
++                        request();
++                        preview_requested = 1;
++                    }
++                }
++            }
++        } else preview_low_draw_samples = 0, preview_frames = 0;
++    } else preview_low_draw_samples = 0, preview_frames = 0;
++#endif
+     AcquireSRWLockExclusive(&oot_map_lock);
+     memcpy(oot_map, map, sizeof oot_map);
+     oot_flags = flags;
+@@ -1290,6 +1326,15 @@
+     if (flying && oot_event_playing(c)) flying = 0;
+     if (!flying) flying_actor = 0;
+     const int64_t now = hos_now_ns();
++    static int position_timing = -1;
++    if (position_timing < 0) position_timing = env_on("HOS_JINRA_SCENE_TIMING");
++    if (position_timing) {
++        const float x = oot_load_float(c, actor + 796);
++        const float y = oot_load_float(c, actor + 800);
++        const float z = oot_load_float(c, actor + 804);
++        hos_log("timing link %lld actor %llx event %d %.6f %.6f %.6f", (long long)now, (unsigned long long)actor,
++                oot_event_playing(c), (double)x, (double)y, (double)z);
++    }
+     __atomic_store_n(&flight_player_seen, now, __ATOMIC_RELAXED);
+     if (marked_actor != actor || now - last_player_tick > 2000000000LL) marked_controller = 0;
+     last_player_tick = now;
+@@ -1652,7 +1697,7 @@
+     hos_occlusion_off = e && e[0] == '1';
+     if (hos_occlusion_off) hos_log("occlusion off: the game makes no occlusion queries (JINRA_OCCLUSION_OFF=1)");
+ }
+-/* (issue 1241) The game needs about 10 GB of memory and swap together (the page file on Windows): on 8 GB of RAM
++/* (jinra, issue 1241) The game needs about 10 GB of memory and swap together (the page file on Windows): on 8 GB of RAM
+    and no swap it closed before the title with no word of why, and adding swap let it play. Below that, the log says so and
+    a message says it once at boot; the game starts anyway. The text, or 0 when there is enough */
+ #define HOS_MEMORY_NEEDED_MB 10240ull
+@@ -1729,6 +1774,124 @@
+     return 0;
+ }
+ 
++#ifdef _WIN32
++static void preview_default(const char *key, const char *value) {
++    if (!getenv(key)) _putenv_s(key, value);
++}
++
++#include <bcrypt.h>
++static const char *profile_message;
++
++static int profile_file(const char *path) {
++    DWORD attrs = GetFileAttributesA(path);
++    return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
++}
++
++static int profile_activate(const char *directory) {
++    char profile[MAX_PATH], script[MAX_PATH], python[MAX_PATH], work[MAX_PATH], tmp[MAX_PATH];
++    char pending[MAX_PATH + 40], pipe[84], command[MAX_PATH * 4 + 96];
++    const char *local = getenv("LOCALAPPDATA");
++    if (snprintf(profile, sizeof profile, "%s\\jinra-perfil-015", directory) >= sizeof profile ||
++        snprintf(script, sizeof script, "%s\\gestao.py", profile) >= sizeof script || !profile_file(script)) return 0;
++    preview_default("JINRA_TEST_FIRST_VISIT_WAITS", "1");
++    preview_default("JINRA_TEST_FIFO_CADENCE", "1");
++    preview_default("JINRA_TEST_EARLY_READBACK", "1");
++    preview_default("JINRA_TEST_TARGET_SHAPE_REUSE", "1");
++    preview_default("JINRA_TEST_SHARED_CAPTURE", "1");
++    if (getenv("JINRA_TEST_RESOURCE_BATCH_PATH")) {
++        profile_message = "gestao de recursos fornecida pela sessao externa.";
++        return 1;
++    }
++    profile_message = "gestao seletiva indisponivel; restantes opcoes carregadas.";
++    if (snprintf(python, sizeof python, "%s\\python\\python.exe", profile) >= sizeof python) return 1;
++    if (!profile_file(python)) {
++        const char *provided = getenv("JINRA_PROFILE_PYTHON");
++        const char *base = provided ? strrchr(provided, '\\') : NULL;
++        const char *slash = provided ? strrchr(provided, '/') : NULL;
++        if (slash && (!base || slash > base)) base = slash;
++        if (provided && strlen(provided) < sizeof python && base && !_stricmp(base + 1, "python.exe") &&
++            ((provided[0] && provided[1] == ':' && (provided[2] == '\\' || provided[2] == '/'))) &&
++            profile_file(provided)) {
++            strcpy(python, provided);
++        } else if (!local || snprintf(python, sizeof python, "%s\\Jinra-Recomp\\kit\\0.1.8-4aee236\\tools\\python\\python.exe", local) >= sizeof python ||
++                   !profile_file(python)) return 1;
++    }
++    const DWORD tmp_len = GetTempPathA(sizeof tmp, tmp);
++    if (!tmp_len || tmp_len >= sizeof tmp) return 1;
++    const DWORD pid = GetCurrentProcessId();
++    unsigned char random[16];
++    if (BCryptGenRandom(NULL, random, sizeof random, BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) return 1;
++    char token[33];
++    for (int i = 0; i < 16; i++) snprintf(token + i * 2, 3, "%02x", random[i]);
++    if (snprintf(work, sizeof work, "%sJinra-015-%lu-%s", tmp, (unsigned long)pid, token) >= sizeof work) return 1;
++    if (snprintf(pending, sizeof pending, "%s\\pending-resources.bin", work) >= sizeof pending) return 1;
++    if (snprintf(command, sizeof command, "\"%s\" -I -B -S \"%s\" %lu \"%s\"", python, script, (unsigned long)pid, work) >= sizeof command) return 1;
++    if (!CreateDirectoryA(work, NULL)) return 1;
++    const char *external = getenv("HOS_CONTROL");
++    if (!external || !*external) {
++        snprintf(pipe, sizeof pipe, "jinra-recursos-%lu-%s", (unsigned long)pid, token);
++        _putenv_s("HOS_CONTROL", pipe);
++        _putenv_s("JINRA_PRIVATE_RESOURCE_PIPE", "1");
++    }
++    _putenv_s("JINRA_TEST_RESOURCE_BATCH_PATH", pending);
++    preview_default("JINRA_TEST_RESOURCE_QUEUE", "1");
++    preview_default("JINRA_TEST_RESOURCE_REFERENCES", "1");
++    preview_default("JINRA_TEST_RESOURCE_RESIDENT_LINKS", "1");
++    preview_default("JINRA_TEST_RESOURCE_BROAD", "1");
++    preview_default("JINRA_TEST_RESOURCE_DECOMMIT", "1");
++    preview_default("JINRA_TEST_GUEST_RAM_AUDIT", "@jinra-memory-only");
++    STARTUPINFOA startup = {0};
++    PROCESS_INFORMATION child = {0};
++    startup.cb = sizeof startup;
++    if (!CreateProcessA(python, command, NULL, NULL, FALSE, CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS,
++                        NULL, profile, &startup, &child)) {
++        RemoveDirectoryA(work);
++        return 1;
++    }
++    CloseHandle(child.hThread);
++    CloseHandle(child.hProcess);
++    profile_message = "perfil nativo ativo; gestor seletivo iniciado.";
++    return 1;
++}
++
++static void preview_runtime_profile(int argc, char **argv) {
++    for (int i = 1; i < argc; ++i)
++        if (!strcmp(argv[i], "--prepare-shaders")) return;
++    char directory[MAX_PATH], driver[MAX_PATH], hyrule[MAX_PATH], kakariko[MAX_PATH];
++    const DWORD length = hos_game_path_a(directory, MAX_PATH);
++    if (!length || length >= MAX_PATH) return;
++    char *last = strrchr(directory, SEP);
++    if (!last) return;
++    *last = 0;
++    if (snprintf(driver, sizeof driver, "%s\\jinra-previa-ram\\driver", directory) >= sizeof driver ||
++        snprintf(hyrule, sizeof hyrule, "%s\\jinra-previa-ram\\planicie.txt", directory) >= sizeof hyrule ||
++        snprintf(kakariko, sizeof kakariko, "%s\\jinra-previa-ram\\kakariko.txt", directory) >= sizeof kakariko) return;
++    const DWORD attr = GetFileAttributesA(driver);
++    if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY) ||
++        GetFileAttributesA(hyrule) == INVALID_FILE_ATTRIBUTES || GetFileAttributesA(kakariko) == INVALID_FILE_ATTRIBUTES) return;
++    if (!getenv("__GL_SHADER_DISK_CACHE_PATH")) {
++        _putenv_s("__GL_SHADER_DISK_CACHE_PATH", driver);
++        SetEnvironmentVariableA("__GL_SHADER_DISK_CACHE_PATH", driver);
++        SetEnvironmentVariableA("__GL_SHADER_DISK_CACHE", "1");
++    }
++    preview_default("JINRA_PREVIEW_RAM", "1");
++    if (!profile_activate(directory)) {
++        preview_default("RX_VK_PCACHE_LOAD", "0");
++        preview_default("JINRA_TEST_WARM_EMPTY_CACHE", "1");
++    } else if (getenv("RX_VK_PCACHE_LOAD") && !strcmp(getenv("RX_VK_PCACHE_LOAD"), "0")) {
++        preview_default("JINRA_TEST_WARM_EMPTY_CACHE", "1");
++    }
++    preview_default("JINRA_TEST_SCENE_TRIGGER", "1");
++    preview_default("JINRA_TEST_SCENE_KEYS", hyrule);
++    preview_default("JINRA_TEST_KAKARIKO_KEYS", kakariko);
++    preview_default("JINRA_TEST_SHADOW_SWEEP_BOUNDED", "1");
++    preview_default("JINRA_TEST_SMALL_COPY_ONLY", "1");
++    preview_default("JINRA_TEST_COPY_64K", "1");
++    preview_default("RX_VK_SMALL_COPY_PHASE", "1");
++    preview_default("RX_VK_RT_SMALL_POOL", "1");
++}
++#endif
++
+ int main(int argc, char **argv) {
+ #else
+ static int game_main(int argc, char **argv) {
+@@ -1740,6 +1903,7 @@
+         hos_relaunch_keep_env();
+     }
+     load_jinra_env();
++    preview_runtime_profile(argc, argv);
+ #endif
+     occlusion_switch();
+     {
+@@ -1795,6 +1959,7 @@
+         }
+     }
+     hos_log("Jinra-Recomp %s", JINRA_VERSION);
++    if (profile_message) hos_log("Jinra perfil 0.1.5: %s", profile_message);
+     removed_switch_notes();
+     void hos_control_start(const char *version);
+     hos_control_start(JINRA_VERSION);   /* (HOS_CONTROL=<socket>: the control bridge, host/control.c) */
+@@ -1967,6 +2132,8 @@
+     hos_prof_start();   /* HOS_PROFILE=<seconds> */
+     void hos_chain_start(void);
+     hos_chain_start();  /* HOS_CHAIN=<path> */
++    extern void jinra_gap_init(void);
++    jinra_gap_init();
+ #ifdef _WIN32
+     timeBeginPeriod(1);   /* 1 ms timer resolution: the 60 Hz vsync and the game's frame pacing sleep in short steps */
+     no_power_throttling();
+@@ -2005,7 +2172,7 @@
+     (void)p;
+     ExitProcess((UINT)game_main(game_argc, game_argv));
+ }
+-/* (linux) Room in the drivers' own shader caches for what the preparation builds. The pipelines the notes predict (~43,000
++/* (jinra, linux) Room in the drivers' own shader caches for what the preparation builds. The pipelines the notes predict (~43,000
+    in OoT, vk_draw.cpp predict_run) are built into the driver's disk cache alone, not into jinra_vk_pipelines.bin, which is read in whole
+    at every start. NVIDIA's cache holds 1 GiB by default and cleans itself down to that as it is written: a full preparation filled
+    it to the limit (1026 MB) and the pipelines it dropped were compiled again in play. Mesa's (RADV, ANV) has the same 1 GiB default.
+@@ -2017,7 +2184,7 @@
+ }
+ #include <errno.h>
+ #include <sys/stat.h>
+-/* (linux) NVIDIA's driver keeps no shader cache at all when __GL_SHADER_DISK_CACHE_PATH names a folder that does not exist:
++/* (jinra, linux) NVIDIA's driver keeps no shader cache at all when __GL_SHADER_DISK_CACHE_PATH names a folder that does not exist:
+    it neither creates it nor falls back to ~/.cache/nvidia, and every start compiles every pipeline again (a test of 300 pipelines:
+    7.9 ms each at the first start and at the second, against 0.06 ms from the cache; driver 620.70). The folder a player or a
+    launcher named is made here, before anything loads Vulkan. Mesa makes its own (MESA_SHADER_CACHE_DIR, parents too). Not needed:

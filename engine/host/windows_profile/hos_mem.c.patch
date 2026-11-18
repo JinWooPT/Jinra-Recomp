@@ -1,0 +1,157 @@
+--- hos_mem.c
++++ hos_mem.c
+@@ -1,6 +1,15 @@
+ /* Guest memory map: the system region (our own objects), the heap, address regions.
+    The whole 4 GB window is committed up front (hos_main.c), so "mapping" here is only bookkeeping and zeroing. */
+ #include "hos.h"
++
++#ifdef _WIN32
++extern void guest_ram_audit(char action, uint64_t lo, uint64_t length, uint64_t caller);
++extern void jinra_ram_allocation_stack(Ctx*, uint64_t, uint64_t);
++#define LIFE(action, lo, bytes) guest_ram_audit(action, lo, bytes, (uint64_t)__builtin_return_address(0))
++#else
++#define LIFE(action, lo, bytes) ((void)0)
++#endif
++
+ #ifndef JINRA_ENV_H   /* (env_on: the switches' one rule) */
+ #include "../gpu/vk/compat/jinra_env.h"
+ #endif
+@@ -57,7 +66,7 @@
+ 
+ uint64_t hos_region_floor(void) { return region_floor; }
+ 
+-/* (the control bridge: host/control.c) Whether [addr, addr + size) is wholly inside memory the runtime has
++/* (jinra, the control bridge: host/control.c) Whether [addr, addr + size) is wholly inside memory the runtime has
+    mapped for the game: the image, the system region in use (our own objects), the heap, or an address region. A read or
+    write outside it is refused, never faulted. The classes it may fall in (0 none): */
+ enum { HOS_MEM_IMAGE = 1, HOS_MEM_SYSTEM, HOS_MEM_HEAP, HOS_MEM_REGION };
+@@ -145,6 +154,26 @@
+     for (uint64_t p = addr >> 12; p < (addr + size + 0xFFF) >> 12 && p < (1ULL << 20); p++) pages_used[p >> 6] |= 1ULL << (p & 63);
+ }
+ 
++#ifdef _WIN32
++#include <psapi.h>
++extern uint64_t jinra_resource_release_base(void);
++
++static uint64_t jinra_resource_resident(uint64_t lo, uint64_t hi) {
++    PSAPI_WORKING_SET_EX_INFORMATION addresses[4096];
++    const size_t count = (size_t)((hi - lo) >> 12);
++    if (!count || count > 4096) return UINT64_MAX;
++    for (size_t i = 0; i < count; ++i) {
++        addresses[i].VirtualAddress = GP(lo + (i << 12));
++        addresses[i].VirtualAttributes.Flags = 0;
++    }
++    if (!K32QueryWorkingSetEx(GetCurrentProcess(), addresses, (DWORD)(count * sizeof(addresses[0]))))
++        return UINT64_MAX;
++    uint64_t pages = 0;
++    for (size_t i = 0; i < count; ++i) pages += addresses[i].VirtualAttributes.Valid;
++    return pages << 12;
++}
++#endif
++
+ static void discard_pages(uint64_t addr, uint64_t size) {
+     if (!hos_guest_range(addr, size)) return;   /* (guest pages only; Linux's discard zeroes what it is given) */
+     const uint64_t lo = (addr + 0xFFF) & ~0xFFFULL, hi = (addr + size) & ~0xFFFULL;
+@@ -161,8 +190,21 @@
+         looked = 1;
+         discard = (DiscardFn)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "DiscardVirtualMemory");
+     }
+-    if (!discard || discard(GP(lo), (SIZE_T)(hi - lo)) != ERROR_SUCCESS)
+-        VirtualAlloc(GP(lo), (SIZE_T)(hi - lo), MEM_RESET, PAGE_READWRITE);
++    const uint64_t selected = jinra_resource_release_base();
++    const int sample = lo <= selected && selected < hi;
++    if (sample) LIFE('B', lo, jinra_resource_resident(lo, hi));
++    if (sample && env_on("JINRA_TEST_RESOURCE_DECOMMIT") && VirtualFree(GP(lo), (SIZE_T)(hi - lo), MEM_DECOMMIT)) {
++        LIFE('M', lo, hi - lo);
++    } else {
++        const DWORD status = discard ? discard(GP(lo), (SIZE_T)(hi - lo)) : ERROR_CALL_NOT_IMPLEMENTED;
++        if (status == ERROR_SUCCESS) {
++            if (sample) LIFE('K', lo, hi - lo);
++        } else {
++            void *reset = VirtualAlloc(GP(lo), (SIZE_T)(hi - lo), MEM_RESET, PAGE_READWRITE);
++            if (sample) LIFE(reset ? 'R' : 'E', lo, reset ? hi - lo : GetLastError());
++        }
++    }
++    if (sample) LIFE('O', lo, jinra_resource_resident(lo, hi));
+ #elif !defined(__EMSCRIPTEN__)
+     extern int hos_posix_guest_discard(void *p, size_t n);   /* (hos_main.c: MADV_REMOVE on the memfd window) */
+     extern int rx_guest_imported(uint64_t lo, uint64_t hi);
+@@ -196,8 +238,19 @@
+             break;
+         }
+     }
+-    UNLOCK();
+-    if (freed_size) discard_pages(freed, freed_size);
++    int released_under_lock = 0;
++#ifdef _WIN32
++    const uint64_t selected = jinra_resource_release_base();
++    if (freed_size && selected >= freed && selected - freed < freed_size && env_on("JINRA_TEST_RESOURCE_DECOMMIT")) {
++        discard_pages(freed, freed_size);
++        released_under_lock = 1;
++    }
++#endif
++    UNLOCK();
++    if (freed_size) {
++        if (!released_under_lock) discard_pages(freed, freed_size);
++        LIFE('L', freed, freed_size);
++    }
+ }
+ 
+ /* ---- nn::os memory -------------------------------------------------------------------------------------- */
+@@ -273,6 +326,8 @@
+ /* nn::os::FreeAddressRegion(unsigned long) -> Result */
+ HLE(_ZN2nn2os17FreeAddressRegionEm) {
+     HOS_TRACE_CALL("FreeAddressRegion");
++    if (env_on("JINRA_TEST_STATE8_LIFE"))
++        guest_ram_audit('l', ARG(0), 0, c->x[30]);
+     hos_region_free(ARG(0));
+     RET(0);
+ }
+@@ -319,6 +374,10 @@
+         else
+             for (int i = 0; i < nruns; i++) memset(GP(runs[i][0]), 0, runs[i][1] - runs[i][0]);
+     }
++    LIFE('A', a, n);
++#ifdef _WIN32
++    jinra_ram_allocation_stack(c, a, n);
++#endif
+     HOS_WRITTEN(GP(a), n);
+     RET(0);
+ }
+@@ -331,6 +390,8 @@
+         RET(0xCA01);
+         return;
+     }
++    if (env_on("JINRA_TEST_STATE8_LIFE"))
++        guest_ram_audit('f', ARG(0), ARG(1), c->x[30]);
+     if (ARG(0) + ARG(1) > (1ULL << 32)) {   /* (mkw-recomp: the pair of AllocateMemoryPages' commit above) */
+         const uint64_t lo = (ARG(0) + 0xFFF) & ~0xFFFULL, hi = (ARG(0) + ARG(1)) & ~0xFFFULL;
+         /* (pages the Vulkan back end imported, as part of a pool's 16 MB chunk, stay committed and are zeroed: the GPU
+@@ -338,17 +399,26 @@
+         extern int rx_guest_imported(uint64_t lo, uint64_t hi);
+         if (hi > lo && rx_guest_imported(lo, hi)) memset(GP(lo), 0, (size_t)(hi - lo));
+ #if defined(_WIN32)
+-        else if (hi > lo) VirtualFree(GP(lo), (SIZE_T)(hi - lo), MEM_DECOMMIT);
++        else if (hi > lo) {
++            const uint64_t selected = jinra_resource_release_base();
++            const int sample = lo <= selected && selected < hi;
++            if (sample) LIFE('B', lo, jinra_resource_resident(lo, hi));
++            if (VirtualFree(GP(lo), (SIZE_T)(hi - lo), MEM_DECOMMIT)) LIFE('M', lo, hi - lo);
++            else if (sample) LIFE('E', lo, GetLastError());
++            if (sample) LIFE('O', lo, jinra_resource_resident(lo, hi));
++        }
+ #else
+         else if (hi > lo) {   /* (linux: kept mapped, the pages read as zero; MADV_REMOVE on the memfd window) */
+             extern int hos_posix_guest_discard(void *p, size_t n);
+             hos_posix_guest_discard(GP(lo), (size_t)(hi - lo));
+         }
+ #endif
++        LIFE('F', ARG(0), ARG(1));
+         RET(0);
+         return;
+     }
+     discard_pages(ARG(0), ARG(1));
++    LIFE('F', ARG(0), ARG(1));
+     RET(0);
+ }
+ 

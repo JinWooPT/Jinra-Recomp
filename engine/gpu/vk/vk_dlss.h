@@ -69,6 +69,9 @@ int dlss_fg_frames(VkCommandBuffer cmd, VkImage color, VkImageView color_view, u
                    const VkImage* out, const VkImageView* out_views, bool blend, uint64_t sequence);
 /// Frame generation at Off or Auto (no fixed multiplier: dlss_fg_frames is not asked): its feature, if made, let go and its
 /// memory back, as when the Frame generation by row changes. Each such present (vk_replay.cpp); nothing to do is one load
+bool anr_fg_installed();
+bool anr_fg_failed();
+bool anr_fg_made_last_set();
 void dlss_fg_idle();
 /// Before the process exits (mkwvk_close_asked): its feature let go with the queue idle
 void dlss_fg_close();

@@ -70,7 +70,10 @@
 #include "vk_programs.h"
 #include "vk_pipelines.h"
 #include "warm_bounded.h"
+#include "capture_trace.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
+
+#include "jinra-lazy-graphics-shaders.h"
 
 namespace mkwvk {
 // (RX_VK_DRAW_STATS: the pointer table's regions, vk_bank.cpp)
@@ -391,7 +394,19 @@ thread_local VkCommandBuffer rec_cmd = VK_NULL_HANDLE;
 thread_local uint64_t rec_value = 0;
 
 // ---- per recording: a descriptor pool and an upload stream (reset when the recording is reused) ----
+using DescriptorDemand = std::array<uint32_t, 6>;
+
+bool observe_descriptor_capacity() {
+    static const bool observe = env_on("JINRA_TEST_DESC_CAPACITY");
+    return observe;
+}
+
 struct RecordingRes {
+    uint32_t sets_used = 0, sets_peak = 0;
+    DescriptorDemand descriptors_used{}, descriptors_peak{};
+    VkDescriptorSetLayout last_measured_layout = VK_NULL_HANDLE;
+    DescriptorDemand last_demand{};
+
     VkDescriptorPool pool = VK_NULL_HANDLE;
     std::vector<VkDescriptorPool> extra;   // (pools added when the first ran out)
     // (the stream in use: the first, or one a recording that outgrew it was moved to. Descriptors written before the move hold
@@ -418,6 +433,56 @@ const uint64_t kStream = (getenv("RX_VK_STREAM_MB") ? (uint64_t)std::max(1, atoi
 std::atomic<uint64_t> stream_peak{0}, stream_extra{0}, stream_grown{0};
 std::deque<RecordingRes> res;   // (a deque: a recording thread keeps its own in place while another is added)
 thread_local RecordingRes* cur = nullptr;
+
+bool descriptor_pools_on_demand() {
+    static const bool on = [] {
+        const bool enabled = env_on("JINRA_TEST_DESC_ON_DEMAND");
+        if (enabled) logf("Jinra descriptor pools on demand enabled");
+        return enabled;
+    }();
+    return on;
+}
+
+void descriptor_record_allocation(RecordingRes& slot, const Program& program) {
+    slot.sets_used++;
+    if (slot.last_measured_layout != program.set_layout) {
+        slot.last_demand = {};
+        const auto add = [](uint32_t& count, const auto& values) {
+            for (const auto& descriptor : values) count += descriptor.count;
+        };
+        for (const auto& stage : program.stages) {
+            add(slot.last_demand[0], stage.info.constant_buffer_descriptors);
+            add(slot.last_demand[1], stage.info.storage_buffers_descriptors);
+            add(slot.last_demand[2], stage.info.texture_descriptors);
+            add(slot.last_demand[3], stage.info.image_descriptors);
+            add(slot.last_demand[4], stage.info.texture_buffer_descriptors);
+            add(slot.last_demand[5], stage.info.image_buffer_descriptors);
+        }
+        slot.last_measured_layout = program.set_layout;
+    }
+    for (size_t i = 0; i < slot.descriptors_used.size(); ++i)
+        slot.descriptors_used[i] += slot.last_demand[i];
+}
+
+void descriptor_recording_end(RecordingRes& r, int slot) {
+    if (!r.sets_used) return;
+    bool new_peak = r.sets_used > r.sets_peak;
+    r.sets_peak = std::max(r.sets_peak, r.sets_used);
+    for (size_t i = 0; i < r.descriptors_used.size(); ++i) {
+        new_peak |= r.descriptors_used[i] > r.descriptors_peak[i];
+        r.descriptors_peak[i] = std::max(r.descriptors_peak[i], r.descriptors_used[i]);
+    }
+    if (new_peak || !r.extra.empty()) {
+        const auto& n = r.descriptors_used;
+        logf("Jinra descriptor recording qpc=%llu slot=%d sets=%u uniform=%u storage=%u sampler=%u image=%u "
+             "uniform_texel=%u storage_texel=%u overflow=%zu peak=%u",
+             (unsigned long long)load_path_qpc(), slot, r.sets_used, n[0], n[1], n[2], n[3], n[4], n[5],
+             r.extra.size(), (unsigned)new_peak);
+    }
+    r.sets_used = 0;
+    r.descriptors_used = {};
+    r.last_measured_layout = VK_NULL_HANDLE;
+}
 
 VkDescriptorPool make_pool() {
     // (each recording's pool: 8192 sets of up to 32768 descriptors a type, for the programs with more descriptors than the push limit,
@@ -831,6 +896,7 @@ void play_cache_begin() {
 /// (pipeline_cache_save's thread, or the window's close) play's generation taken away once nothing is being made with it, a new one
 /// in its place, and written alone. One not written is kept and tried again at the next save
 void play_cache_save() {
+    if (env_on("JINRA_TEST_WARM_EMPTY_CACHE")) return;
     static std::mutex mu;   // (a save's thread and the window's close, pipeline_cache_close)
     std::lock_guard lk(mu);
     static std::vector<PlayCache*> unsaved;
@@ -955,6 +1021,29 @@ bool pcache_drop_stale() {
     }();
     return dropped;
 }
+// Experimental path for an already prepared installation. Reuse the cache opened
+// by the normal draw path, and leave the offline preparation untouched.
+bool index_normal_play = false;
+std::atomic<bool> scene_cache_ready{false};
+void prewarm_known_scene(bool from_scene = false);
+void queue_startup_index() {
+    if (!index_normal_play || !programs_load_at_create() || !env_on("RX_VK_INDEX_EARLY") ||
+        precompile_wanted() || pcache_load_off() || !pcache ||
+        !dev.vk13.pipelineCreationCacheControl) return;
+    static std::once_flag once;
+    std::call_once(once, [] {
+        const auto start = std::chrono::steady_clock::now();
+        jobs_push([start] {
+            auto refs = pipe_notes_refs();
+            if (refs.empty()) return;
+            const auto count = refs.size();
+            programs_index(std::move(refs), {});
+            logf("vk: startup index: %zu notes published %.1f ms after cache initialization",
+                 count, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+        });
+    });
+}
+
 void pcache_init() {
     if (pcache) return;
     char exe[MAX_PATH];
@@ -977,10 +1066,13 @@ void pcache_init() {
     }
     logf("vk: pipeline cache %s (%zu KB)", pcache_path.c_str(), data.size() >> 10);
     data = {};
-    if (pcache) play_files_merge();
+    if (pcache && !(off && env_on("JINRA_TEST_WARM_EMPTY_CACHE"))) play_files_merge();
     // (what it holds as read, the play files too: a save of data that size has nothing to add to the files)
     size_t held = 0;
     if (pcache && vkGetPipelineCacheData(dev.device, pcache, &held, nullptr) == VK_SUCCESS) pcache_saved_size = held;
+    queue_startup_index();
+    if (index_normal_play && pcache) scene_cache_ready.store(true, std::memory_order_release);
+    prewarm_known_scene();
 }
 
 struct Targets {
@@ -1028,6 +1120,10 @@ VkPrimitiveTopology pipeline_topology(const Program& p, VkPrimitiveTopology draw
 
 /// A graphics pipeline: built on a worker (vk_jobs.h); ready once pipeline is set (null: it failed)
 struct PipeEntry {
+#ifdef _WIN32
+    uint64_t measured_key = 0;
+    std::atomic<bool> measured_first_bind{false};
+#endif
     std::atomic<bool> ready{false};
     std::atomic<VkPipeline> pipeline{VK_NULL_HANDLE};   // (a fast-linked one first, the worker's full build over it)
     std::atomic<uint8_t> how{0};   // (the census: how play made it, UseCounters::made_how; 0: before play, or not made)
@@ -1139,9 +1235,132 @@ std::atomic<int> st_driver_faults{0};
 /// driver_faults)
 void note_driver_fault() { st_driver_faults.fetch_add(1, std::memory_order_relaxed); }
 #ifdef _WIN32
+namespace {
+struct PipelineTraceContext {
+    uint64_t key = 0;
+    int part = -1;
+    char origin = 'r';
+};
+thread_local PipelineTraceContext trace_context;
+struct ScopedPipelineTrace {
+    PipelineTraceContext saved = trace_context;
+    ScopedPipelineTrace(uint64_t key, int part, char origin = trace_context.origin) {
+        trace_context = {key, part, origin};
+    }
+    ~ScopedPipelineTrace() { trace_context = saved; }
+};
+
+struct PipelineSample {
+    uint64_t begin_ns;
+    uint64_t finish_ns;
+    uint64_t feedback_ns;
+    uint32_t thread;
+    uint32_t flags;
+    int32_t result;
+    char kind;
+    PipelineTraceContext context;
+    std::atomic<bool> ready;
+};
+std::array<PipelineSample, 32768> pipeline_samples{};
+std::atomic<size_t> pipeline_sample_count{0};
+
+struct PipelineUseSample {
+    uint64_t qpc, frame, key;
+    char kind, event;
+    std::atomic<bool> ready;
+};
+std::array<PipelineUseSample, 262144> pipeline_uses{};
+std::atomic<size_t> pipeline_use_count{0};
+
+void write_pipeline_uses() {
+    const char* path = std::getenv("JINRA_TEST_PIPE_USES");
+    if (!path) return;
+    FILE* out = std::fopen(path, "wb");
+    if (!out) return;
+    std::fputs("qpc,frame,key,kind,event\n", out);
+    const size_t total = pipeline_use_count.load();
+    if (total > pipeline_uses.size())
+        logf("vk: pipeline use trace lost %zu records", total - pipeline_uses.size());
+    for (size_t i = 0; i < std::min(total, pipeline_uses.size()); ++i) {
+        const auto& s = pipeline_uses[i];
+        if (!s.ready.load(std::memory_order_acquire)) continue;
+        std::fprintf(out, "%llu,%llu,%016llx,%c,%c\n", (unsigned long long)s.qpc,
+                      (unsigned long long)s.frame, (unsigned long long)s.key, s.kind, s.event);
+    }
+    std::fclose(out);
+}
+
+void record_pipeline_use(uint64_t key, char kind, char event) {
+    static const bool enabled = [] {
+        return std::getenv("JINRA_TEST_PIPE_USES") && std::atexit(write_pipeline_uses) == 0;
+    }();
+    if (!enabled) return;
+    const size_t slot = pipeline_use_count.fetch_add(1, std::memory_order_relaxed);
+    if (slot >= pipeline_uses.size()) return;
+    auto& sample = pipeline_uses[slot];
+    sample.qpc = load_path_qpc();
+    sample.frame = capture_trace::frame();
+    sample.key = key;
+    sample.kind = kind;
+    sample.event = event;
+    sample.ready.store(true, std::memory_order_release);
+}
+
+const char* pipeline_trace_path() {
+    static const char* path = []() -> const char* {
+        const char* file = std::getenv("JINRA_TEST_PIPE_FEEDBACK");
+        if (!file || !*file) return nullptr;
+        std::atexit([] {
+            FILE* out = std::fopen(std::getenv("JINRA_TEST_PIPE_FEEDBACK"), "wb");
+            if (!out) return;
+            std::fputs("begin_ns,end_ns,feedback_ns,thread,flags,result,kind,key,part,origin\n", out);
+            const size_t count = std::min(pipeline_sample_count.load(), pipeline_samples.size());
+            for (size_t i = 0; i < count; ++i) {
+                const auto& s = pipeline_samples[i];
+                if (!s.ready.load(std::memory_order_acquire)) continue;
+                std::fprintf(out, "%llu,%llu,%llu,%u,%u,%d,%c,%016llx,%d,%c\n",
+                    (unsigned long long)s.begin_ns, (unsigned long long)s.finish_ns, (unsigned long long)s.feedback_ns,
+                    (unsigned)s.thread, (unsigned)s.flags, (int)s.result, s.kind,
+                    (unsigned long long)s.context.key, s.context.part, s.context.origin);
+            }
+            std::fclose(out);
+        });
+        return file;
+    }();
+    return path;
+}
+
+template <class CI, class Fn>
+VkResult profile_pipeline(Fn make, VkPipelineCache cache, const CI* ci, VkPipeline* pipe, char kind) {
+    if (!pipeline_trace_path()) return make(dev.device, cache, 1, ci, nullptr, pipe);
+    VkPipelineCreationFeedback feedback{};
+    VkPipelineCreationFeedbackCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO};
+    info.pNext = ci->pNext;
+    info.pPipelineCreationFeedback = &feedback;
+    CI traced = *ci;
+    traced.pNext = &info;
+    const uint64_t start = load_path_qpc();
+    const auto status = make(dev.device, cache, 1, &traced, nullptr, pipe);
+    const uint64_t end = load_path_qpc();
+    const size_t slot = pipeline_sample_count.fetch_add(1, std::memory_order_relaxed);
+    if (slot < pipeline_samples.size()) {
+        auto& record = pipeline_samples[slot];
+        record.begin_ns = start;
+        record.finish_ns = end;
+        record.feedback_ns = feedback.duration;
+        record.thread = GetCurrentThreadId();
+        record.flags = feedback.flags;
+        record.result = status;
+        record.kind = kind;
+        record.context = trace_context;
+        record.ready.store(true, std::memory_order_release);
+    }
+    return status;
+}
+}
 __declspec(noinline) VkResult guarded_graphics(VkPipelineCache cache, const VkGraphicsPipelineCreateInfo* ci, VkPipeline* pl) {
     __try {
-        return vkCreateGraphicsPipelines(dev.device, cache, 1, ci, nullptr, pl);
+        return profile_pipeline(vkCreateGraphicsPipelines, cache, ci, pl, 'g');
     } __except (1) {
         *pl = VK_NULL_HANDLE;   // (whatever the driver wrote before it faulted is not a pipeline)
         note_driver_fault();
@@ -1151,7 +1370,7 @@ __declspec(noinline) VkResult guarded_graphics(VkPipelineCache cache, const VkGr
 }
 __declspec(noinline) VkResult guarded_compute(VkPipelineCache cache, const VkComputePipelineCreateInfo* ci, VkPipeline* pl) {
     __try {
-        return vkCreateComputePipelines(dev.device, cache, 1, ci, nullptr, pl);
+        return profile_pipeline(vkCreateComputePipelines, cache, ci, pl, 'c');
     } __except (1) {
         *pl = VK_NULL_HANDLE;   // (whatever the driver wrote before it faulted is not a pipeline)
         note_driver_fault();
@@ -1226,6 +1445,97 @@ VkResult guarded_compute(VkPipelineCache cache, const VkComputePipelineCreateInf
 #endif
 VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo, int part = -1,
                           bool* cold = nullptr);
+// Diagnostic replay of the graphics keys observed in a previously measured scene.
+// This measures the upper bound of a scene-specific cache, with one background job.
+Targets note_targets(const PipeNote& n);
+void prewarm_scene_keys(const char* path, const char* name, std::once_flag& once, bool from_scene,
+                        bool allow_compile = true, bool trace_keys = false) {
+    const bool warm_empty = pcache_load_off() && env_on("JINRA_TEST_WARM_EMPTY_CACHE");
+    if (!path || !*path || !scene_cache_ready.load(std::memory_order_acquire) || (pcache_load_off() && !warm_empty) ||
+        !dev.vk13.pipelineCreationCacheControl || env_on("RX_VK_INDEX_EARLY")) return;
+    std::call_once(once, [path, name, from_scene, warm_empty, allow_compile, trace_keys] {
+#ifdef _WIN32
+        if (from_scene) logf("vk: %s pipeline test queued qpc %llu", name, (unsigned long long)capture_trace::qpc());
+#endif
+        jobs_push_serial([path, name, warm_empty, allow_compile, trace_keys] {
+            const auto start = std::chrono::steady_clock::now();
+            std::unique_ptr<FILE, decltype(&fclose)> list(fopen(path, "r"), fclose);
+            if (!list) return;
+            std::unordered_set<uint64_t> keys;
+            const size_t max_keys = warm_empty ? 2048 : 256;
+            for (unsigned long long key; keys.size() < max_keys && fscanf(list.get(), "%llx", &key) == 1;)
+                keys.insert(key);
+            if (keys.empty()) return;
+            std::unique_ptr<FILE, decltype(&fclose)> notes(fopen(pipe_notes_file().c_str(), "rb"), fclose);
+            if (!notes) return;
+            std::unordered_map<uint64_t, std::vector<NoteRef>> programs;
+            std::vector<uint64_t> order;
+            for (const auto& ref : pipe_notes_refs()) {
+                if (!keys.count(ref.key)) continue;
+                auto& refs = programs[ref.prog];
+                if (refs.empty()) order.push_back(ref.prog);
+                refs.push_back(ref);
+            }
+            size_t hits = 0, cold = 0, failed = 0, matched = 0, retained = 0;
+            constexpr uint64_t limit = 64ull << 20;
+            uint64_t remaining = limit;
+            const bool retain = env_on("JINRA_TEST_SCENE_REUSE");
+            auto note = std::make_unique<PipeNote>();
+            for (uint64_t key : order) {
+                const auto create = [&](Program& p) {
+                    if (p.compute || p.failed) return;
+                    for (const auto& ref : programs.at(key)) {
+                        if (p.variant != ref.variant || !pipe_note_at(notes.get(), ref.at, note.get())) continue;
+                        ++matched;
+                        ensure_layout(p);
+                        bool requires_compile = false;
+#ifdef _WIN32
+                        ScopedPipelineTrace trace(ref.key, -1, 'w');
+#endif
+                        const uint64_t asked_at = trace_keys ? capture_trace::qpc() : 0;
+                        VkPipeline pipeline = pipeline_from_caches(p, *note, &requires_compile);
+                        const bool cache_hit = pipeline != VK_NULL_HANDLE;
+                        if (!pipeline && requires_compile && warm_empty && allow_compile)
+                            pipeline = build_graphics(p, note->s, note_targets(*note), (VkPrimitiveTopology)note->topo);
+                        const bool published = pipeline && pipeline_keep_ready(ref.key, pipeline);
+#ifdef _WIN32
+                        if (trace_keys) {
+                            logf("Jinra Zora preparation key=%016llx qpc=%llu end=%llu tid=%lu hit=%u compile_required=%u published=%u",
+                                (unsigned long long)ref.key, (unsigned long long)asked_at,
+                                (unsigned long long)capture_trace::qpc(), (unsigned long)GetCurrentThreadId(),
+                                (unsigned)cache_hit, (unsigned)requires_compile, (unsigned)published);
+                        }
+#endif
+                        if (pipeline) {
+                            hits += published;
+                        } else {
+                            cold += requires_compile;
+                            failed += !requires_compile;
+                        }
+                    }
+                };
+                if (retain) retained += program_cache_prepare_scene(key, remaining, create);
+                else program_cache_borrow(key, create);
+            }
+            if (retain)
+                logf("vk: scene program reuse: %zu programs, %llu bytes retained", retained,
+                     (unsigned long long)(limit - remaining));
+#ifdef _WIN32
+            logf("vk: %s pipeline test complete qpc %llu", name, (unsigned long long)capture_trace::qpc());
+#endif
+            logf("vk: %s pipeline test: %zu keys, %zu programs, %zu matching notes, %zu ready, %zu compile required, %zu failed, %.1f ms",
+                 name, keys.size(), order.size(), matched, hits, cold, failed,
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+        });
+    });
+}
+void prewarm_known_scene(bool from_scene) {
+    const char* override_path = getenv("JINRA_TEST_SCENE_KEYS");
+    const bool scene_trigger = !override_path || env_on("JINRA_TEST_SCENE_TRIGGER");
+    if (scene_trigger != from_scene) return;
+    static std::once_flag once;
+    prewarm_scene_keys(override_path ? override_path : "jinra_planicie_pipelines.txt", "scene", once, from_scene);
+}
 bool gpl_libs_cached() {
     static const bool on = !env_on("RX_VK_GPL_NO_CACHE");
     return on;
@@ -1258,6 +1568,9 @@ VkComputePipelineCreateInfo compute_pipeline_info(const Program& q, bool noopt) 
 /// neither has it, and where the driver cannot be asked that way
 VkPipeline compute_pipeline_cached(const Program& q, bool noopt) {
     if (!dev.vk13.pipelineCreationCacheControl) return VK_NULL_HANDLE;
+#ifdef _WIN32
+    ScopedPipelineTrace trace(mix(q.key, q.variant), -1);
+#endif
     VkComputePipelineCreateInfo asked = compute_pipeline_info(q, noopt);
     asked.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
     VkPipeline cached = VK_NULL_HANDLE;
@@ -1267,6 +1580,65 @@ VkPipeline compute_pipeline_cached(const Program& q, bool noopt) {
 VkResult graphics_with(VkPipelineCache cache, const VkGraphicsPipelineCreateInfo* ci, VkPipeline* pl) {
     return cache && cache == pcache ? cached_graphics(ci, pl) : guarded_graphics(cache, ci, pl);
 }
+
+VkResult graphics_for_cached_program(const Program& program, VkPipelineCache cache,
+                                    const VkGraphicsPipelineCreateInfo& original, VkPipeline* pipeline) {
+    if (!original.stageCount || std::all_of(original.pStages, original.pStages + original.stageCount,
+                    [](const auto& stage) { return stage.module != VK_NULL_HANDLE; }))
+        return graphics_with(cache, &original, pipeline);
+
+    JinraGraphicsReferences refs;
+    if (!jinra_read_graphics_references(program, refs) || refs.size != original.stageCount)
+        return VK_ERROR_INITIALIZATION_FAILED;
+
+    std::array<VkPipelineShaderStageCreateInfo, 8> stages{};
+    std::array<VkPipelineShaderStageModuleIdentifierCreateInfoEXT, 8> ids{};
+    for (uint32_t i = 0; i < refs.size; ++i) {
+        const auto& saved = refs.stages[i];
+        stages[i] = original.pStages[i];
+        if (stages[i].stage != saved.stage) return VK_ERROR_INITIALIZATION_FAILED;
+        ids[i] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_MODULE_IDENTIFIER_CREATE_INFO_EXT,
+                  stages[i].pNext, saved.identifier.identifierSize, saved.identifier.identifier};
+        stages[i].pNext = &ids[i];
+        stages[i].module = VK_NULL_HANDLE;
+    }
+    auto request = original;
+    request.pStages = stages.data();
+    request.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+    VkResult result = graphics_with(cache, &request, pipeline);
+    jinra_lazy_graphics_result(result == VK_SUCCESS);
+    if (result != VK_PIPELINE_COMPILE_REQUIRED || (original.flags & VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT))
+        return result;
+
+    const uint64_t miss_qpc = load_path_qpc();
+    const auto miss_start = std::chrono::steady_clock::now();
+    // A miss gets complete modules only for this creation. The resulting pipeline owns what it needs.
+    struct Modules {
+        std::array<VkShaderModule, 8> handles{};
+        ~Modules() {
+            for (const auto handle : handles) {
+                if (handle) vkDestroyShaderModule(dev.device, handle, nullptr);
+            }
+        }
+    } modules;
+    for (uint32_t i = 0; i < refs.size; ++i) {
+        stages[i] = original.pStages[i];
+        modules.handles[i] = jinra_load_graphics_module(refs.stages[i]);
+        if (!modules.handles[i]) return VK_ERROR_INITIALIZATION_FAILED;
+        stages[i].module = modules.handles[i];
+    }
+    request.flags = original.flags;
+    *pipeline = VK_NULL_HANDLE;
+    result = graphics_with(cache, &request, pipeline);
+    const double elapsed_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - miss_start).count();
+    logf("Jinra lazy graphics recovery qpc=%llu tid=%lu program=%016llx variant=%llu stages=%u ms=%.3f result=%d",
+         static_cast<unsigned long long>(miss_qpc), static_cast<unsigned long>(GetCurrentThreadId()),
+         static_cast<unsigned long long>(program.key), static_cast<unsigned long long>(program.variant),
+         refs.size, elapsed_ms, static_cast<int>(result));
+    return result;
+}
+
 
 /// A target's write mask: the state's channel mask, nothing for a target the fragment shader leaves unwritten
 /// (Maxwell keeps its texels; Vulkan writes undefined values: TOTK's maxwell.md 1.1)
@@ -2143,6 +2515,14 @@ uint64_t pipeline_key(const Program& p, const NvnState& s, const Targets& at, Vk
     return key;
 }
 
+void trace_scene_pipeline(const char* name, uint64_t serial, uint64_t program, uint64_t key) {
+#ifdef _WIN32
+    static const bool timing = capture_trace::file() && env_on("JINRA_TEST_TIMING");
+    if (timing)
+        capture_trace::add({name, capture_trace::qpc(), capture_trace::frame(), GetCurrentThreadId(), serial, program, key});
+#endif
+}
+
 PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo, const uint8_t color_types[8]) {
     // the key: what is baked into it (the rest is dynamic state)
     // (and which variant: p.key is the same for all the variants of a program by its textures' types, and a draw of
@@ -2186,7 +2566,14 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
     auto it = pipelines.find(key);
     if (it != pipelines.end()) return remember(mine[key] = it->second.get());
     pcache_init();
+    trace_scene_pipeline("pipe_first", s.prog.serial, p.key, key);
+#ifdef _WIN32
+    record_pipeline_use(key, 'g', 'D');
+#endif
     PipeEntry* e = pipelines.emplace(key, std::make_unique<PipeEntry>()).first->second.get();
+#ifdef _WIN32
+    e->measured_key = key;
+#endif
     if (kept_ready_n.load(std::memory_order_acquire)) {   // (made at its program's create call: ready, as one the precompile built)
         VkPipeline kept = VK_NULL_HANDLE;
         {
@@ -2199,6 +2586,9 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
         }
         if (kept) {
             e->pipeline = kept;
+#ifdef _WIN32
+            record_pipeline_use(key, 'g', 'H');
+#endif
             e->ready.store(true, std::memory_order_release);
             census.pipes_taken++;
             return remember(e);
@@ -2259,6 +2649,9 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
 VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo, int part, bool* cold) {
     if (at.n < 0 || at.n > 8) return VK_NULL_HANDLE;   // (at most 8 colour targets)
     const Shader::Info& vs = *vertex_info(p);
+#ifdef _WIN32
+    ScopedPipelineTrace trace(pipeline_trace_path() ? pipeline_key(p, s, at, topo) : 0, part);
+#endif
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<VkPipelineShaderStageCreateInfo> stages;
     for (const Stage& st : p.stages) {
@@ -2484,7 +2877,7 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
         }
     }
     const VkPipelineCache cache = lib_cached || (part < 0 && !driver_cache_only) ? pcache : driver_ask_cache;
-    VkResult r = graphics_with(cache, &ci, &pl);
+    VkResult r = graphics_for_cached_program(p, cache, ci, &pl);
     // The AMD Windows compiler can reject ordinary graphics pipelines with its optimizer on. (A fault caught in it is kDriverFault
     // now, VK_ERROR_UNKNOWN before: the retry stays for both, under the gate)
     if (dev.props.vendorID == 0x1002 && dev.task_mesh_fallback && !p.mesh && part < 0 &&
@@ -2718,7 +3111,14 @@ VkSampler sampler_make(int id, bool compare) {
         ci.pNext = &rm;
     }
     VkSampler sm = VK_NULL_HANDLE;
-    if (vkCreateSampler(dev.device, &ci, nullptr, &sm) != VK_SUCCESS) {
+    VkResult result;
+    {
+#ifdef _WIN32
+        LoadPhaseScope detail(LOAD_SAMPLER_CREATE);
+#endif
+        result = vkCreateSampler(dev.device, &ci, nullptr, &sm);
+    }
+    if (result != VK_SUCCESS) {
         remember_failure();   // (an error's output handle is undefined, not a resource to cache or destroy)
         return VK_NULL_HANDLE;
     }
@@ -2939,6 +3339,9 @@ VkDescriptorBufferInfo uniform_range(const NvnState& s, const Stage& st, uint32_
             if (d.cbuf_index == index) used = std::max(used, d.cbuf_offset + d.count * 16u);
     if (index == 0 || index == 2) {   // the driver's banks: only what the program reads of them
         FINE_SCOPE(FT_BANK);
+#ifdef _WIN32
+            LoadPhaseScope detail(LOAD_BANK);
+#endif
         FINE_N(FC_BANK_CALLS, 1);
         const uint32_t n = std::clamp<uint32_t>((used + 15) & ~15u, 16, 0xA00);
         BankCache& c = bank_cache()[index == 2][std::clamp(st.nvn_stage, 0, kNvnStages - 1)];
@@ -2994,6 +3397,9 @@ VkDescriptorBufferInfo uniform_range(const NvnState& s, const Stage& st, uint32_
     }
     if (index == 1) {
         FINE_SCOPE(FT_C1);
+#ifdef _WIN32
+            LoadPhaseScope detail(LOAD_C1);
+#endif
         FINE_N(FC_C1_CALLS, 1);
         const void* key = &st;
         auto it = cur->c1_at.find(key);
@@ -3008,6 +3414,9 @@ VkDescriptorBufferInfo uniform_range(const NvnState& s, const Stage& st, uint32_
     }
     if (index >= 3 && index < 3 + 16) {
         FINE_SCOPE(FT_UBO);
+#ifdef _WIN32
+            LoadPhaseScope detail(LOAD_UBO);
+#endif
         FINE_N(FC_UBO_CALLS, 1);
         const nvn_p_bind_buf& u = s.ubo[std::clamp(st.nvn_stage, 0, kNvnStages - 1)][index - 3];
         if (!u.addr) return bi;
@@ -3304,6 +3713,9 @@ void build_descriptors(const NvnState& s, const Program& p) {
         }
         for (const auto& d : info.storage_buffers_descriptors) {
             FINE_SCOPE(FT_STORAGE);
+#ifdef _WIN32
+            LoadPhaseScope detail(LOAD_STORAGE);
+#endif
             FINE_N(FC_SSBO_DESCS, d.count);
             VkWriteDescriptorSet w = write(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, d.count);
             const size_t first = dw().bufs.size();
@@ -3561,6 +3973,9 @@ void build_descriptors(const NvnState& s, const Program& p) {
         texel_views(info.image_buffer_descriptors, VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, true);
         for (const auto& d : info.texture_descriptors) {
             FINE_SCOPE(FT_TEX);
+#ifdef _WIN32
+            LoadPhaseScope detail(LOAD_SAMPLED);
+#endif
             VkWriteDescriptorSet w = write(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, d.count);
             const size_t first = dw().imgs.size();
             const VkImageViewType vt = view_type(d.type);
@@ -3605,6 +4020,12 @@ void build_descriptors(const NvnState& s, const Program& p) {
                                (unsigned long long)p.key, k, handle, tex ? tex->id : 0, (unsigned long long)(tex ? tex->gpu : 0),
                                tex ? tex->width : 0, tex ? tex->height : 0, tex ? tex->layers : 0, tex ? (void*)tex->image : nullptr,
                                (void*)view, view ? "" : " (dummy)");
+#ifdef _WIN32
+                static const bool trace_terrain = env_on("JINRA_TEST_WAIT_DETAIL") && capture_trace::file();
+                if (trace_terrain && view && tex && tex->width == 1365 && tex->height == 1365 && tex->layers == 90)
+                    capture_trace::add({"terrain_read", capture_trace::qpc(), capture_trace::frame(), GetCurrentThreadId(),
+                                        texture_segment(), tex->gpu, tex->id, p.key, host->gpu_guest(tex->gpu)});
+#endif
                 if (view && tex && tex->gpu_written) draw_sampled().push_back(tex);
                 if (!view) view = dummies.view[(int)vt], st_dummy_textures += handle != 0;
                 dw().imgs.push_back({sampler_for((int)(handle >> 20), d.is_depth), view, VK_IMAGE_LAYOUT_GENERAL});
@@ -3669,6 +4090,26 @@ TLS_OBJECT(pushed, std::array<Pushed, 2>)   // [graphics, compute]
 std::string state_list_snapshot(bool* present) { return state_list_bytes(present); }   // (vk_draw.h: the menu's)
 /// A compute pipeline of the back end's own, made elsewhere (vk_fsr3.cpp), through the pipeline cache the game's are kept
 /// in across runs (jinra_vk_pipelines.bin), as theirs are: in play through the play caches (create_cached), so that it does not grow
+#ifdef _WIN32
+
+void diagnostic_small_copy_loading();
+
+extern "C" __declspec(dllexport) void jinra_timing_scene_open() {
+    diagnostic_small_copy_loading();
+    prewarm_known_scene(true);
+}
+extern "C" __declspec(dllexport) void jinra_timing_zora_open() {
+    static std::once_flag once;
+    const bool allow_compile = !env_on("JINRA_TEST_ZORA_PROBE_ONLY");
+    prewarm_scene_keys(getenv("JINRA_TEST_ZORA_KEYS"), "Zora", once, true, allow_compile, true);
+}
+extern "C" __declspec(dllexport) void jinra_timing_kakariko_open() {
+    diagnostic_small_copy_loading();
+    static std::once_flag once;
+    prewarm_scene_keys(getenv("JINRA_TEST_KAKARIKO_KEYS"), "Kakariko", once, true);
+}
+#endif
+
 /// the start's cache; before the cache is loaded, with none. (Outside the unnamed namespace: vk_fsr3.cpp links to it)
 VkResult shared_compute_pipeline(const VkComputePipelineCreateInfo* ci, VkPipeline* out) {
     return cached_compute(ci, out);
@@ -3816,16 +4257,23 @@ bool bind_descriptors(VkCommandBuffer cmd, VkPipelineBindPoint bp, const Program
         for (const VkWriteDescriptorSet& w : dw().writes) fine_n[FC_POOL_DESCS] += w.descriptorCount;
     }
     VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    if (!cur->pool && descriptor_pools_on_demand()) cur->pool = make_pool();
     ai.descriptorPool = cur->extra.empty() ? cur->pool : cur->extra.back();
     if (!ai.descriptorPool) return false;
     ai.descriptorSetCount = 1;
     ai.pSetLayouts = &p.set_layout;
     VkDescriptorSet set = VK_NULL_HANDLE;
-    if (vkAllocateDescriptorSets(dev.device, &ai, &set) != VK_SUCCESS) {
+    const VkResult first_result = vkAllocateDescriptorSets(dev.device, &ai, &set);
+    if (first_result != VK_SUCCESS) {
+        const bool observe = observe_descriptor_capacity();
+        const uint64_t before = observe ? load_path_qpc() : 0;
         const VkDescriptorPool pool = make_pool();
         if (!pool) return false;
         ai.descriptorPool = pool;
-        if (vkAllocateDescriptorSets(dev.device, &ai, &set) != VK_SUCCESS) {
+        const VkResult retry = vkAllocateDescriptorSets(dev.device, &ai, &set);
+        if (observe) logf("Jinra descriptor overflow before=%llu after=%llu result=%d retry=%d",
+                          (unsigned long long)before, (unsigned long long)load_path_qpc(), (int)first_result, (int)retry);
+        if (retry != VK_SUCCESS) {
             vkDestroyDescriptorPool(dev.device, pool, nullptr);
             return false;
         }
@@ -3836,6 +4284,7 @@ bool bind_descriptors(VkCommandBuffer cmd, VkPipelineBindPoint bp, const Program
             return false;
         }
     }
+    if (observe_descriptor_capacity()) descriptor_record_allocation(*cur, p);
     for (auto& w : dw().writes) w.dstSet = set;
     vkUpdateDescriptorSets(dev.device, (uint32_t)dw().writes.size(), dw().writes.data(), 0, nullptr);
     vkCmdBindDescriptorSets(cmd, bp, p.layout, 0, 1, &set, 0, nullptr);
@@ -4886,12 +5335,16 @@ void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value) {
     ParLock lk;
     if ((size_t)slot >= res.size()) res.resize((size_t)slot + 1);
     RecordingRes& r = res[slot];
-    if (!r.pool) {
-        r.pool = make_pool();
-    } else {
+    if (observe_descriptor_capacity()) descriptor_recording_end(r, slot);
+    const bool reuse_pool = r.pool != VK_NULL_HANDLE;
+    if (reuse_pool) {
         vkResetDescriptorPool(dev.device, r.pool, 0);
         for (VkDescriptorPool p : r.extra) vkDestroyDescriptorPool(dev.device, p, nullptr);
         r.extra.clear();
+    } else if (!descriptor_pools_on_demand()) {
+        r.pool = make_pool();
+    }
+    if (reuse_pool || descriptor_pools_on_demand()) {
         // (the streams the last recording of the slot grew into: given back after 120 recordings that stayed in the first, the
         // slot's last one being done (recording_wait). RX_VK_STREAM_KEEP=1: kept)
         static const bool keep = env_on("RX_VK_STREAM_KEEP");
@@ -6763,6 +7216,20 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
             if (skip) return;
         }
     }
+    // A depth-tested opaque colour draw can be the only draw that colours
+    // Link over an already-visible depth surface on the first step into water.
+    // Evaluate the historical guard only while awaiting a shader or pipeline.
+    const auto preserve_opaque_colour = [&] {
+        const bool needed = at.n && at.depth && s.ds.dt && !s.ds.dw && !s.color.blend_en;
+        if (needed) {
+            static const bool noted = [] {
+                logf("Jinra: preserved a pending opaque colour draw (first-water guard active)");
+                return true;
+            }();
+            (void)noted;
+        }
+        return needed;
+    };
     // Wait for translation before reading its stages. A pending pipeline may be left out only when no stage writes
     // global memory or storage buffers/images and its targets hold an earlier frame's picture. RX_VK_PIPE_SKIP=0:
     // pipelines are always waited for too.
@@ -6770,12 +7237,20 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     // RX_VK_PIPE_SKIP=2 restores the old translation skip for persistent targets; after translation, memory-writing pipelines wait.
     static const bool always_wait = getenv("RX_VK_PIPE_SKIP") && atoi(getenv("RX_VK_PIPE_SKIP")) == 0;
     static const bool legacy_translation_skip = getenv("RX_VK_PIPE_SKIP") && atoi(getenv("RX_VK_PIPE_SKIP")) == 2;
+    static const bool first_visit_waits = env_on("JINRA_TEST_FIRST_VISIT_WAITS");
     auto wait_for = [&](const std::atomic<bool>& ready) {
         PROF_EXACT();
         const auto t0 = std::chrono::steady_clock::now();
-        jobs_wait(ready);
+        bool ran_here;
+        {
+#ifdef _WIN32
+            LoadPhaseScope wait_scope(LOAD_PIPE_WAIT);
+#endif
+            ran_here = jobs_wait(ready);
+        }
         st_waits++;
         st_wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        return ran_here;
     };
     // RX_VK_TRANSLATE_WAIT_MS=<ms> (off unless set): a translation not ready, for a draw whose targets hold an
     // earlier frame's picture, is waited for at most this long a frame in all, on each recording thread, without taking the
@@ -6799,8 +7274,9 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         return ms;
     }();
     if (!cp->ready.load(std::memory_order_acquire)) {
-        if (legacy_translation_skip && targets_persistent(at)) return use.skipped(), void(st_pending_skips++);
-        if (!always_wait && translate_wait_ms >= 0 && targets_persistent(at)) {
+        const bool may_defer = !preserve_opaque_colour() && targets_persistent(at);
+        if (legacy_translation_skip && may_defer) return use.skipped(), void(st_pending_skips++);
+        if (!always_wait && translate_wait_ms >= 0 && may_defer) {
             static thread_local uint64_t budget_frame = ~0ull;
             static thread_local double budget_left = 0;
             const uint64_t frame = texture_frame_no();
@@ -6819,7 +7295,14 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
             }
             if (!ready) return use.skipped(), void(st_pending_skips++);
         } else {
-            wait_for(cp->ready);
+            const uint64_t begin = first_visit_waits ? capture_trace::qpc() : 0;
+            const bool ran_here = wait_for(cp->ready);
+            if (first_visit_waits) {
+                const uint64_t end = capture_trace::qpc();
+                logf("Jinra first visit translation qpc=%llu end=%llu frame=%llu tid=%lu program=%016llx executed_here=%u",
+                     (unsigned long long)begin, (unsigned long long)end, (unsigned long long)capture_trace::frame(),
+                     (unsigned long)GetCurrentThreadId(), (unsigned long long)cp->key, (unsigned)ran_here);
+            }
         }
     }
     if (exposure_log_on() && cp) exposure_note(s, *cp);
@@ -6852,8 +7335,37 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         if (use.on) use.pipeline(pe->ready.load(std::memory_order_acquire), use_counters.pipes_new != pipes_new);
     }
     if (!pe->ready.load(std::memory_order_acquire)) {
-        const bool may_skip = !always_wait && targets_persistent(at) && !writes_memory(p);
-        if (may_skip) return use.skipped(), void(st_pending_skips++);
+        const bool may_skip = !always_wait && !preserve_opaque_colour() && targets_persistent(at) && !writes_memory(p);
+        if (may_skip) {
+            static const bool timing = env_on("JINRA_TEST_TIMING");
+            if (timing) trace_scene_pipeline("pipe_skip", s.prog.serial, p.key, pipeline_key(p, s, at, topo));
+#ifdef _WIN32
+            static const bool trace_uses = std::getenv("JINRA_TEST_PIPE_USES") != nullptr;
+            if (trace_uses) record_pipeline_use(pipeline_key(p, s, at, topo), 'g', 'S');
+#endif
+            return use.skipped(), void(st_pending_skips++);
+        }
+#ifdef _WIN32
+        static const bool detail_wait = env_on("JINRA_TEST_WAIT_DETAIL") && capture_trace::file();
+        if (detail_wait || first_visit_waits) {
+            const uint64_t key = pipeline_key(p, s, at, topo);
+            const uint64_t begin_cycles = capture_trace::thread_cycles();
+            const uint64_t begin = capture_trace::qpc();
+            const bool ran_here = wait_for(pe->ready);
+            const uint64_t end = capture_trace::qpc();
+            if (first_visit_waits) {
+                logf("Jinra first visit wait qpc=%llu end=%llu frame=%llu tid=%lu program=%016llx variant=%016llx "
+                     "pipeline=%016llx source=%u executed_here=%u",
+                     (unsigned long long)begin, (unsigned long long)end,
+                     (unsigned long long)capture_trace::frame(), (unsigned long)GetCurrentThreadId(),
+                     (unsigned long long)p.key, (unsigned long long)p.variant, (unsigned long long)key,
+                     (unsigned)pe->how.load(std::memory_order_relaxed), (unsigned)ran_here);
+            }
+            if (detail_wait) capture_trace::add({"pipe_wait", begin, capture_trace::frame(), GetCurrentThreadId(),
+                                p.key, key, end, capture_trace::thread_cycles() - begin_cycles,
+                                uint64_t(ran_here), texture_segment(), s.prog.serial});
+        } else
+#endif
         wait_for(pe->ready);
     }
     if (use.on) use.pipeline_made(pe->how.load(std::memory_order_relaxed));
@@ -7059,6 +7571,11 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         FINE_SCOPE(FT_BINDPL);
         FINE_N(FC_BIND_PIPE, 1);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl), last_pipeline = pl;
+#ifdef _WIN32
+        static const bool trace_bind = env_on("JINRA_TEST_PIPE_FIRST_BIND");
+        if (trace_bind && !pe->measured_first_bind.exchange(true, std::memory_order_relaxed))
+            record_pipeline_use(pe->measured_key, 'g', 'B');
+#endif
         if (p.fallback) {
             // A static-stride pipeline invalidates the dynamic strides, even with no vertex bindings.
             // Drop both bind-skip caches; the resolved buffer references themselves are still reusable.
@@ -9132,6 +9649,11 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
         }
     }
     dclock.key = cp->key;
+    struct DiagnosticDispatch {
+        uint64_t previous;
+        ~DiagnosticDispatch() { diagnostic_compute_program = previous; }
+    } diagnostic{diagnostic_compute_program};
+    diagnostic_compute_program = cp->key;
     texture_watch_prog(cp->key);
     {   // (RX_VK_LOG_PUSH=<key prefix>: once, that program's push constants and the c0 words it reads)
         static const char* want = getenv("RX_VK_LOG_PUSH");
@@ -9172,9 +9694,15 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
                                                                      : dev.props.vendorID == 0x8086;
             // (one the prepare left in our cache is only asked for here: it comes back at once. Queued, it waited for a worker
             // behind their graphics builds, and its dispatch was left out)
+#ifdef _WIN32
+            record_pipeline_use(mix(p.key, p.variant), 'c', 'D');
+#endif
             const VkPipeline cached = compute_pipeline_cached(p, true);
             auto build = [job] {
                 Program& q = const_cast<Program&>(*job);
+#ifdef _WIN32
+                ScopedPipelineTrace trace(mix(q.key, q.variant), -1);
+#endif
                 VkComputePipelineCreateInfo ci = compute_pipeline_info(q, true);
                 const auto t0 = std::chrono::steady_clock::now();
                 VkPipeline made = VK_NULL_HANDLE;
@@ -9218,6 +9746,9 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
             static std::atomic<int> told{0};
             if (told++ < 40) logf("vk: dispatch of %016llx left out: its compute pipeline is still compiling", (unsigned long long)p.key);
             st_pending_skips++;
+#ifdef _WIN32
+            record_pipeline_use(mix(p.key, p.variant), 'c', 'S');
+#endif
             use.skipped();
             return;
         }
@@ -9227,6 +9758,11 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
     if (!p.compute_pipeline && !taau_key(p.key)) {   // (a stood-in network is never compiled)
         if (!program_cache_complete(p)) SKIP_HERE();   // (read without its code: see above)
         pcache_init();
+#ifdef _WIN32
+        const uint64_t key = mix(p.key, p.variant);
+        record_pipeline_use(key, 'c', 'D');
+        ScopedPipelineTrace trace(key, -1);
+#endif
         VkComputePipelineCreateInfo ci = compute_pipeline_info(p, true);   // (RX_VK_NOOPT=1, as for graphics pipelines above)
         const auto t0 = std::chrono::steady_clock::now();
         {   // (11-07: a freeze after Load was the driver's compiler on one compute pipeline, here, on the submit's thread)
@@ -9561,6 +10097,10 @@ int64_t draw_slotgen_saves() {   // (Descriptor reuse: of those, what the global
 void pipeline_cache_play() {
     play_cache_begin();
     programs_play_begin();   // (the census: what is made from here on is made in play)
+    index_normal_play = true;
+    queue_startup_index();
+    if (pcache) scene_cache_ready.store(true, std::memory_order_release);
+    prewarm_known_scene();
 }
 
 // ---- What the programs' loader asks of the pipelines (vk_pipelines.h) ----
@@ -9607,6 +10147,9 @@ bool pipe_note_at(FILE* f, int64_t at, PipeNote* out) {
     return f && _fseeki64(f, at, SEEK_SET) == 0 && fread((void*)out, sizeof(PipeNote), 1, f) == 1 && note_sane(*out);
 }
 VkPipeline pipeline_from_caches(const Program& p, const PipeNote& n, bool* cold) {
+#ifdef _WIN32
+    ScopedPipelineTrace trace(n.key, -1, trace_context.origin == 'w' ? 'w' : 'p');
+#endif
     ask_start_first = true;
     *cold = false;
     const VkPipeline pl = build_graphics(p, n.s, note_targets(n), (VkPrimitiveTopology)n.topo, -1, cold);
@@ -9614,6 +10157,9 @@ VkPipeline pipeline_from_caches(const Program& p, const PipeNote& n, bool* cold)
     return pl;
 }
 VkPipeline compute_pipeline_from_caches(const Program& p) {
+#ifdef _WIN32
+    ScopedPipelineTrace trace(mix(p.key, p.variant), -1, 'p');
+#endif
     ask_start_first = true;
     const VkPipeline pl = compute_pipeline_cached(p, true);
     ask_start_first = false;
@@ -9639,6 +10185,9 @@ bool pipeline_keep_ready(uint64_t key, VkPipeline pl) {
     {
         std::lock_guard lk(kept_ready_mu);
         if (kept_ready.emplace(key, pl).second) {
+#ifdef _WIN32
+            if (env_on("JINRA_TEST_PIPE_FIRST_BIND")) record_pipeline_use(key, 'g', 'P');
+#endif
             kept_ready_n.store(kept_ready.size(), std::memory_order_release);
             return true;
         }
@@ -9739,6 +10288,17 @@ BufferRef stream_copy(const void* src, uint64_t n) {
     if (at == UINT64_MAX) return {};
     std::memcpy(cur->mapped + at, src, n);
     return {cur->stream, at, n, 0};
+}
+
+BufferRef diagnostic_small_stream_copy(const uint8_t* data, uint64_t size) {
+    if (!cur || !cur->stream || !cur->mapped || !size || cur->used > cur->size) return {};
+    const uint64_t align = std::max<uint64_t>({256, dev.props.limits.minUniformBufferOffsetAlignment,
+                                               dev.props.limits.minStorageBufferOffsetAlignment});
+    const uint64_t at = (cur->used + align - 1) & ~(align - 1);
+    if (at > cur->size || size > cur->size - at) return {};
+    std::memcpy(cur->mapped + at, data, size);
+    cur->used = at + size;
+    return {cur->stream, at, size, 0};
 }
 
 UniformUpload uniform_upload(uint64_t size) {

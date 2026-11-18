@@ -957,6 +957,7 @@ MENU_HINTS(hn_pace, 0, "As soon as it is ready.", "At an even interval: less stu
 const char* framegen_maker_name() {
     if (opts.framegen < 1) return nullptr;
     switch (framegen_maker()) {
+    case FgMaker::Anr: return "ANR FG";
     case FgMaker::Dlss: return "NVIDIA DLSS FG";
     case FgMaker::Fsr3: return "FSR 3.1 FG";
     case FgMaker::BuiltIn: return setting_label("Built-in FG");
@@ -967,6 +968,7 @@ const char* framegen_maker_name() {
 const char* tx_framegen_by(int v) {
     if (v == FG_ENGINE_BUILT_IN) return setting_label("Built-in FG");
     if (v == FG_ENGINE_FSR31) return "AMD FSR 3.1 (2x)";
+    if (v == FG_ENGINE_ANR) return "ANR FG (Beta, 2×)";
     const char* who = framegen_maker_name();
     if (!who) return setting_label("Auto");
     static char b[80];
@@ -1000,6 +1002,16 @@ const char* framegen_skip_text(int why, unsigned most) {
 /// Its line: at Auto with another than DLSS-G making the frames, why ("Not DLSS FG now: " and framegen_skip_text). Variants
 /// (every one): Auto's, Built-in's, then "Not DLSS FG now: " with each reason
 const char* hn_framegen_by(int v, int variant) {
+    if (v == FG_ENGINE_ANR) {
+        if (variant > 0) return nullptr;
+        if (opts.hdr || dev.hdr) return "Turn HDR off to use this ANR FG beta.";
+        if (opts.framegen != 2) return "Set Frame generation to 2× to use ANR FG.";
+        if (opts.dlss == ur::GAME || opts.dlss == ur::OFF)
+            return "Select a temporal upscaler such as AMD FSR 3.1 to use ANR FG.";
+        if (anr_fg_failed()) return "ANR FG did not start or generate frames. Built-in FG is available.";
+        if (framegen_maker() == FgMaker::Anr) return "ANR FG is generating frames.";
+        return "ANR FG needs a temporal upscaler. The built-in engine covers frames ANR cannot generate.";
+    }
     if (v == FG_ENGINE_FSR31) {
         if (variant > 0) return nullptr;
         if (variant < 0 && !fsr3fi::capable())
@@ -3834,6 +3846,8 @@ void menu_init() {
     if (done) return;
     done = true;
     for (auto& count : item_counts) count.store(-1, std::memory_order_relaxed);
+    for (Row& row : rows)
+        if (row.value == &opts.framegen_by && anr_fg_installed()) row.hi = FG_ENGINE_ANR;
     bool has_options = false;
     bool has_vram_budget = false;   // (a file from before the VRAM budget row: its preset's, memory_budget's)
     bool has_memory_budget = false;   // (a file from before memory_budget: its preset's)
@@ -3857,7 +3871,8 @@ void menu_init() {
             *eq = 0;
             for (Row& r : rows) {
                 if (!r.value || r.value == &opts.game_lang || strcmp(line, ini_key(r))) continue;
-                const int v = atoi(eq + 1);
+                int v = atoi(eq + 1);
+                if (r.value == &opts.framegen_by && v == FG_ENGINE_ANR && r.hi < FG_ENGINE_ANR) v = FG_ENGINE_AUTO;
                 *r.value = r.value == &opts.output_res ? parse_output(eq + 1) : std::min(std::max(v, r.lo), r.hi);
             }
             has_resolution |= !strcmp(line, "resolution");

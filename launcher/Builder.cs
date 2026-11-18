@@ -14,8 +14,8 @@ internal sealed record BuildUpdate(string Text, double? Progress = null, bool Is
 
 internal sealed class Builder
 {
-    internal const string Version = "0.1.7";
-    internal const string GameVersion = "0.1.6";
+    internal const string Version = "0.1.8";
+    internal const string GameVersion = "0.1.8";
     private const string EngineVersion = GameVersion + "-4aee236";
     private const string ExpectedBuild = "E0F3CCFAF50065AE4EA01EB5AEB13B1A";
     private static readonly JsonSerializerOptions Json = new() { PropertyNameCaseInsensitive = true };
@@ -25,6 +25,7 @@ internal sealed class Builder
     internal string Home => home;
     internal string BuildLog => Path.Combine(home, "compilacao.log");
     internal static bool HasFsr4(string output) => File.Exists(Path.Combine(output, ".jinra-fsr"));
+    internal static bool HasAnr(string output) => File.Exists(Path.Combine(output, "anr", "jinra_anr_bridge.dll"));
     internal static bool HasDlss(string output) => File.Exists(Path.Combine(output, "ngx", "nvngx_dlss.dll"));
     internal static string? InstalledVersion(string output)
     {
@@ -89,7 +90,7 @@ internal sealed class Builder
     }
 
     internal async Task BuildAsync(string source, string output, bool prepareShaders, bool dlss, bool fsr4, BuildProfile profile,
-        IProgress<BuildUpdate> report, CancellationToken token)
+        IProgress<BuildUpdate> report, CancellationToken token, bool installAnr = false)
     {
         output = Path.GetFullPath(output);
         source = string.IsNullOrWhiteSpace(source) ? "" : Path.GetFullPath(source);
@@ -161,7 +162,7 @@ internal sealed class Builder
             env["JINRA_VERSION"] = GameVersion;
             var previousTools = Path.Combine(home, "kit", "0.1.1-4aee236", "tools");
             env["JINRA_LEGACY_CPM"] = string.Join(Path.PathSeparator,
-                new[] { "0.1.1", "0.1.2", "0.1.3", "0.1.4", "0.1.5" }.Select(version =>
+                new[] { "0.1.1", "0.1.2", "0.1.3", "0.1.4", "0.1.5", "0.1.6", "0.1.7" }.Select(version =>
                     Path.Combine(home, "kit", version + "-4aee236", "tools", "cpm")));
             env["JINRA_LEGACY_LLVM"] = Path.Combine(previousTools, "llvm");
             if (dlss)
@@ -179,6 +180,11 @@ internal sealed class Builder
             if (!File.Exists(GameExecutable(output)) || !File.Exists(Path.Combine(output, "image.bin")) ||
                 !File.Exists(Path.Combine(output, "jinra_vk.dll")))
                 throw new IOException(Text("A compilação terminou sem todos os ficheiros necessários para jogar.", "The build finished without all the files needed to play."));
+            if (installAnr && dlss)
+            {
+                report.Report(new(Text("A preparar a geração de fotogramas ANR", "Preparing ANR frame generation"), null, true));
+                await RunAsync(Python, ["-I", "scripts/anr_provider.py", "--game", output], Payload, report, token, env);
+            }
             await WriteAtomicAsync(Path.Combine(output, ".jinra-built"), EngineVersion, token);
             RemoveOwnedDirectory(extract);
         }
@@ -225,6 +231,7 @@ internal sealed class Builder
         var start = new ProcessStartInfo(GameExecutable(output)) { WorkingDirectory = output, UseShellExecute = false };
         start.Environment["JINRA_NO_UPDATE_CHECK"] = "1";
         start.Environment["RX_VK_PRECOMPILE"] = "0";
+        if (File.Exists(Python)) start.Environment["JINRA_PROFILE_PYTHON"] = Python;
         if (lowMemory) start.Environment["RX_VK_PCACHE_LOAD"] = "0";
         string? memoryLog = null;
         if (diagnostics)

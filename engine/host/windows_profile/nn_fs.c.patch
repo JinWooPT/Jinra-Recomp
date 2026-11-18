@@ -1,0 +1,50 @@
+--- nn_fs.c
++++ nn_fs.c
+@@ -15,7 +15,7 @@
+ #include "../gpu/vk/compat/jinra_env.h"
+ #endif
+ 
+-/* (#1468) A game folder whose deepest file passes 260 characters (MAX_PATH: "E:\Games\...\romfs\Event\EventSetting\
++/* (jinra, #1468) A game folder whose deepest file passes 260 characters (MAX_PATH: "E:\Games\...\romfs\Event\EventSetting\
+    Ev..." at 262) is read too. The host paths here are up to HOS_FS_PATH bytes, and on Windows each file call goes through
+    its wide function: the path converted from the game's UTF-8 strings and, when it is
+    long and absolute, given the extended-length prefix \\?\ (with its / made \), which Windows takes without its long-paths
+@@ -343,9 +343,13 @@
+     char path[HOS_FS_PATH];
+     int writable = 0;
+     const char *g = gstr(ARG(1));
++    static int scene_timing = -1;
++    if (scene_timing < 0) scene_timing = env_on("HOS_JINRA_SCENE_TIMING");
++    if (scene_timing && (strstr(g, "/Banc/") || strstr(g, "/Terrain/")))
++        hos_log("timing fs %lld tid %lu %s", (long long)hos_now_ns(), (unsigned long)GetCurrentThreadId(), g);
+     /* (mkw-recomp 16bc3bc: the host's file calls block, so the virtual core goes to another thread meanwhile, as
+        Horizon would run another while this one waits for the file system. OoT's ARes loaders held it up to 250 ms.)
+-       (#1929) From before host_path: the first open of a button-prompt file builds it there (prompts.c,
++       (jinra, #1929) From before host_path: the first open of a button-prompt file builds it there (prompts.c,
+        251-357 ms on Linux), and other threads that open it meanwhile wait in there for the build; with the core held
+        through that, four threads waiting for the core ran without one within 50 ms */
+     const int away = hos_vcore_away();
+@@ -387,6 +391,23 @@
+     }
+     HANDLE h = CreateFileA(path, GENERIC_READ | (want_write ? GENERIC_WRITE : 0), FILE_SHARE_READ | FILE_SHARE_WRITE,
+                            NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
++    if (h != INVALID_HANDLE_VALUE && !want_write) {
++        const char *hook = NULL;
++        if (strcmp(g, "content:/Banc/HyruleField/HyruleField_Child_Static.bcett.byml.zs") == 0)
++            hook = "jinra_timing_scene_open";
++        else if (strcmp(g, "content:/Banc/KakarikoVillage/KakarikoVillage_Child_Static.bcett.byml.zs") == 0)
++            hook = "jinra_timing_kakariko_open";
++        else if (strcmp(g, "content:/Banc/ZoraDomain/ZoraDomain_Child_Static.bcett.byml.zs") == 0 &&
++                 getenv("JINRA_TEST_ZORA_KEYS"))
++            hook = "jinra_timing_zora_open";
++        if (hook) {
++            HMODULE renderer = GetModuleHandleW(L"jinra_vk.dll");
++            if (renderer) {
++                void (*scene_open)(void) = (void (*)(void))GetProcAddress(renderer, hook);
++                if (scene_open) scene_open();
++            }
++        }
++    }
+     if (away) hos_vcore_back();
+     if (h == INVALID_HANDLE_VALUE) {
+         if (hos_trace || fs_trace()) hos_log("fs: OpenFile(%s): not found", g);

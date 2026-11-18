@@ -40,6 +40,7 @@
 #include "vk_gprof.h"
 #include "vk_dump.h"
 #include "vk_jobs.h"
+#include "capture_trace.h"
 
 #include <span>
 
@@ -332,8 +333,30 @@ void pool_put(Dead& d) {
 size_t pool_trim() {
     std::lock_guard lk(pool_mu);
     const uint64_t cap = pool_pressed ? 0 : pool_cap();
-    const size_t most = pool_pressed ? 64 : 16;
+    static const bool drain_backlog = env_on("JINRA_TEST_TARGET_BACKLOG");
+    const bool backlog = drain_backlog && pool_bytes > (512ull << 20);
+    const size_t most = pool_pressed ? 64 : backlog ? 32 : 16;
     size_t n = 0;
+    static const bool keep_shapes = env_on("JINRA_TEST_TARGET_SHAPE_REUSE");
+    // Under the existing pool limit, prefer losing spare copies over losing
+    // the last image compatible with a size and format. Age and pressure wins.
+    if (keep_shapes && !pool_pressed && pool_bytes > cap) {
+        static size_t duplicates = 0;
+        for (auto& [key, images] : target_pool) {
+            (void)key;
+            while (images.size() > 1 && pool_bytes > cap && n < most) {
+                Pooled& oldest = images.front();
+                pool_destroy(oldest);
+                pool_bytes -= std::min(pool_bytes, oldest.bytes);
+                --pool_n;
+                ++n;
+                images.erase(images.begin());
+                if (++duplicates <= 4 || duplicates % 600 == 0)
+                    logf("vk: render target pool retired %zu redundant images", duplicates);
+            }
+            if (pool_bytes <= cap || n == most) break;
+        }
+    }
     for (auto it = target_pool.begin(); it != target_pool.end() && n < most;) {
         auto& v = it->second;
         for (size_t i = 0; i < v.size() && n < most;) {   // (the oldest of a shape first: the front)
@@ -497,6 +520,7 @@ Staging staging(uint64_t n, uint64_t align = 256) {
 // ---- the GPU ASTC decoder (Eden's) ----
 struct AstcPush {
     uint32_t block_dims[2], layer_stride, block_size, x_shift, block_height, block_height_mask, native_tiling;
+    uint32_t width, height;
 };
 VkDescriptorSetLayout astc_set = VK_NULL_HANDLE;
 VkPipelineLayout astc_layout = VK_NULL_HANDLE;
@@ -914,12 +938,12 @@ LevelGeo level_geo(const Texture& tex, uint32_t level) {   // (level: the image'
 }
 
 /// The guest bytes [gpu, gpu + n) in host memory: in place when contiguous, else copied into scratch
-const uint8_t* guest_bytes(uint64_t gpu, uint64_t n, std::vector<uint8_t>& scratch) {
+const uint8_t* guest_bytes(uint64_t gpu, uint64_t n, std::vector<uint8_t>& scratch, bool current_storage) {
     uint64_t avail = 0;
     const uint8_t* p = host->gpu_ptr(gpu, &avail);
     // (below 1 TB the GPU address is the guest's: the storage as it was at the submit being replayed, where the game has
     // rewritten it since (vk_memory.cpp, "texture storage in the capture"))
-    if (p && avail >= n) return gpu < (1ull << 40) ? memory_as_submitted(gpu, p, n, scratch) : p;
+    if (p && avail >= n) return gpu < (1ull << 40) && !current_storage ? memory_as_submitted(gpu, p, n, scratch) : p;
     if (n >= (32u << 20)) {   // (a big sparse texture's pages, gathered on several threads: the course maps' 349 MB)
         scratch.resize(n);
         const uint32_t nt = std::clamp(std::thread::hardware_concurrency() / 2, 1u, 6u);
@@ -956,6 +980,17 @@ void widen_rows(uint8_t* dst, const uint8_t* src, size_t texels, int from, int t
 
 /// Byte ranges of a texture's storage, from its start (what the CPU wrote since its last upload)
 using Ranges = std::vector<std::pair<uint64_t, uint64_t>>;
+// The guest may finish publishing a material after the synchronous submit's capture.
+// On its first upload, or when the CPU replaces an entire compressed 2D array, take
+// the complete current backing. Other reads keep their submit-time view.
+bool current_material_storage(const Texture& texture, const Ranges* dirty) {
+    static const bool asynchronous = env_on("RX_VK_ASYNC");
+    if (asynchronous || texture.gpu_written || texture.sparse || texture.type != VK_IMAGE_TYPE_2D) return false;
+    const bool bc = is_bc(texture.format);
+    if (!texture.uploaded) return texture.astc || bc || is_astc(texture.format);
+    return !texture.astc && bc && texture.layers > 1 && dirty && dirty->size() == 1 &&
+           dirty->front().first == 0 && dirty->front().second >= texture.guest_size;
+}
 bool overlaps(const Ranges* dirty, uint64_t a, uint64_t b) {
     if (!dirty) return true;
     for (const auto& r : *dirty)
@@ -1003,13 +1038,20 @@ bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
         return false;
     }
     std::vector<uint8_t> scratch;
+    const bool current_storage = current_material_storage(tex, dirty);
     for (size_t k = 0; k < layers.size(); k++) {
         const uint64_t at = (uint64_t)layers[k] * layer_size + tail0;
         if (at >= total) continue;
         const uint64_t n = std::min(tail, total - at);
-        std::memcpy(s.data + k * tail, guest_bytes(tex.gpu + at, n, scratch), n);
+        std::memcpy(s.data + k * tail, guest_bytes(tex.gpu + at, n, scratch, current_storage), n);
     }
     const uint64_t staged = tail * layers.size();
+#ifdef _WIN32
+    static const bool trace_terrain = env_on("JINRA_TEST_WAIT_DETAIL") && capture_trace::file();
+    if (trace_terrain && tex.width == 1365 && tex.height == 1365 && tex.layers == 90)
+        capture_trace::add({"terrain_upload", capture_trace::qpc(), capture_trace::frame(), GetCurrentThreadId(),
+                            texture_segment(), tex.gpu, tex.id, staged, host->gpu_guest(tex.gpu), layers.size()});
+#endif
     flush_mapped_range(s.allocation, s.offset, staged);   // (encoded blocks read by the GPU decoder, not necessarily coherent)
     st_bytes += (int64_t)staged;
     VkCommandBuffer cmd = upload_cmd();
@@ -1035,13 +1077,21 @@ bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
             pc.block_height = g.tile_h;
             pc.block_height_mask = (1u << g.tile_h) - 1;
             pc.native_tiling = 1;
+            pc.width = g.w;
+            pc.height = g.h;
+            static const uint32_t layer_override = [] {
+                const char* value = getenv("RX_VK_BC_LAYERS");
+                return value ? std::clamp<uint32_t>(uint32_t(atoi(value)), 1u, kBcLayers) : 0u;
+            }();
+            const bool field_materials = tex.width == 1365 && tex.height == 1365 && tex.layers == 90 &&
+                                         tex.levels == 11 && tex.block_w == 8 && tex.block_h == 8;
+            const uint32_t run = layer_override ? layer_override : field_materials ? 4u : 1u;
             for (size_t k0 = 0; k0 < layers.size();) {
                 size_t k1 = k0 + 1;
                 // (one layer a run: with runs of up to kBcLayers, an array's layers past the run's first came out wrong in the
                 // smaller levels, and Hyrule Field's ground, which samples the terrain's material arrays (1365 x 1365 x 90, ASTC
                 // 8x8) at those levels from a distance, had its tiles outlined in dark lines (RX 6600: none with one layer a run,
                 // nor with the arrays kept as RGBA8). RX_VK_BC_LAYERS=<n>: up to n a run)
-                static const uint32_t run = getenv("RX_VK_BC_LAYERS") ? std::clamp<uint32_t>((uint32_t)atoi(getenv("RX_VK_BC_LAYERS")), 1u, kBcLayers) : 1u;
                 while (k1 < layers.size() && k1 - k0 < run && layers[k1] == layers[k1 - 1] + 1) k1++;
                 const uint32_t n = (uint32_t)(k1 - k0);
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, astc_pipe);
@@ -1079,6 +1129,8 @@ bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
         pc.block_height = g.tile_h;
         pc.block_height_mask = (1u << g.tile_h) - 1;
         pc.native_tiling = 1;
+        pc.width = g.w;
+        pc.height = g.h;
         for (size_t k = 0; k < (all ? 1 : layers.size()); k++) {
             const VkImageView view = astc_level_view(&tex, level, all ? ~0u : layers[k]);
             if (!view) {
@@ -1173,7 +1225,9 @@ bool upload_unswizzle_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
     default: return false;
     }
     if (!unswizzle_ready()) return false;
-    const BufferRef src = gpu_buffer(tex.gpu, total);
+    // The existing CPU upload handles textures whose backing storage has not been imported yet.
+    static const bool no_import = env_on("JINRA_TEST_UNSWIZZLE_NO_IMPORT");
+    const BufferRef src = gpu_buffer(tex.gpu, total, !no_import);
     const uint64_t align = std::max<uint64_t>(dev.props.limits.minStorageBufferOffsetAlignment, 16);
     if (!src || (src.offset % align)) return false;
     for (uint32_t level = 0; level < tex.levels; level++) {   // (every level must be possible before any is done)
@@ -1534,6 +1588,7 @@ bool upload_inner(Texture& tex, const Ranges* dirty) {
     // (the GPU's unswizzle reads guest memory as it is: not where the capture kept the storage as it was at its submit)
     if (!(tex.gpu < (1ull << 40) && memory_has_shadow(tex.gpu, total)) && upload_unswizzle_gpu(tex, total, dirty))
         return up_route = UP_GPU, true;
+    const bool current_storage = current_material_storage(tex, dirty);
     const bool linear = nvn_tex_is_linear(&tex.d);
     int widen_from = 0;
     widened(tex.d.format ? vk_format(tex.nvn_format).format : tex.format, &widen_from);
@@ -1597,7 +1652,7 @@ bool upload_inner(Texture& tex, const Ranges* dirty) {
                 uint8_t* blocks = (tex.astc || widen_from) ? (lin.resize(block_bytes), lin.data()) : out;
                 if (linear) {
                     const uint64_t row = (uint64_t)g.tw * src_bpb;
-                    const uint8_t* src = guest_bytes(tex.gpu + src_off, (uint64_t)stride * (g.th - 1) + row, scratch);
+                    const uint8_t* src = guest_bytes(tex.gpu + src_off, (uint64_t)stride * (g.th - 1) + row, scratch, current_storage);
                     for (uint32_t y = 0; y < g.th; y++) std::memcpy(blocks + y * row, src + (uint64_t)y * stride, row);
                 } else {
                     // (suyu's unswizzle reads the whole swizzled span without bounds checks: a span the storage
@@ -1616,7 +1671,7 @@ bool upload_inner(Texture& tex, const Ranges* dirty) {
                     const uint8_t* src = nullptr;
                     if (gather_parts) {
                     } else if (from < total && total - from >= need) {
-                        src = guest_bytes(tex.gpu + from, need, scratch);
+                        src = guest_bytes(tex.gpu + from, need, scratch, current_storage);
                     } else {
                         scratch.assign(need, 0);
                         if (from < total) host->gpu_read(tex.gpu + from, scratch.data(), total - from);
@@ -1907,6 +1962,16 @@ bool low_vram_texture_mips() {
 }
 
 Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw, int bh, int bpb, bool as_target) {
+#ifdef _WIN32
+    struct CreationTrace {
+        uint64_t start = capture_trace::arrival_detail() ? capture_trace::qpc() : 0;
+        bool committed = false;
+        ~CreationTrace() {
+            if (start) capture_trace::add({"arrival_texture", start, capture_trace::frame(), GetCurrentThreadId(),
+                                           capture_trace::qpc(), uint64_t(committed)});
+        }
+    } trace;
+#endif
     PROF_EXACT();   // (texture_get's slow path: PROF_TEXGET samples the rest)
     auto tex = std::make_unique<Texture>();
     Texture& x = *tex;
@@ -2236,6 +2301,9 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
     p->id = ++ids;
     p->first_seen = frame_no;
     st_made++;
+#ifdef _WIN32
+    trace.committed = true;
+#endif
     p->key_layout = key.layout, p->key_cls = key.cls;
     {   // (another image at this storage: what tells them apart; content one renders the other does not see)
         static int told;
@@ -2902,6 +2970,9 @@ TextureAttachment texture_attachment(Texture* tex, const nvn_tex* t, const nvn_v
         vi.format = format;
         vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, slice, 1};
         VkImageView view = VK_NULL_HANDLE;
+#ifdef _WIN32
+        LoadPhaseScope detail(LOAD_VIEW_CREATE);
+#endif
         *result = vkCreateImageView(dev.device, &vi, nullptr, &view);
         return *result == VK_SUCCESS ? view : VK_NULL_HANDLE;
     });
@@ -3473,6 +3544,14 @@ void texture_describe_written(uint64_t lo, uint64_t size, std::string& out) {
     if (n > 6) out += " (" + std::to_string(n) + " in all)";
 }
 
+bool texture_pending_copy_writeback(uint64_t lo, uint64_t size) {
+    const uint64_t hi = lo + size;
+    for (const auto& batch : drawn_batches)
+        for (const auto& flush : batch.fs)
+            if (flush.clip_lo < hi && flush.clip_hi > lo) return true;
+    return false;
+}
+
 bool texture_gpu_written_in(uint64_t lo, uint64_t size) {
     const uint64_t hi = lo + size;
     std::lock_guard lk(vw_mu);
@@ -3811,6 +3890,14 @@ void texture_rendered(Texture* tex) {
         if (gpu_owned.size() > 65536) gpu_owned.erase(gpu_owned.begin());   // (bounded; the oldest addresses go)
     }
 }
+void diagnostic_target_frame(uint64_t frame) {
+    std::lock_guard lk(pool_mu);
+    logf("vk: lifetime targets frame %llu cached_bytes %llu cached_images %llu reused %llu new %llu destroyed %llu",
+         (unsigned long long)frame, (unsigned long long)pool_bytes, (unsigned long long)pool_n,
+         (unsigned long long)st_pool_reused, (unsigned long long)st_pool_made,
+         (unsigned long long)st_pool_destroyed);
+}
+
 uint64_t texture_frame_no() {
     return frame_no;
 }

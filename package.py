@@ -113,6 +113,7 @@ def package(stage):
     shutil.copy2(stage / "jinra-play.exe", publish / "jinra-play.exe")
     (publish / "Jinra-Recomp.UI.pdb").unlink(missing_ok=True)
     shutil.copy2(ROOT / "LICENSE", publish / "LICENSE.txt")
+    shutil.copytree(ROOT / "native/licenses/dotnet", publish / "licenses/dotnet")
     packed = stage / "launcher.zip"
     print("A montar o executável final…", flush=True)
     zip_tree(packed, publish)

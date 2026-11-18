@@ -9,7 +9,7 @@
 #include "command_line.h"
 
 namespace fs = std::filesystem;
-constexpr wchar_t PayloadId[] = L"0.1.7-4aee236";
+constexpr wchar_t PayloadId[] = L"0.1.8-4aee236";
 constexpr char Trailer[] = "JINRAPK1";
 
 bool unpack_payload(const fs::path& executable, const fs::path& path) {

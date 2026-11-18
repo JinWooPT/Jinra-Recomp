@@ -1,0 +1,625 @@
+--- nn_os_sync.c
++++ nn_os_sync.c
+@@ -6,6 +6,7 @@
+    initializers) is created on first use. Mutexes are always recursive: relocking a non-recursive nn::os mutex
+    would be a game bug on hardware anyway. */
+ #include "hos.h"
++#include "jinra_gap.h"
+ #ifndef JINRA_ENV_H   /* (env_on: the switches' one rule) */
+ #include "../gpu/vk/compat/jinra_env.h"
+ #endif
+@@ -36,7 +37,7 @@
+     int qcap, qhead, qlen;
+     /* condvar */
+     uint64_t gen;
+-    /* Horizon's handoff: mutex: condition variable waiters a signal has woken that the mutex is owed to;
++    /* (EvilOOT) Horizon's handoff: mutex: condition variable waiters a signal has woken that the mutex is owed to;
+        condvar: its waiters, those a signal has given the mutex to and not yet out, the mutex they wait with
+        (cv_mixed: waiters with more than one: no handoff) */
+     int reserved;
+@@ -49,8 +50,18 @@
+     struct Obj *mw;    /* holder -> the multi-wait it is linked to */
+     int spin_misses, spin_waits;
+     int64_t sig_ns;      /* (HOS_WAKE_LAT: when it was last signaled / sent to) */
++    int64_t gap_signal_ns;
++    uint32_t gap_signal_tid;
+     struct Obj *spare;   /* (on the spare list: see spares) */
+ } Obj;
++
++/* Call with the object's lock held. This is the last observed signal,
++   so it may be a later signal than the one that originally woke a waiter. */
++static void gap_signal_locked(Obj *obj) {
++    if (!jinra_gap_enabled) return;
++    obj->gap_signal_tid = GetCurrentThreadId();
++    obj->gap_signal_ns = hos_now_ns();
++}
+ 
+ static int wake_lat_on(void);   /* (HOS_WAKE_LAT, below) */
+ 
+@@ -394,7 +405,7 @@
+    a wake. No wake-up is lost: a sleeper raises mwait, then tries the CAS, under m->lk; an unlocker exchanges the owner,
+    then reads mwait (both sequentially consistent): either it sees the sleeper and takes m->lk (held until the sleeper
+    sleeps) to wake it, or the sleeper's CAS sees the mutex free. */
+-/* (11-07) Horizon hands a mutex to its waiters: a condition variable's signal makes the woken thread one of
++/* (EvilOOT, 11-07) Horizon hands a mutex to its waiters: a condition variable's signal makes the woken thread one of
+    the mutex's waiters in the kernel, and the unlock gives the mutex to it. Here any thread could take it first: the
+    movie player's thread signalled its decoder to stop, unlocked, locked again before the decoder had the mutex, and
+    joined it holding the mutex: a freeze after Load about one start in four. A signal now reserves the mutex for the
+@@ -427,6 +438,7 @@
+     if (!owed) { mutex_lock(m, guest, NULL); return; }
+     HosThread *self = hos_self();
+     if (mutex_take_owed(m, self)) { m->count = 1; return; }
++    const int64_t gap_begin = JINRA_GAP_NOW();
+     HOS_CHAIN(HOS_CHAIN_WAIT, m->key);
+     AcquireSRWLockExclusive(&m->lk);
+     __atomic_add_fetch(&m->mwait, 1, __ATOMIC_SEQ_CST);
+@@ -435,6 +447,7 @@
+     ReleaseSRWLockExclusive(&m->lk);
+     HOS_CHAIN(HOS_CHAIN_WOKE, m->key);
+     m->count = 1;
++    if (gap_begin) JINRA_GAP_LONG("game_mutex_owed", gap_begin, hos_now_ns(), 0, 0, m->key, 0);
+ }
+ static int handoff_on(void) {   /* HOS_NO_HANDOFF=1: the old way (any thread may take a mutex a signal's waiter is owed) */
+     static int v = -1;
+@@ -475,11 +488,12 @@
+     if (trace_ms < 0) { const char *e = getenv("HOS_MUTEX_TRACE"); trace_ms = e ? atoi(e) : 0; }
+     HosThread *holder = __atomic_load_n(&m->owner, __ATOMIC_RELAXED);
+     const int64_t t0 = trace_ms && holder ? hos_now_ns() : 0;
++    const int64_t gap_begin = JINRA_GAP_NOW();
+     const int chain = hos_chain_on;
+     if (chain) hos_chain_note(HOS_CHAIN_WAIT, m->key, c ? c->x[30] : 0);
+     AcquireSRWLockExclusive(&m->lk);
+     __atomic_add_fetch(&m->mwait, 1, __ATOMIC_SEQ_CST);
+-    {   /* (11-07: a wait of over 10 s says who holds the mutex, once per wait: the freeze after Load) */
++    {   /* (EvilOOT, 11-07: a wait of over 10 s says who holds the mutex, once per wait: the freeze after Load) */
+         int64_t told_at = hos_now_ns() + 10000000000ll;
+         while (!mutex_take(m, self)) {
+             hos_cv_sleep(&m->cv, &m->lk, 2000);
+@@ -495,6 +509,7 @@
+     ReleaseSRWLockExclusive(&m->lk);
+     if (chain) hos_chain_note(HOS_CHAIN_WOKE, m->key, c ? c->x[30] : 0);
+     m->count = 1;
++    if (gap_begin) JINRA_GAP_LONG("game_mutex", gap_begin, hos_now_ns(), 0, 0, m->key, c ? c->x[30] : 0);
+     if (t0) {
+         const int64_t waited = hos_now_ns() - t0;
+         static volatile LONG logged;
+@@ -518,7 +533,7 @@
+     return count;
+ }
+ 
+-/* (11-07) HOS_MUTEX_WATCH=<guest address>: every operation on that mutex, and the signals of the condition
++/* (EvilOOT, 11-07) HOS_MUTEX_WATCH=<guest address>: every operation on that mutex, and the signals of the condition
+    variables waited on with it, logged with the thread and the caller (lr). The freeze after Load: MovieOperateThread
+    holds 0x106a387d58 and joins VideoDecoderThread, which waits for it on its way out of a condition variable wait. */
+ static uint64_t watch_mutex(void) {
+@@ -549,11 +564,422 @@
+     if (watched(ARG(0))) watch_log("finalize", ARG(0), 0, c, NULL);
+     drop(ARG(0));
+ }
++
++#include <psapi.h>
++
++/* Observe the real resource worker only after its existing lock succeeds. */
++extern void guest_ram_audit(char action, uint64_t lo, uint64_t length, uint64_t caller);
++static volatile LONG64 resource_manager;
++static volatile LONG single_state;
++static uint64_t single_node, single_base;
++static _Thread_local uint64_t selected_link, selected_manager, released_base;
++extern uint64_t jinra_observed_allocation_size(uint64_t base, uint64_t *start);
++extern int jinra_observed_reacquisition(uint64_t node, uint64_t base, int64_t since);
++static void resource_batch_invalidate(uint64_t node, uint64_t base);
++
++int jinra_resource_arm_observation(uint64_t node, uint64_t base, int64_t since, int native) {
++    if (!hos_guest_range(node, 0x398) || !hos_guest_range(base, 1)) return 0;
++    if (InterlockedCompareExchange(&single_state, -1, 0) != 0 &&
++        InterlockedCompareExchange(&single_state, -1, 2) != 2) return 0;
++    uint64_t start = 0;
++    const uint64_t bytes = jinra_observed_allocation_size(base, &start);
++    extern int rx_guest_imported(uint64_t lo, uint64_t hi);
++    const uint64_t maximum = native >= 3 ? (16u << 20) : (1u << 20);
++    if (native && (!since || bytes == 0 || bytes > maximum ||
++                   jinra_observed_reacquisition(node, base, since) || rx_guest_imported(start, start + bytes))) {
++        InterlockedExchange(&single_state, 0);
++        return 0;
++    }
++    single_node = node;
++    single_base = base;
++    InterlockedExchange(&single_state, native == 4 ? 6 : native >= 2 ? 4 : native ? 3 : 1);
++    return 1;
++}
++
++long jinra_resource_selection_status(int cancel) {
++    const LONG state = InterlockedCompareExchange(&single_state, 0, 0);
++    if (cancel && (state == 1 || state == 3 || state == 4 || state == 6))
++        return InterlockedCompareExchange(&single_state, 0, state) == state ? 0 : 5;
++    return state;
++}
++
++static int resource_link_readable(uint64_t link) {
++    if ((link & 7) || !hos_guest_range(link, 16)) return 0;
++    MEMORY_BASIC_INFORMATION region;
++    const uintptr_t at = (uintptr_t)GP(link);
++    if (!VirtualQuery((const void *)at, &region, sizeof region) || region.State != MEM_COMMIT ||
++        (region.Protect & (PAGE_GUARD | PAGE_NOACCESS))) return 0;
++    const uintptr_t distance = at - (uintptr_t)region.BaseAddress;
++    return distance <= region.RegionSize && region.RegionSize - distance >= 16;
++}
++
++static int resource_pages_resident(uint64_t address, size_t size) {
++    if (!hos_guest_range(address, size)) return 0;
++    PSAPI_WORKING_SET_EX_INFORMATION pages[2] = {{0}};
++    pages[0].VirtualAddress = GP(address);
++    pages[1].VirtualAddress = GP(address + size - 1);
++    if (!K32QueryWorkingSetEx(GetCurrentProcess(), pages, sizeof pages)) return 0;
++    for (unsigned i = 0; i < 2; ++i) {
++        const DWORD protection = (DWORD)pages[i].VirtualAttributes.Win32Protection;
++        if (!pages[i].VirtualAttributes.Valid || !protection || (protection & (PAGE_GUARD | PAGE_NOACCESS))) return 0;
++    }
++    return 1;
++}
++
++static int resource_readable_link(uint64_t link, int resident) {
++    if (link & 7) return 0;
++    return resident ? resource_pages_resident(link, 16) : resource_link_readable(link);
++}
++
++uint64_t jinra_resource_select_link(uint64_t manager, uint64_t head) {
++    if (!selected_link || selected_manager != manager) return head;
++    const uint64_t link = selected_link;
++    selected_link = 0;
++    return link;
++}
++
++uint64_t jinra_resource_release_base(void) {
++    return released_base;
++}
++
++static int resource_apply_candidate(Ctx *c, uint64_t manager, uint64_t head, LONG state) {
++    const int64_t start = hos_now_ns();
++    const uint32_t offset = G32(manager + 0x64);
++    if (offset != 0xb0) return 0;
++    const uint64_t link = single_node + offset;
++    static int resident = -1;
++    if (resident < 0) resident = env_on("JINRA_TEST_RESOURCE_RESIDENT_LINKS");
++    if (resident && !resource_pages_resident(single_node, 0x398)) return 0;
++    if (head != link) {
++        if ((state != 4 && state != 6) || !resource_readable_link(link, resident)) return 0;
++        const int64_t after_link = hos_now_ns();
++        const uint64_t prev = G64(link), next = G64(link + 8);
++        if (!resource_readable_link(prev, resident) || !resource_readable_link(next, resident) ||
++            G64(prev + 8) != link || G64(next) != link) return 0;
++        guest_ram_audit('x', single_node, (uint64_t)(after_link - start), 0);
++        guest_ram_audit('Z', single_node, (uint64_t)(hos_now_ns() - after_link), 0);
++    }
++    if (G64(single_node + 0x390) != single_base) return 0;
++    const uint8_t flags = *(const uint8_t *)GP(single_node + 5);
++    if (__atomic_load_n((const uint32_t *)GP(single_node + 0x90), __ATOMIC_ACQUIRE) != 0 ||
++        flags & 2 || G32(single_node + 0x10) != 11 || G32(single_node + 0xc) & 0x10000 ||
++        !(*(const uint8_t *)GP(single_node + 2) & 1) || !G64(single_node + 0x68) ||
++        G64(single_node + 0xc0) || G64(single_node + 0xc8)) return 0;
++    const int dry_run = state == 1 || state == 6;
++    guest_ram_audit(dry_run ? 'W' : 'V', single_node, single_base, 0);
++    guest_ram_audit('G', single_node, (uint64_t)(hos_now_ns() - start), 0);
++    if (state == 4) {
++        selected_link = link;
++        selected_manager = manager;
++    }
++    if (!dry_run) {
++        released_base = single_base;
++        c->x[25] = 1;
++    }
++    return 1;
++}
++
++static void resource_observe_candidate(Ctx *c, uint64_t manager, uint64_t head) {
++    const LONG state = InterlockedCompareExchange(&single_state, 0, 0);
++    if (!head || (state != 1 && state != 3 && state != 4 && state != 6) ||
++        InterlockedCompareExchange(&single_state, 5, state) != state) return;
++    InterlockedExchange(&single_state, resource_apply_candidate(c, manager, head, state) ? 2 : state);
++}
++
++uint64_t jinra_resource_manager_observed(void) {
++    return (uint64_t)InterlockedCompareExchange64(&resource_manager, 0, 0);
++}
++
++void jinra_state8_node_event(char type, uint64_t node, uint64_t data, uint64_t lr) {
++    static volatile LONG configured;
++    LONG mode = InterlockedCompareExchange(&configured, 0, 0);
++    if (!mode) {
++        const LONG selected = env_on("JINRA_TEST_STATE8_LIFE") ? 2 : 1;
++        const LONG previous = InterlockedCompareExchange(&configured, selected, 0);
++        mode = previous ? previous : selected;
++    }
++    if (mode == 2) guest_ram_audit(type, node, data, lr);
++}
++
++void jinra_record_reference_acquire(uint64_t node) {
++    if (!hos_guest_range(node, 0x398)) return;
++    const uint64_t base = G64(node + 0x390);
++    guest_ram_audit('I', node, base, 0);
++    jinra_state8_node_event('i', node, base, 0);
++    resource_batch_invalidate(node, base);
++}
++
++#include <stdio.h>
++
++/* Laboratory batch, prepared once outside the resource worker. */
++enum { resource_batch_capacity = 2048, resource_batch_index_size = 4096 };
++typedef struct {
++    uint64_t node, base, proposed, since;
++} ResourceBatchInput;
++typedef struct {
++    ResourceBatchInput input;
++    uint64_t start, bytes;
++    volatile LONG excluded;
++} ResourceBatchEntry;
++
++static ResourceBatchEntry resource_batch[resource_batch_capacity];
++static unsigned resource_batch_index[resource_batch_index_size];
++static SRWLOCK resource_batch_index_lock = SRWLOCK_INIT;
++static unsigned resource_batch_count, resource_batch_cursor;
++static volatile LONG resource_batch_state, resource_batch_selected;
++static int resource_batch_observe;
++static int resource_batch_broad;
++static int64_t resource_batch_begin, resource_batch_end, resource_batch_next;
++
++static unsigned resource_batch_slot(uint64_t node) {
++    return (unsigned)(((node >> 3) * 0x9e3779b97f4a7c15ULL) >> 52);
++}
++
++static void resource_batch_invalidate(uint64_t node, uint64_t base) {
++    LONG state = InterlockedCompareExchange(&resource_batch_state, 0, 0);
++    if (state != 1 && state != 2) return;
++    if (!TryAcquireSRWLockShared(&resource_batch_index_lock)) return;
++    state = InterlockedCompareExchange(&resource_batch_state, 0, 0);
++    if (state == 1 || state == 2) {
++        unsigned slot = resource_batch_slot(node);
++        while (resource_batch_index[slot]) {
++            ResourceBatchEntry *entry = &resource_batch[resource_batch_index[slot] - 1];
++            if (entry->input.node == node) {
++                if (!base || entry->input.base == base) InterlockedExchange(&entry->excluded, 1);
++                break;
++            }
++            slot = (slot + 1) & (resource_batch_index_size - 1);
++        }
++    }
++    ReleaseSRWLockShared(&resource_batch_index_lock);
++}
++
++static DWORD WINAPI resource_batch_preflight(void *unused) {
++    (void)unused;
++    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
++    for (unsigned i = 0; i < resource_batch_count; ++i) {
++        ResourceBatchEntry *entry = &resource_batch[i];
++        const ResourceBatchInput *input = &entry->input;
++        entry->bytes = jinra_observed_allocation_size(input->base, &entry->start);
++        if (!entry->bytes || entry->bytes != input->proposed || entry->bytes > (16u << 20) ||
++            jinra_observed_reacquisition(input->node, input->base, (int64_t)input->since))
++            InterlockedExchange(&entry->excluded, 1);
++    }
++    InterlockedExchange(&resource_batch_state, 2);
++    return 0;
++}
++
++int jinra_resource_arm_batch(const char *path, int observe, int64_t begin, int64_t end) {
++    LONG state = InterlockedCompareExchange(&resource_batch_state, 0, 0);
++    if ((state != 0 && state != 3) || InterlockedCompareExchange(&resource_batch_state, -1, state) != state) return 0;
++    AcquireSRWLockExclusive(&resource_batch_index_lock);
++    memset(resource_batch_index, 0, sizeof resource_batch_index);
++    resource_batch_count = resource_batch_cursor = 0;
++    InterlockedExchange(&resource_batch_selected, 0);
++    ReleaseSRWLockExclusive(&resource_batch_index_lock);
++    FILE *file = fopen(path, "rb");
++    int valid = 0;
++    if (file && !fseek(file, 0, SEEK_END)) {
++        const long length = ftell(file);
++        valid = length > 0 && (unsigned long)length % sizeof(ResourceBatchInput) == 0 &&
++                (unsigned long)length / sizeof(ResourceBatchInput) <= resource_batch_capacity && !fseek(file, 0, SEEK_SET);
++    }
++    ResourceBatchInput input;
++    while (valid && fread(&input, sizeof input, 1, file) == 1) {
++        if (resource_batch_count == resource_batch_capacity || !hos_guest_range(input.node, 0x398) ||
++            !hos_guest_range(input.base, 1) || !input.proposed || input.proposed > (16u << 20)) {
++            valid = 0;
++            break;
++        }
++        unsigned slot = resource_batch_slot(input.node);
++        while (resource_batch_index[slot] &&
++               resource_batch[resource_batch_index[slot] - 1].input.node != input.node)
++            slot = (slot + 1) & (resource_batch_index_size - 1);
++        if (resource_batch_index[slot]) {
++            valid = 0;
++            break;
++        }
++        resource_batch[resource_batch_count].input = input;
++        resource_batch[resource_batch_count].excluded = 0;
++        resource_batch_index[slot] = ++resource_batch_count;
++    }
++    if (file) {
++        if (ferror(file)) valid = 0;
++        fclose(file);
++    }
++    if (!valid || !resource_batch_count || end <= begin) {
++        InterlockedExchange(&resource_batch_state, 4);
++        return 0;
++    }
++    resource_batch_observe = observe;
++    resource_batch_broad = env_on("JINRA_TEST_RESOURCE_BROAD");
++    resource_batch_begin = begin;
++    resource_batch_next = begin;
++    resource_batch_end = end;
++    InterlockedExchange(&resource_batch_state, 1);
++    HANDLE worker = CreateThread(NULL, 0, resource_batch_preflight, NULL, 0, NULL);
++    if (!worker) {
++        InterlockedExchange(&resource_batch_state, 4);
++        return 0;
++    }
++    CloseHandle(worker);
++    return 1;
++}
++
++unsigned jinra_resource_batch_status(long *state) {
++    *state = InterlockedCompareExchange(&resource_batch_state, 0, 0);
++    return (unsigned)InterlockedCompareExchange(&resource_batch_selected, 0, 0);
++}
++
++static void resource_batch_step(Ctx *c, uint64_t manager, uint64_t head) {
++    if (InterlockedCompareExchange(&resource_batch_state, 0, 0) != 2 || !head) return;
++    if (manager != jinra_resource_manager_observed()) return;
++    const int64_t now = hos_now_ns();
++    if (now >= resource_batch_end || resource_batch_cursor >= resource_batch_count) {
++        InterlockedExchange(&resource_batch_state, 3);
++        return;
++    }
++    if (now < resource_batch_begin || now < resource_batch_next) return;
++    if (InterlockedCompareExchange(&single_state, 0, 0) != 0) return;
++    typedef int (*PoolCheck)(uint64_t, uint64_t);
++    static PoolCheck no_import;
++    if (!no_import) {
++        HMODULE renderer = GetModuleHandleW(L"jinra_vk.dll");
++        no_import = renderer ? (PoolCheck)(void *)GetProcAddress(renderer, "jinra_resource_range_free") : NULL;
++        if (!no_import) {
++            InterlockedExchange(&resource_batch_state, 4);
++            return;
++        }
++    }
++    for (unsigned attempts = 0; attempts < 8 && resource_batch_cursor < resource_batch_count; ++attempts) {
++        ResourceBatchEntry *entry = &resource_batch[resource_batch_cursor];
++        if (InterlockedCompareExchange(&entry->excluded, 0, 0)) {
++            ++resource_batch_cursor;
++            continue;
++        }
++        const int safe = no_import(entry->start, entry->start + entry->bytes);
++        const int64_t checked = hos_now_ns();
++        if (safe < 0) return;
++        ++resource_batch_cursor;
++        if (!safe) continue;
++        single_node = entry->input.node;
++        single_base = entry->input.base;
++        if (!resource_apply_candidate(c, manager, head, resource_batch_observe ? 6 : 4)) continue;
++        guest_ram_audit('S', single_node, (uint64_t)(checked - now), 0);
++        InterlockedIncrement(&resource_batch_selected);
++        const unsigned bandwidth = (resource_batch_broad ? 32u : 12u) << 20;
++        const int64_t gap = resource_batch_broad ? 12000000 : 45000000;
++        const int64_t interval = (int64_t)(entry->bytes * 1000000000ULL / bandwidth);
++        resource_batch_next = now + (interval > gap ? interval : gap);
++        return;
++    }
++}
++
++
++static void resource_references_observe(Ctx *c, uint64_t pc) {
++    const int increment_path = pc == 0x801b50f8;
++    const int decrement_path = pc == 0x801b8368 || pc == 0x801b8bb8;
++    const int destruction_path = pc == 0x801b90e4;
++    if ((!increment_path && !decrement_path && !destruction_path) ||
++        !env_on("JINRA_TEST_RESOURCE_REFERENCES")) return;
++    const uint64_t node = decrement_path ? c->x[20] : c->x[19];
++    if (!hos_guest_range(node, 0x398)) return;
++    const int32_t previous = (int32_t)G32(node + 0x90);
++    if (destruction_path) {
++        if (previous <= 0) {
++            const uint64_t base = G64(node + 0x390);
++            guest_ram_audit('N', node, base, 0);
++            if (env_on("JINRA_TEST_STATE8_LIFE")) {
++                const uint32_t state = G32(node + 0x10);
++                if (state == 8 || state == 9 || state == 11 || state == 12)
++                {
++                    guest_ram_audit('n', node, base, state);
++                    guest_ram_audit('q', node, G64(node + 0x68), pc);
++                }
++            }
++            resource_batch_invalidate(node, base);
++        }
++        return;
++    }
++    const int64_t next = (int64_t)previous + (increment_path ? (int32_t)c->x[20] : -1);
++    if (previous >= 0 && next >= 0 && ((previous == 0) != (next == 0))) {
++        const uint64_t base = G64(node + 0x390);
++        guest_ram_audit(next ? 'I' : 'J', node, base, 0);
++        jinra_state8_node_event(next ? 'i' : 'j', node, base, pc);
++        resource_batch_invalidate(node, base);
++    }
++}
++
++static void resource_queue_observe(Ctx *c) {
++    const uint64_t pc = c->x[30];
++    switch (pc) {
++        case 0x801b69d0: case 0x801b6a88:
++        case 0x801b50f8: case 0x801b8368: case 0x801b8bb8: case 0x801b90e4:
++        case 0x801bae8c: case 0x801baed4: case 0x801baf7c: break;
++        default: return;
++    }
++    static const char build[] = "e0f3ccfaf50065ae4ea01eb5aeb13b1a45da3348";
++    extern const char hos_main_build_id[];
++    if (strcmp(hos_main_build_id, build) || !env_on("JINRA_TEST_RESOURCE_QUEUE")) return;
++    if (pc == 0x801b69d0 || pc == 0x801b6a88) {
++        const uint64_t node = c->x[19];
++        if (hos_guest_range(node, 0x398)) {
++            const uint64_t data = G64(node + 0x390);
++            if (data) {
++                jinra_state8_node_event('m', node, data, pc);
++                jinra_state8_node_event('q', node, G64(node + 0x68), pc);
++            }
++        }
++        return;
++    }
++    if (pc != 0x801bae8c && pc != 0x801baed4 && pc != 0x801baf7c) {
++        resource_references_observe(c, pc);
++        return;
++    }
++
++    const uint64_t manager = c->x[20];
++    if (pc == 0x801bae8c) {
++        released_base = 0;
++        if (ARG(0) != manager + 0x70 || !hos_guest_range(manager, 0x98)) return;
++        if (!jinra_resource_manager_observed())
++            InterlockedExchange64(&resource_manager, (LONG64)manager);
++        const uint32_t request = (uint32_t)c->x[25];
++        const uint32_t pending = G32(manager + 0x60);
++        const uint64_t head = pending ? G64(manager + 0x58) : 0;
++        if (!request) {
++            resource_observe_candidate(c, manager, head);
++            if (!(uint32_t)c->x[25]) resource_batch_step(c, manager, head);
++        }
++        static _Thread_local uint64_t last_manager, last_head;
++        static _Thread_local uint32_t last_pending;
++        if (request || manager != last_manager || pending != last_pending || head != last_head) {
++            guest_ram_audit('Q', manager, ((uint64_t)request << 32) | pending, 0);
++            guest_ram_audit('H', head, pending, 0);
++            last_manager = manager;
++            last_head = head;
++            last_pending = pending;
++        }
++        return;
++    }
++
++    const uint64_t item = c->x[24];
++    if (!hos_guest_range(item, 0xd0)) return;
++    if (pc == 0x801baed4 && ARG(0) == c->x[22]) {
++        const uint8_t flags = *(const uint8_t *)GP(item + 2);
++        guest_ram_audit('D', item, flags, 0);
++    } else if (pc == 0x801baf7c && ARG(0) == c->x[19] + 0x498) {
++        const uint64_t first = G64(item + 0xc0);
++        const uint64_t second = G64(item + 0xc8);
++        guest_ram_audit('Y', item, (first != 0) | ((second != 0) << 1), 0);
++    }
++}
++
+ HLE(_ZN2nn2os9LockMutexEPNS0_9MutexTypeE) {
+     Obj *m = obj(ARG(0), K_MUTEX);
+     if (watched(ARG(0))) watch_log("lock", ARG(0), 0, c, m);
+     mutex_lock(m, ARG(0), c);
+     if (watched(ARG(0))) watch_log("locked", ARG(0), 0, c, m);
++    resource_queue_observe(c);
+ }
+ HLE(_ZN2nn2os11UnlockMutexEPNS0_9MutexTypeE) {
+     Obj *m = obj(ARG(0), K_MUTEX);
+@@ -583,6 +1009,7 @@
+     AcquireSRWLockExclusive(&cv->lk);
+     cv_reserve(cv);
+     cv->gen++;
++    gap_signal_locked(cv);
+     ReleaseSRWLockExclusive(&cv->lk);
+     WakeConditionVariable(&cv->cv);
+ }
+@@ -601,9 +1028,13 @@
+     /* release the guest mutex fully while holding the condvar's lock: a signal cannot slip in between */
+     const int count = mutex_release_all(m);
+     HOS_CHAIN(HOS_CHAIN_WAIT, cv->key);
++    const int64_t gap_begin = JINRA_GAP_NOW();
+     while (cv->gen == gen) hos_cv_sleep(&cv->cv, &cv->lk, INFINITE);
+     const int owed = cv_leave(cv, m);
++    const int64_t signal = cv->gap_signal_ns;
++    const uint32_t signal_tid = cv->gap_signal_tid;
+     ReleaseSRWLockExclusive(&cv->lk);
++    if (gap_begin) JINRA_GAP_LONG("game_cond", gap_begin, hos_now_ns(), signal, signal_tid, cv->key, c->x[30]);
+     HOS_CHAIN(HOS_CHAIN_WOKE, cv->key);
+     if (w) watch_log(owed ? "cv woken, owed the mutex" : "cv woken", ARG(1), ARG(0), c, m);
+     mutex_lock_owed(m, ARG(1), owed);
+@@ -621,6 +1052,7 @@
+     HOS_CHAIN(HOS_CHAIN_SIGNAL, e->key);
+     AcquireSRWLockExclusive(&e->lk);
+     e->signaled = 1;
++    gap_signal_locked(e);
+     if (wake_lat_on()) e->sig_ns = hos_now_ns();
+     ReleaseSRWLockExclusive(&e->lk);
+     WakeAllConditionVariable(&e->cv);
+@@ -673,6 +1105,7 @@
+     int64_t deadline = timeout_ns > 0 ? hos_now_ns() + timeout_ns : 0;
+     const int was_set = e->signaled > 0;
+     const int chain = !try_only && !was_set && hos_chain_on;
++    const int64_t gap_begin = !try_only && !was_set ? JINRA_GAP_NOW() : 0;
+     if (chain) hos_chain_note(HOS_CHAIN_WAIT, e->key, 0);
+     if (!try_only) spin_until_set(e, &e->signaled);
+     int slept = 0;
+@@ -686,7 +1119,10 @@
+     int got = e->signaled;
+     if (got && !try_only && wake_lat_on()) wake_lat_note(slept ? 2 : spun ? 1 : 0, slept ? hos_now_ns() - e->sig_ns : 0);
+     if (got && e->autoclear) e->signaled = 0;
++    const int64_t signal = got && gap_begin ? e->gap_signal_ns : 0;
++    const uint32_t signal_tid = got && gap_begin ? e->gap_signal_tid : 0;
+     ReleaseSRWLockExclusive(&e->lk);
++    if (gap_begin) JINRA_GAP_LONG("game_event", gap_begin, hos_now_ns(), signal, signal_tid, e->key, 0);
+     if (chain) hos_chain_note(HOS_CHAIN_WOKE, e->key, 0);
+     return got;
+ }
+@@ -898,18 +1334,23 @@
+ }
+ static void sema_acquire(Obj *s) {
+     const int chain = s->sem <= 0 && hos_chain_on;
++    const int64_t gap_begin = s->sem <= 0 ? JINRA_GAP_NOW() : 0;
+     if (chain) hos_chain_note(HOS_CHAIN_WAIT, s->key, 0);
+     spin_until_set(s, &s->sem);
+     AcquireSRWLockExclusive(&s->lk);
+     while (s->sem <= 0) hos_cv_sleep(&s->cv, &s->lk, INFINITE);
+     s->sem--;
++    const int64_t signal = gap_begin ? s->gap_signal_ns : 0;
++    const uint32_t signal_tid = gap_begin ? s->gap_signal_tid : 0;
+     ReleaseSRWLockExclusive(&s->lk);
++    if (gap_begin) JINRA_GAP_LONG("game_sema", gap_begin, hos_now_ns(), signal, signal_tid, s->key, 0);
+     if (chain) hos_chain_note(HOS_CHAIN_WOKE, s->key, 0);
+ }
+ static void sema_release(Obj *s, int n) {
+     HOS_CHAIN(HOS_CHAIN_SIGNAL, s->key);
+     AcquireSRWLockExclusive(&s->lk);
+     s->sem += n;
++    gap_signal_locked(s);
+     if (s->sem_max && s->sem > s->sem_max) s->sem = s->sem_max;
+     ReleaseSRWLockExclusive(&s->lk);
+     WakeAllConditionVariable(&s->cv);
+@@ -958,6 +1399,7 @@
+         q->q[(q->qhead + q->qlen) % q->qcap] = v;
+     }
+     q->qlen++;
++    gap_signal_locked(q);
+     if (wake_lat_on()) q->sig_ns = hos_now_ns();
+     ReleaseSRWLockExclusive(&q->lk);
+     WakeAllConditionVariable(&q->cv);
+@@ -969,6 +1411,7 @@
+     int64_t deadline = timeout_ns > 0 ? hos_now_ns() + timeout_ns : 0;
+     const int was_set = q->qlen > 0;
+     const int chain = timeout_ns != 0 && !was_set && hos_chain_on;
++    const int64_t gap_begin = timeout_ns != 0 && !was_set ? JINRA_GAP_NOW() : 0;
+     if (chain) hos_chain_note(HOS_CHAIN_WAIT, q->key, 0);
+     if (timeout_ns != 0) spin_until_set(q, &q->qlen);
+     int slept = 0;
+@@ -977,6 +1420,7 @@
+     while (!q->qlen) {
+         if (timeout_ns == 0 || (timeout_ns > 0 && !wait_until(q, deadline))) {
+             ReleaseSRWLockExclusive(&q->lk);
++            if (gap_begin) JINRA_GAP_LONG("game_queue", gap_begin, hos_now_ns(), 0, 0, q->key, 0);
+             if (chain) hos_chain_note(HOS_CHAIN_WOKE, q->key, 0);
+             return 0;
+         }
+@@ -989,7 +1433,10 @@
+         q->qhead = (q->qhead + 1) % q->qcap;
+         q->qlen--;
+     }
++    const int64_t signal = gap_begin ? q->gap_signal_ns : 0;
++    const uint32_t signal_tid = gap_begin ? q->gap_signal_tid : 0;
+     ReleaseSRWLockExclusive(&q->lk);
++    if (gap_begin) JINRA_GAP_LONG("game_queue", gap_begin, hos_now_ns(), signal, signal_tid, q->key, 0);
+     if (chain) hos_chain_note(HOS_CHAIN_WOKE, q->key, 0);
+     if (take) {
+         WakeAllConditionVariable(&q->cv);

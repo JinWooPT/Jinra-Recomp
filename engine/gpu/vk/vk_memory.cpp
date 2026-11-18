@@ -25,6 +25,7 @@
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <psapi.h>
 
 #include "vk_internal.h"
 #include "vk_texture.h"   // (upload_command_buffer)
@@ -47,6 +48,11 @@
 #ifndef JINRA_ENV_H   // (env_on: the switches' one rule)
 #include "jinra_env.h"
 #endif
+#include "capture_trace.h"
+#include "memory_submit_trace.h"
+#ifdef _WIN32
+#include "texture_page_arena.h"
+#endif
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
 namespace mkwvk {
@@ -63,6 +69,7 @@ struct Pool {
     uint64_t lo = 0, hi = 0;   // guest range imported (aligned outwards)
     uint64_t range_lo = 0, range_hi = 0;   // (the game's pool range it was found for: pool_of's last hit)
     VkDeviceMemory memory = VK_NULL_HANDLE;
+    uint32_t import_heap = VK_MAX_MEMORY_HEAPS;
     std::vector<VkDeviceMemory> pieces;   // (a pool imported as several dma-bufs: the ones after `memory`)
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceAddress address = 0;
@@ -115,10 +122,11 @@ std::map<uint64_t, Pool> imported;    // by lo, made on first use
 Pool* last_pool = nullptr;            // (the last pool_of hit: draws in a row bind buffers of the same pools)
 extern Pool* pool_cache[4096];
 void retire_pool(std::map<uint64_t, Pool>::iterator it);
-Pool* pool_lookup(uint64_t guest, uint64_t size);
+Pool* pool_lookup(uint64_t guest, uint64_t size, const char* kind, uint64_t program);
 struct SrwMutex {   // (a slim reader/writer lock: half std::mutex's cost, taken for every buffer a draw binds)
     SRWLOCK l = SRWLOCK_INIT;
     void lock() { AcquireSRWLockExclusive(&l); }
+    bool try_lock() { return TryAcquireSRWLockExclusive(&l) != 0; }
     void unlock() { ReleaseSRWLockExclusive(&l); }
 };
 SrwMutex pools_mu;
@@ -359,6 +367,17 @@ bool import_dma_buf(uint64_t lo, uint64_t hi, Pool& p) {
 }
 #endif
 
+thread_local bool small_read_worker = false;
+
+struct ImportOrigin {
+    uint64_t qpc = 0, lo = 0, hi = 0;
+    std::vector<GuestPool> reserved;
+    std::vector<PSAPI_WORKING_SET_EX_INFORMATION> samples;
+};
+
+std::mutex import_origins_mu;
+std::vector<ImportOrigin> import_origins;
+
 bool import_pool(uint64_t lo, uint64_t hi, Pool& p) {
     import_cooling = false;
     import_result = VK_SUCCESS;
@@ -378,16 +397,52 @@ bool import_pool(uint64_t lo, uint64_t hi, Pool& p) {
     clk::time_point t1, t2, t3, t4;
     struct Report {   // (where an import's time goes: logged for slow ones, 12 times)
         const clk::time_point &a, &b, &c, &d, &e;
+        uint64_t bytes;
         ~Report() {
             if (e.time_since_epoch().count() == 0) return;
             const double total = std::chrono::duration<double, std::milli>(e - a).count();
-            static int logged;
-            if (total < 2.0 || logged++ >= 12) return;
+            static std::atomic<int> logged;
+            static const bool detail = env_on("JINRA_TEST_IMPORT_FRAME");
+            if (total < 2.0 || (!detail && logged++ >= 12)) return;
             auto ms = [](clk::time_point x, clk::time_point y) { return std::chrono::duration<double, std::milli>(y - x).count(); };
-            logf("vk: import %.1f ms: commit+properties %.1f, buffer %.1f, allocate %.1f, bind+address %.1f", total, ms(a, b),
-                 ms(b, c), ms(c, d), ms(d, e));
+            if (detail)
+                logf("vk: timed import phases qpc_ns %lld end %lld thread %lu bytes %llu total %.3f "
+                     "commit_properties %.3f create_buffer %.3f allocate %.3f bind_address %.3f",
+                     (long long)std::chrono::duration_cast<std::chrono::nanoseconds>(a.time_since_epoch()).count(),
+                     (long long)std::chrono::duration_cast<std::chrono::nanoseconds>(e.time_since_epoch()).count(),
+                     (unsigned long)GetCurrentThreadId(), (unsigned long long)bytes, total,
+                     ms(a, b), ms(b, c), ms(c, d), ms(d, e));
+            else
+                logf("vk: import %.1f ms: commit+properties %.1f, buffer %.1f, allocate %.1f, bind+address %.1f",
+                     total, ms(a, b), ms(b, c), ms(c, d), ms(d, e));
         }
-    } report{t0, t1, t2, t3, t4};
+    } report{t0, t1, t2, t3, t4, bytes};
+    static const bool observe_origin = env_on("JINRA_TEST_IMPORT_ORIGIN");
+    ImportOrigin origin;
+    if (observe_origin) {
+        origin.qpc = load_path_qpc();
+        origin.lo = lo;
+        origin.hi = hi;
+        for (uint8_t* query = ptr; query < ptr + bytes;) {
+            MEMORY_BASIC_INFORMATION info{};
+            if (VirtualQuery(query, &info, sizeof info) != sizeof info) break;
+            const auto end = std::min(static_cast<uint8_t*>(info.BaseAddress) + info.RegionSize, ptr + bytes);
+            if (end <= query) break;
+            if (info.State == MEM_RESERVE)
+                origin.reserved.push_back({lo + uint64_t(query - ptr), lo + uint64_t(end - ptr)});
+            query = end;
+        }
+        constexpr uint64_t step = 64ull << 10;
+        for (uint64_t block = lo; block < hi; block += step) {
+            const uint64_t offset = ((block / step * 2654435761ull) >> 26 & 15) << 12;
+            const uint64_t address = std::min(block + offset, hi - 4096);
+            PSAPI_WORKING_SET_EX_INFORMATION sample{};
+            sample.VirtualAddress = host->guest_base() + address;
+            origin.samples.push_back(sample);
+        }
+        const auto query_bytes = static_cast<DWORD>(origin.samples.size() * sizeof(origin.samples[0]));
+        if (!K32QueryWorkingSetEx(GetCurrentProcess(), origin.samples.data(), query_bytes)) origin.samples.clear();
+    }
     // (pages the game has not touched yet may be only reserved: committed now, as the pool's memory is usable)
     // One commit avoids the slow query walk, but resets protection on committed pages too. Keep the walk
     // for CPU write watches: commit only reserved pages, leaving the watched pages read-only.
@@ -450,7 +505,15 @@ bool import_pool(uint64_t lo, uint64_t hi, Pool& p) {
     ai.allocationSize = bytes;
     ai.memoryTypeIndex = type;
     const VkResult allocated = vkAllocateMemory(dev.device, &ai, nullptr, &p.memory);
+    p.import_heap = dev.memory.memoryTypes[type].heapIndex;
     t3 = clk::now();
+#ifdef _WIN32
+    if (small_read_worker && capture_trace::file())
+        capture_trace::add({"small_alloc", capture_trace::qpc(), capture_trace::frame(), GetCurrentThreadId(), lo, hi,
+                            uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t2.time_since_epoch()).count()),
+                            uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t3.time_since_epoch()).count()),
+                            uint64_t(int64_t(allocated))});
+#endif
     const VkResult bound = allocated == VK_SUCCESS ? vkBindBufferMemory(dev.device, p.buffer, p.memory, 0) : allocated;
     if (bound != VK_SUCCESS) {
         import_result = bound;
@@ -466,6 +529,10 @@ bool import_pool(uint64_t lo, uint64_t hi, Pool& p) {
     if (env_on("RX_VK_LOG_ADDR"))   // (diagnostics: which buffer a device fault's address is in)
         logf("vk: addr import %#llx..%#llx at gpu %#llx..%#llx", (unsigned long long)lo, (unsigned long long)hi,
              (unsigned long long)p.address, (unsigned long long)(p.address + (hi - lo)));
+    if (observe_origin) {
+        std::lock_guard lock(import_origins_mu);
+        if (import_origins.size() < 4096) import_origins.push_back(std::move(origin));
+    }
     t4 = clk::now();
     return true;
 }
@@ -622,6 +689,23 @@ void memory_sync() {
     const auto w1 = std::chrono::steady_clock::now();
     std::lock_guard lk(pools_mu);
     memsync_lock_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - w1).count();
+    static const bool trace_maps = env_on("JINRA_TEST_POOL_MAPS");
+    if (trace_maps) {
+        const auto stamp = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        const auto before = [](const GuestPool& a, const GuestPool& b) { return a.lo < b.lo; };
+        const auto changes = [&](const auto& old, const auto& current, const char* action) {
+            for (const GuestPool& pool : current) {
+                if (pool.hi - pool.lo < (4u << 20)) continue;
+                const auto found = std::lower_bound(old.begin(), old.end(), pool, before);
+                if (found != old.end() && found->lo == pool.lo && found->hi == pool.hi) continue;
+                logf("vk: lifetime map %s %lld %llx..%llx", action, (long long)stamp,
+                     (unsigned long long)pool.lo, (unsigned long long)pool.hi);
+            }
+        };
+        changes(guest_pools, next, "add");
+        changes(next, guest_pools, "remove");
+    }
     guest_pools.swap(next);
     guest_pools_gen.fetch_add(1, std::memory_order_relaxed);
     last_pool = nullptr;
@@ -821,7 +905,9 @@ uint64_t memory_pages_collected() {
 // replay records a submit later, and the mirrors were filled from guest memory as it was then: a frame's terrain
 // tiles read the next one's constants and flashed as walls. The pages are now copied as they are at the submit.
 namespace {
+struct CaptureSlice { uint64_t offset = 0, bytes = 0; };
 struct Capture {
+    CaptureSlice slice;
     std::vector<uint32_t> pages;     // (written since the last submit)
     std::vector<uint32_t> copied;    // (those copied, in order)
     std::vector<uint32_t> slots;     // (and where each is in the buffer: 4 KB a slot, the page's index in pages)
@@ -834,6 +920,11 @@ struct Capture {
     size_t nbytes = 0;
     std::vector<uint32_t> late;      // (indices into pages: copied again by the replay once late_value is done)
     uint64_t late_value = 0;
+#ifdef _WIN32
+    struct TracePage { uint64_t address, value, part, completed; };
+    uint64_t trace_id = 0, trace_part = 0, trace_whole = 0;
+    std::vector<TracePage> trace_pages;
+#endif
     // "shadow staging": the texture pages of this capture, copied from guest memory into ordinary cached RAM too, for
     // take_capture's texture shadow to read instead of the buffer above (often write-combined here: CPU reads ~0.3 GB/s).
     // sidx[i] = the staging slot of pages[i] (4 KB a slot), or -1: that page is read from the buffer. Empty sidx: no staging.
@@ -911,13 +1002,71 @@ inline void cap_entry_set(uint64_t page, CapEntry e) {
     cap_table[c][page % kCapChunkPages] = e;
 }
 // (each kept capture's copy on the GPU, by its generation)
-struct CapBuf { uint64_t value; VkBuffer buffer; VmaAllocation alloc; uint64_t size; void* map; uint64_t last_use = 0; };
+struct CapBuf { uint64_t value; VkBuffer buffer; VmaAllocation alloc; uint64_t size; void* map; uint64_t last_use = 0; CaptureSlice slice{}; };
 std::map<uint32_t, CapBuf> cap_bufs;
 uint64_t cap_bytes = 0;
 constexpr size_t kKeep = 24;
 constexpr uint64_t kCapBytesMax = 768ull << 20;   // (and no more than this in them: loads capture hundreds of MB)
 // (retired buffers, for the next captures: making and freeing a 5 MB buffer every submit cost the replay too)
-struct FreeBuf { VkBuffer buffer; VmaAllocation alloc; void* map; uint64_t size; };
+struct FreeBuf { VkBuffer buffer; VmaAllocation alloc; void* map; uint64_t size; uint64_t cached_at = 0; };
+struct CaptureUse { uint64_t takes = 0, allocations = 0; };
+CaptureUse capture_use_by_mib[257];
+#ifdef _WIN32
+// The capture-pool mutex serializes all records apart from writing them at shutdown.
+namespace capture_pool_trace {
+
+struct Entry {
+    uint64_t qpc;
+    uint64_t allocation;
+    uint64_t capacity;
+    uint64_t requested;
+    char action;
+};
+
+constexpr size_t limit = 524288;
+Entry entries[limit]{};
+std::atomic<size_t> count{0};
+std::atomic<bool> ready[limit]{};
+std::atomic<bool> final_window{false};
+
+void write_events() {
+    const char* path = std::getenv("JINRA_TEST_CAPTURE_POOL_TRACE");
+    if (!path || !*path) return;
+    FILE* file = std::fopen(path, "wb");
+    if (!file) return;
+    std::fputs("qpc,action,allocation,capacity,requested\n", file);
+    const size_t total = count.load(std::memory_order_acquire);
+    const size_t used = std::min(total, limit);
+    size_t incomplete = 0;
+    for (size_t i = 0; i < used; ++i) {
+        if (!ready[i].load(std::memory_order_acquire)) {
+            ++incomplete;
+            continue;
+        }
+        const auto& entry = entries[i];
+        std::fprintf(file, "%llu,%c,%llx,%llu,%llu\n", (unsigned long long)entry.qpc, entry.action,
+                     (unsigned long long)entry.allocation, (unsigned long long)entry.capacity,
+                     (unsigned long long)entry.requested);
+    }
+    std::fprintf(file, "# lost=%llu cap=%llu incomplete=%llu\n", (unsigned long long)(total - used + incomplete),
+                 (unsigned long long)limit, (unsigned long long)incomplete);
+    std::fclose(file);
+}
+
+void take(char action, VmaAllocation allocation, uint64_t capacity, uint64_t requested = 0) {
+    static const bool enabled = std::getenv("JINRA_TEST_CAPTURE_POOL_TRACE") && std::atexit(write_events) == 0;
+    if (!enabled) return;
+    static const bool final_only = env_on("JINRA_TEST_CAPTURE_TRACE_FINAL_WINDOW");
+    if (final_only && !final_window.load(std::memory_order_acquire)) return;
+    const size_t index = count.fetch_add(1, std::memory_order_relaxed);
+    if (index >= limit) return;
+    entries[index] = {load_path_qpc(), (uint64_t)(uintptr_t)allocation, capacity, requested, action};
+    ready[index].store(true, std::memory_order_release);
+}
+
+} // namespace capture_pool_trace
+#endif
+
 std::vector<FreeBuf> cap_free;
 uint64_t cur_cap_value = 0;   // (the submission being recorded: what its syncs' copies wait for)
 uint32_t cur_cap_gen = 0;     // (its capture's generation)
@@ -930,31 +1079,130 @@ std::mutex cap_free_mu;   // (the submitting threads take buffers from cap_free,
 uint64_t cap_free_bytes = 0;   // (cap_free_mu)
 // (the spare buffers: 12 and, on a card of 6 GB or less, 32 MB of them; RX_VK_CAP_SPARE_MB=<n>: that many, 0: as before.
 // After a load the retired ones, 40-60 MB each, stayed as spares for good)
+// Access protected by cap_free_mu during the diagnostic.
+uint64_t cap_loading_limit = UINT64_MAX;
+std::atomic<uint64_t> preview_capture_trim_until{0};
+
 uint64_t cap_spare_max() {
     static const uint64_t v = [] {
         if (const char* e = getenv("RX_VK_CAP_SPARE_MB")) return e[0] && atoll(e) ? (uint64_t)atoll(e) << 20 : ~0ull;
         uint64_t used = 0, allowed = 0;
         return vram_usage(&used, &allowed) && allowed <= (6ull << 30) + (512ull << 20) ? 32ull << 20 : ~0ull;
     }();
-    return v;
+    return std::min(v, cap_loading_limit);
 }
-void cap_buf_free(VkBuffer buffer, VmaAllocation alloc, void* map, uint64_t size, bool from_worker = false) {
+
+// All extents refer to the same transfer-source buffer. Its mapping stays valid
+// through the device's lifetime, as do the existing cached capture buffers.
+// Offset and length are aligned so a noncoherent flush cannot touch a neighbour.
+struct SharedCapturePool {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VmaAllocation allocation = nullptr;
+    uint8_t* mapped = nullptr;
+    uint64_t align = 0, live = 0, high_water = 0;
+    uint64_t requests = 0, overflow = 0;
+    bool attempted = false;
+    std::vector<CaptureSlice> holes;
+    static constexpr uint64_t capacity = 352ull << 20;
+
+    bool initialise() {
+        if (attempted) return mapped != nullptr;
+        attempted = true;
+        align = std::max<uint64_t>(65536, dev.props.limits.nonCoherentAtomSize);
+        void* base = nullptr;
+        if (!create_buffer_cached(capacity, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                  buffer, allocation, &base, true) || !base) {
+            if (buffer) destroy_buffer(buffer, allocation);
+            buffer = VK_NULL_HANDLE;
+            allocation = nullptr;
+            logf("Jinra shared capture unavailable, using original capture allocator");
+            return false;
+        }
+        mapped = static_cast<uint8_t*>(base);
+        holes.reserve(64);
+        holes.push_back({0, capacity});
+        logf("Jinra shared capture ready capacity=%llu alignment=%llu cached=%u",
+             (unsigned long long)capacity, (unsigned long long)align, (unsigned)host_cached(allocation));
+        return true;
+    }
+
+    bool take(uint64_t need, CaptureSlice& slice) {
+        const uint64_t size = (need + align - 1) & ~(align - 1);
+        auto best = holes.end();
+        for (auto it = holes.begin(); it != holes.end(); ++it)
+            if (it->bytes >= size && (best == holes.end() || it->bytes < best->bytes)) best = it;
+        if (best == holes.end()) {
+            ++overflow;
+            if (overflow <= 4) logf("Jinra shared capture overflow need=%llu live=%llu",
+                                    (unsigned long long)need, (unsigned long long)live);
+            return false;
+        }
+        slice = {best->offset, size};
+        if (best->bytes == size) holes.erase(best);
+        else { best->offset += size; best->bytes -= size; }
+        ++requests;
+        live += size;
+        high_water = std::max(high_water, live);
+        return true;
+    }
+
+    void put(CaptureSlice released) {
+        live -= released.bytes;
+        auto next = std::lower_bound(holes.begin(), holes.end(), released.offset,
+            [](const CaptureSlice& item, uint64_t offset) { return item.offset < offset; });
+        if (next != holes.begin()) {
+            auto prev = std::prev(next);
+            if (prev->offset + prev->bytes == released.offset) {
+                prev->bytes += released.bytes;
+                if (next != holes.end() && prev->offset + prev->bytes == next->offset) {
+                    prev->bytes += next->bytes;
+                    holes.erase(next);
+                }
+                return;
+            }
+        }
+        if (next != holes.end() && released.offset + released.bytes == next->offset) {
+            next->offset = released.offset;
+            next->bytes += released.bytes;
+        } else holes.insert(next, released);
+    }
+};
+SharedCapturePool shared_capture_pool; // serialised by cap_free_mu
+bool shared_capture_enabled() {
+    static const bool active = env_on("JINRA_TEST_SHARED_CAPTURE");
+    return active;
+}
+
+void cap_buf_free(VkBuffer buffer, VmaAllocation alloc, void* map, uint64_t size,
+                  bool from_worker = false, CaptureSlice slice = {}) {
     std::lock_guard lk(cap_free_mu);
+    if (slice.bytes) {
+        shared_capture_pool.put(slice);
+        return;
+    }
     if (from_worker && cap_shutting_down.load()) return;
     // (RX 7800 XT: buffers up to 256 MB are kept for the next capture, not only up to 64 MB: a new one costs ~100 ms of
     // vkAllocateMemory on AMD's driver. RX_VK_CAPTURE_KEEP_OLD=1: as before)
     static const bool keep_old = env_on("RX_VK_CAPTURE_KEEP_OLD");
     if (cap_free.size() < 12 && size <= (keep_old ? 64ull << 20 : 256ull << 20) &&
         cap_free_bytes + size <= std::min<uint64_t>(cap_spare_max(), keep_old ? ~0ull : 768ull << 20)) {
-        cap_free.push_back({buffer, alloc, map, size});
+        cap_free.push_back({buffer, alloc, map, size, GetTickCount64()});
+#ifdef _WIN32
+        capture_pool_trace::take('R', alloc, size);
+#endif
         cap_free_bytes += size;
     } else {
+#ifdef _WIN32
+        capture_pool_trace::take('D', alloc, size);
+#endif
+        memory_submit_trace::Scope destroying(memory_submit_trace::destroy, 1, size);
         destroy_buffer(buffer, alloc);
     }
 }
 void cap_buf_retire(std::map<uint32_t, CapBuf>::iterator it) {
+    memory_submit_trace::Scope retiring(memory_submit_trace::retire, 1, it->second.size);
     cap_bytes -= it->second.size;
-    cap_buf_free(it->second.buffer, it->second.alloc, it->second.map, it->second.size);
+    cap_buf_free(it->second.buffer, it->second.alloc, it->second.map, it->second.size, false, it->second.slice);
     cap_bufs.erase(it);
 }
 // (a capture's buffer by its size class: 2, 4, 8, then 16 MB and up to the MB. It was never under 16 MB, for captures of ~1 MB:
@@ -991,7 +1239,130 @@ bool cap_prewarm_on() {
 }
 std::atomic<int> cap_prewarm_busy{0};
 std::atomic<int> cap_prewarm_class_busy[4]{};   // (32, 64, 128 and 192 MB spares being made)
+// Bench-only retirement of capture buffers that are already out of GPU use.
+std::mutex aged_capture_worker_mu;
+bool aged_capture_closing = false;
+std::jthread aged_capture_worker;
+std::atomic<bool> aged_capture_sweep_done{true};
+
+void aged_capture_stop() {
+    std::lock_guard lock(aged_capture_worker_mu);
+    aged_capture_closing = true;
+    if (aged_capture_worker.joinable()) {
+        aged_capture_worker.request_stop();
+        aged_capture_worker.join();
+    }
+}
+
+uint64_t periodic_capture_minimum() {
+    static const uint64_t bytes = env_on("JINRA_TEST_CAPTURE_ONLY_LARGE") ? 192ull << 20 : 64ull << 20;
+    return bytes;
+}
+
+void aged_capture_checkpoint(const char* label) {
+    if (!std::strcmp(label, "rest_60_post")) {
+        capture_pool_trace::final_window.store(true, std::memory_order_release);
+    }
+    const char* mode = std::getenv("JINRA_TEST_CAPTURE_AGE");
+    if (!mode) return;
+    const bool exact = std::strcmp(mode, "exact") == 0;
+    if (exact && std::strcmp(label, "aged_gerudo_warm") == 0) {
+        // Largest request measured in Gerudo across the two visits in the short trial.
+        constexpr uint64_t bytes = 225ull << 20;
+        std::lock_guard worker_lock(aged_capture_worker_mu);
+        if (aged_capture_closing) return;
+        if (aged_capture_worker.joinable()) aged_capture_worker.join();
+        aged_capture_worker = std::jthread([] {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+            VkBuffer buffer = VK_NULL_HANDLE;
+            VmaAllocation allocation = nullptr;
+            void* mapped = nullptr;
+            const auto before = std::chrono::steady_clock::now();
+            const bool ready = create_buffer_cached(bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, buffer,
+                                                    allocation, &mapped, !env_on("RX_VK_CAP_BLOCKS"));
+            if (ready && mapped) cap_buf_free(buffer, allocation, mapped, bytes, true);
+            else if (ready) destroy_buffer(buffer, allocation);
+            logf("Jinra capture warm bytes=%llu ok=%u qpc=%llu ms=%.3f", (unsigned long long)bytes,
+                 (unsigned)(ready && mapped), (unsigned long long)load_path_qpc(),
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - before).count());
+        });
+        return;
+    }
+    const bool periodic = std::strcmp(label, "automatic_return") == 0;
+    const bool repeated = periodic || env_on("JINRA_TEST_CAPTURE_REPEAT");
+    const bool on_revisit = !std::strcmp(label, "fit_market_rest_post") || !std::strcmp(label, "fit_gerudo_rest_post");
+    const bool final_recall = !std::strcmp(label, "recall_rest_post") &&
+                              env_on("JINRA_TEST_CAPTURE_FINISH_RECALL");
+    if (!periodic && std::strcmp(label, "rest_60_post") &&
+        !(repeated && (on_revisit || final_recall))) return;
+    const uint64_t minimum = periodic ? periodic_capture_minimum() :
+        (repeated && env_on("JINRA_TEST_CAPTURE_RECLAIM_MEDIUM") ? 40ull : 64ull) << 20;
+    const bool active = exact || std::strcmp(mode, "active") == 0 ||
+                        std::strcmp(mode, "fit") == 0 || std::strcmp(mode, "fit8") == 0;
+    if (!active && std::strcmp(mode, "control")) return;
+    std::lock_guard worker_lock(aged_capture_worker_mu);
+    if (aged_capture_closing) return;
+    if (aged_capture_worker.joinable()) {
+        if (!repeated || !aged_capture_sweep_done.load(std::memory_order_acquire)) return;
+        aged_capture_worker.join();
+    }
+    aged_capture_sweep_done.store(false, std::memory_order_release);
+    aged_capture_worker = std::jthread([active, minimum, periodic, repeated, phase = std::string(label)](std::stop_token stop) {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        std::vector<FreeBuf> seen;
+        {
+            std::lock_guard lock(cap_free_mu);
+            seen.reserve(cap_free.size());
+        }
+        for (;;) {
+            if (stop.stop_requested()) break;
+            FreeBuf spare{};
+            uint64_t idle = 0;
+            {
+                std::lock_guard lock(cap_free_mu);
+                const auto now = GetTickCount64();
+                const auto candidate = std::find_if(cap_free.begin(), cap_free.end(), [&](const FreeBuf& item) {
+                    return item.size >= minimum && now - item.cached_at >= 60000 &&
+                           std::none_of(seen.begin(), seen.end(), [&](const FreeBuf& previous) {
+                               return item.buffer == previous.buffer && item.cached_at == previous.cached_at;
+                           });
+                });
+                if (candidate == cap_free.end()) break;
+                spare = *candidate;
+                idle = now - spare.cached_at;
+                seen.push_back(spare);
+                capture_pool_trace::take(active ? 'X' : 'O', spare.alloc, spare.size);
+                if (active) {
+                    cap_free_bytes -= spare.size;
+                    cap_free.erase(candidate);
+                }
+            }
+            MEMORY_BASIC_INFORMATION region{};
+            if (spare.map) VirtualQuery(spare.map, &region, sizeof region);
+            const auto before = std::chrono::steady_clock::now();
+            const auto qpc = load_path_qpc();
+            if (active) destroy_buffer(spare.buffer, spare.alloc);
+            logf("Jinra aged capture active=%u bytes=%llu age_ms=%llu base=%p qpc=%llu release_ms=%.3f",
+                 (unsigned)active, (unsigned long long)spare.size, (unsigned long long)idle,
+                 region.AllocationBase, (unsigned long long)qpc,
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - before).count());
+            Sleep(500);
+        }
+        logf("Jinra aged capture finished active=%u candidates=%zu", (unsigned)active, seen.size());
+        logf("Jinra capture repeat checkpoint=%s candidates=%zu", phase.c_str(), seen.size());
+        if (repeated && !periodic) {
+            if (const char* folder = std::getenv("JINRA_TEST_IMPORT_SNAPSHOT_DIR")) {
+                const std::string marker = std::string(folder) + "/capture-repeat-" + phase + ".done";
+                if (FILE* complete = std::fopen(marker.c_str(), "wb")) std::fclose(complete);
+            }
+        }
+        aged_capture_sweep_done.store(true, std::memory_order_release);
+    });
+}
+
 void cap_exit_note() {
+    if (std::getenv("JINRA_TEST_CAPTURE_AGE")) aged_capture_stop();
+
     std::lock_guard lk(cap_free_mu);   // (a worker inside cap_buf_free finishes first; one after this sees the flag under the same mutex)
     cap_shutting_down = true;
 }
@@ -1035,28 +1406,118 @@ void cap_prewarm_class(uint64_t size) {
         cap_prewarm_busy--;
     }
 }
-bool cap_buf_get(uint64_t need, VkBuffer& buffer, VmaAllocation& alloc, void*& map, uint64_t& size) {
+void cap_trim_retired_on_request() {
+#ifdef _WIN32
+    if (cap_loading_limit != UINT64_MAX) return;
+    const uint64_t expires = preview_capture_trim_until.exchange(0);
+    if (!expires || GetTickCount64() > expires) return;
+    const auto start = std::chrono::steady_clock::now();
+    const uint64_t before = cap_free_bytes;
+    cap_loading_limit = 320ull << 20;
+    while (cap_free_bytes > cap_loading_limit) {
+        // Drop oversized buffers first. Keep one buffer per useful size class when possible.
+        auto victim = cap_free.end();
+        for (auto it = cap_free.begin(); it != cap_free.end(); ++it) {
+            if (it->size <= (192ull << 20) &&
+                std::none_of(it + 1, cap_free.end(), [it](const FreeBuf& other) { return other.size == it->size; })) continue;
+            if (victim == cap_free.end() || it->size > victim->size) victim = it;
+        }
+        if (victim == cap_free.end()) {
+            victim = std::max_element(cap_free.begin(), cap_free.end(),
+                                      [](const FreeBuf& a, const FreeBuf& b) { return a.size < b.size; });
+        }
+        const FreeBuf retired = *victim;
+        cap_free.erase(victim);
+        cap_free_bytes -= retired.size;
+        destroy_buffer(retired.buffer, retired.alloc);
+    }
+    logf("vk: capture trim qpc %llu reserved %llu to %llu MiB in %.3f ms",
+         static_cast<unsigned long long>(load_path_qpc()), static_cast<unsigned long long>(before >> 20),
+         static_cast<unsigned long long>(cap_free_bytes >> 20),
+         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+#endif
+}
+
+bool capture_fit_enabled() {
+    const char* mode = std::getenv("JINRA_TEST_CAPTURE_AGE");
+    return mode && (std::strcmp(mode, "fit") == 0 || std::strcmp(mode, "fit8") == 0);
+}
+
+bool capture_fit_coalesced() {
+    const char* mode = std::getenv("JINRA_TEST_CAPTURE_AGE");
+    return mode && std::strcmp(mode, "fit8") == 0;
+}
+
+bool capture_fits_size(uint64_t size, uint64_t need) {
+    constexpr uint64_t large = 64ull << 20;
+    return size >= need && (size < large || size - need <= need / 4);
+}
+
+bool cap_buf_get(uint64_t need, VkBuffer& buffer, VmaAllocation& alloc, void*& map, uint64_t& size, CaptureSlice& slice) {
+    static const bool fit = capture_fit_enabled();
+    static const bool coalesced = capture_fit_coalesced();
     std::lock_guard lk(cap_free_mu);
-    if (cap_prewarm_on()) {
+    cap_trim_retired_on_request();
+    slice = {};
+    const bool shared = shared_capture_enabled() && shared_capture_pool.initialise();
+    if (shared && shared_capture_pool.take(need, slice)) {
+        buffer = shared_capture_pool.buffer;
+        alloc = shared_capture_pool.allocation;
+        map = shared_capture_pool.mapped + slice.offset;
+        // Preserve the existing retention policy based on logical standalone classes.
+        size = cap_buf_size(need);
+        return true;
+    }
+    // Demand beyond the shared block uses the original reusable buffer path.
+    if (!shared && cap_prewarm_on()) {
         static bool first = true;
         if (first) {   // (the first capture: the classes a load asks for)
             first = false;
             for (uint64_t c : {32ull << 20, 64ull << 20, 128ull << 20, 192ull << 20}) cap_prewarm_class(c);
         }
     }
+    static const bool trace_requests = env_on("JINRA_TEST_CAPTURE_BLOCKS");
+    if (trace_requests && need >= (32ull << 20))
+        logf("Jinra capture demand qpc=%llu bytes=%llu", (unsigned long long)load_path_qpc(), (unsigned long long)need);
     size_t best = cap_free.size();
     for (size_t i = 0; i < cap_free.size(); i++)
-        if (cap_free[i].size >= need && (best == cap_free.size() || cap_free[i].size < cap_free[best].size)) best = i;
+        if ((fit ? capture_fits_size(cap_free[i].size, need) : cap_free[i].size >= need) &&
+            (best == cap_free.size() || cap_free[i].size < cap_free[best].size)) best = i;
     if (best < cap_free.size()) {
         buffer = cap_free[best].buffer, alloc = cap_free[best].alloc, map = cap_free[best].map, size = cap_free[best].size;
         cap_free_bytes -= size;
+        ++capture_use_by_mib[std::min<uint64_t>(256, size >> 20)].takes;
+        if (size >= (192ull << 20) && std::getenv("JINRA_TEST_CAPTURE_AGE"))
+            logf("Jinra capture reuse need=%llu bytes=%llu qpc=%llu", (unsigned long long)need,
+                 (unsigned long long)size, (unsigned long long)load_path_qpc());
+#ifdef _WIN32
+        capture_pool_trace::take('T', alloc, size, need);
+#endif
         cap_free.erase(cap_free.begin() + (ptrdiff_t)best);
         return map != nullptr;
     }
     size = cap_buf_size(need);
+    constexpr uint64_t mib = 1ull << 20;
+    if (coalesced && need >= 40 * mib && need <= 64 * mib) {
+        constexpr uint64_t step = 8 * mib;
+        size = (need + step - 1) & ~(step - 1);
+    }
+    if (fit && !capture_fits_size(size, need)) {
+        size = (need + mib - 1) & ~(mib - 1);
+    }
     map = nullptr;
-    return create_buffer_cached(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, buffer, alloc, &map,
-                                size >= (16ull << 20) && !env_on("RX_VK_CAP_BLOCKS")) && map;
+    const auto create_start = std::chrono::steady_clock::now();
+    const bool ready = create_buffer_cached(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, buffer, alloc, &map,
+                                            size >= (16ull << 20) && !env_on("RX_VK_CAP_BLOCKS")) && map;
+    if (ready) ++capture_use_by_mib[std::min<uint64_t>(256, size >> 20)].allocations;
+#ifdef _WIN32
+    if (ready) capture_pool_trace::take('N', alloc, size, need);
+#endif
+    const double create_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - create_start).count();
+    if (size >= ((fit ? 40ull : 64ull) << 20) || create_ms > 5.0)
+        logf("Jinra capture allocate need=%llu bytes=%llu ok=%u qpc=%llu ms=%.3f", (unsigned long long)need,
+             (unsigned long long)size, (unsigned)ready, (unsigned long long)load_path_qpc(), create_ms);
+    return ready;
 }
 std::vector<std::pair<uint64_t, uint64_t>> cap_ranges;   // (the mirrored pools the captures take, as of the last one)
 std::mutex cap_ranges_mu;
@@ -1149,17 +1610,38 @@ bool tex_capture_on() {
 }
 std::vector<std::pair<uint64_t, uint64_t>> tex_cap_ranges;   // (texture storage the capture takes, merged; cap_ranges_mu)
 std::mutex shadow_mu;   // (after pools_mu, before cap_ranges_mu)
+uint64_t shadow_seq = 0;   // (captures taken)
+uint64_t tex_shadow_allocated = 0, tex_shadow_erased = 0, tex_shadow_updated = 0;
+size_t tex_shadow_peak = 0;
+#ifdef _WIN32
+TexturePageArena tex_shadow_arena;
+bool tex_shadow_arena_on() {
+    static const bool enabled = env_on("JINRA_TEST_SHADOW_ARENA");
+    return enabled;
+}
+#endif
+struct TexturePageDeleter {
+    void operator()(uint8_t* p) const {
+#ifdef _WIN32
+        if (tex_shadow_arena_on() && tex_shadow_arena.release(p, shadow_seq)) return;
+#endif
+        delete[] p;
+    }
+};
 struct ShadowPage {
-    std::unique_ptr<uint8_t[]> b;
+    std::unique_ptr<uint8_t[], TexturePageDeleter> b;
     uint64_t seq = 0;   // (the capture that took it)
 };
 std::unordered_map<uint32_t, ShadowPage> shadow;   // guest page -> its 4 KB as the last capture taken had it
 std::unordered_map<uint32_t, uint32_t> shadow_regions;   // (2 MB region -> its pages in the shadow)
 std::atomic<size_t> shadow_n{0};
-uint64_t shadow_seq = 0;   // (captures taken)
+auto shadow_sweep_next = shadow.end();   // protected by shadow_mu
 // (256 MB: past it the pages no capture took in the last 64 go, the oldest first: those the game rewrites every frame
 // stay; if none can go, a page is read from guest memory as before)
 constexpr size_t kShadowMax = 65536;
+#ifdef _WIN32
+static_assert(kShadowMax == TexturePageArena::capacity);
+#endif
 std::map<uint64_t, std::pair<uint64_t, uint64_t>> tex_spans;   // lo -> (hi, the present a texture was last uploaded from it)
 std::vector<std::pair<uint64_t, uint64_t>> tex_merged;          // (tex_spans merged; shadow_mu)
 bool tex_spans_changed = false;
@@ -1169,11 +1651,40 @@ bool in_tex_merged(uint64_t guest) {   // (shadow_mu held)
     auto it = std::upper_bound(tex_merged.begin(), tex_merged.end(), std::make_pair(guest, ~uint64_t(0)));
     return it != tex_merged.begin() && guest < std::prev(it)->second;
 }
-void shadow_erase(uint32_t page) {   // (shadow_mu held)
-    if (!shadow.erase(page)) return;
-    auto r = shadow_regions.find(page >> 9);
-    if (r != shadow_regions.end() && --r->second == 0) shadow_regions.erase(r);
+bool shadow_bounded_sweep() {
+    static const bool on = env_on("JINRA_TEST_SHADOW_SWEEP_BOUNDED");
+    return on;
+}
+auto shadow_erase_at(decltype(shadow)::iterator it) {   // shadow_mu held
+    if (shadow_bounded_sweep() && it == shadow_sweep_next) ++shadow_sweep_next;
+    auto region = shadow_regions.find(it->first >> 9);
+    if (region != shadow_regions.end() && --region->second == 0) shadow_regions.erase(region);
     shadow_n--;
+    ++tex_shadow_erased;
+    return shadow.erase(it);
+}
+void shadow_erase(uint32_t page) {   // (shadow_mu held)
+    const auto it = shadow.find(page);
+    if (it != shadow.end()) shadow_erase_at(it);
+}
+void shadow_incremental_sweep(size_t incoming) {   // shadow_mu held
+    const size_t count = shadow.size();
+    if (count <= 8192) return;
+    // Use the existing emergency age threshold as we approach the same hard limit.
+    const uint64_t age = count >= kShadowMax - 4096 || incoming > kShadowMax - count ? 64 : 256;
+    const size_t budget = std::min<size_t>(1024, count);
+    memory_submit_trace::Scope trace(memory_submit_trace::sweep);
+    for (size_t i = 0; i < budget; ++i) {
+        if (shadow_sweep_next == shadow.end()) {
+            if (shadow.empty()) break;
+            shadow_sweep_next = shadow.begin();
+        }
+        auto it = shadow_sweep_next++;
+        trace.items++;
+        if (shadow_seq - it->second.seq <= age) continue;
+        shadow_erase_at(it);
+        trace.bytes += 4096;
+    }
 }
 void shadow_drop_range(uint64_t lo, uint64_t hi) {   // (shadow_mu held)
     if (hi <= lo) return;
@@ -1701,6 +2212,27 @@ void shadow_forget(Pool& p, uint64_t at, uint64_t len);   // (the write-back's d
 void memory_capture_submit() {
     std::unique_ptr<Capture> c = capture_make();
     if (!c) return;
+#ifdef _WIN32
+    static const bool automatic_return = env_on("JINRA_TEST_CAPTURE_AUTOMATIC_RETURN");
+    if (automatic_return) {
+        static std::atomic<uint64_t> next_check{0};
+        const uint64_t now = GetTickCount64();
+        uint64_t scheduled = next_check.load(std::memory_order_relaxed);
+        if (now >= scheduled && next_check.compare_exchange_strong(scheduled, now + 2000, std::memory_order_relaxed)) {
+            bool found = false;
+            {
+                std::unique_lock free_buffers(cap_free_mu, std::try_to_lock);
+                if (free_buffers) {
+                    const uint64_t minimum = periodic_capture_minimum();
+                    found = std::any_of(cap_free.begin(), cap_free.end(), [now, minimum](const FreeBuf& buffer) {
+                        return buffer.size >= minimum && now - buffer.cached_at >= 60000;
+                    });
+                }
+            }
+            if (found) aged_capture_checkpoint("automatic_return");
+        }
+    }
+#endif
     std::lock_guard lk(cap_mu);
     captures.push_back(std::move(c));
 }
@@ -1715,7 +2247,7 @@ std::unique_ptr<Capture> capture_make() {
     }
     if (!c) c = std::make_unique<Capture>();
     c->pages.clear(), c->copied.clear(), c->slots.clear(), c->nbytes = 0, c->late.clear(), c->late_value = 0;
-    if (c->map) cap_buf_free(c->buffer, c->alloc, c->map, c->bsize), c->buffer = VK_NULL_HANDLE, c->map = nullptr;
+    if (c->map) cap_buf_free(c->buffer, c->alloc, c->map, c->bsize, false, c->slice), c->buffer = VK_NULL_HANDLE, c->map = nullptr;
     stage_put(*c);
     // (only the pools mirrored in VRAM, the ones the mirrors are filled from, and only their part of the write marks:
     // every written page was taken at first (hundreds of MB a submit where the game streams its world), and the whole
@@ -1758,6 +2290,11 @@ std::unique_ptr<Capture> capture_make() {
     const int64_t n = mirrored.empty() || !host->collect_written_in ? 0
                     : host->collect_written_in(reinterpret_cast<const uint64_t(*)[2]>(mirrored.data()), (int)mirrored.size(), &pages);
     const auto t_scan = std::chrono::steady_clock::now();
+#ifdef _WIN32
+    const bool arrival_trace = capture_trace::arrival_detail();
+    const uint64_t arrival_scan = arrival_trace ? capture_trace::qpc() : 0;
+    uint64_t arrival_copy_start = 0, arrival_copy_end = 0;
+#endif
     // A page the CPU wrote that a submission still on the GPU writes back: the copy waits for that write-back.
     // OoT's exposure meter page is written by both: the GPU adds the frame's light into it and the CPU sets the sums back to
     // 0 and fills in the rest. The CPU runs a frame ahead, and a copy taken before the write-back had landed had the GPU's
@@ -1766,6 +2303,13 @@ std::unique_ptr<Capture> capture_make() {
     // last submission writing them back: not every frame's present. That wait held the game's thread (~8% of its time at a
 // ~2150-draw scene), so those pages are copied again by the replay, before it uses this capture, once the submission is
 // done: the replay waits instead, while the game goes on. RX_VK_CAPTURE_WAIT=1: the game's thread waits, 0: no wait
+#ifdef _WIN32
+    static std::atomic<uint64_t> trace_next{0};
+    const bool tracing = capture_trace::file() != nullptr;
+    c->trace_id = c->trace_part = c->trace_whole = 0;
+    c->trace_pages.clear();
+    if (tracing && n > 0) c->trace_id = 1 + trace_next.fetch_add(1, std::memory_order_relaxed);
+#endif
     if (n > 0) {
         static const int cap_wait = getenv("RX_VK_CAPTURE_WAIT") ? atoi(getenv("RX_VK_CAPTURE_WAIT")) : 2;
         uint64_t v = 0;
@@ -1777,6 +2321,14 @@ std::unique_ptr<Capture> capture_make() {
                     const uint64_t pv = wb_pages.get(pages[i]);
                     if (pv > done) {
                         v = std::max(v, pv);
+#ifdef _WIN32
+                        if (tracing) {
+                            const uint64_t part = wb_parts.get(pages[i]);
+                            if (part) c->trace_part = std::max(c->trace_part, part);
+                            else c->trace_whole = std::max(c->trace_whole, pv);
+                            c->trace_pages.push_back({uint64_t(pages[i]) << kPageShift, pv, part, done});
+                        }
+#endif
                         if (cap_wait == 2) c->late.push_back((uint32_t)i);
                     }
                 }
@@ -1788,7 +2340,7 @@ std::unique_ptr<Capture> capture_make() {
     if (n > 0) {
         c->pages.assign(pages, pages + n);
         if ((uint64_t)n * 4096 <= (256ull << 20) &&   // (a load writes more: those are read later, as before)
-            cap_buf_get((uint64_t)n * 4096, c->buffer, c->alloc, c->map, c->bsize)) {
+            cap_buf_get((uint64_t)n * 4096, c->buffer, c->alloc, c->map, c->bsize, c->slice)) {
             static thread_local std::vector<uint8_t> ok;
             ok.assign((size_t)n, 0);
             // (shadow staging: the pages in the texture ranges are also copied into c->stage, from guest memory first and the buffer
@@ -1810,15 +2362,33 @@ std::unique_ptr<Capture> capture_make() {
                 }
                 if (!tn || !stage_get(*c, (size_t)tn * 4096)) c->sidx.clear();
             }
+#ifdef _WIN32
+            if (arrival_trace) arrival_copy_start = capture_trace::qpc();
+#endif
             copy_pages(pages, n, (uint8_t*)c->map, ok.data(), c->sidx.empty() ? nullptr : c->stage.get(),
                        c->sidx.empty() ? nullptr : c->sidx.data());
+#ifdef _WIN32
+            if (arrival_trace) arrival_copy_end = capture_trace::qpc();
+#endif
             for (int64_t i = 0; i < n; i++)
                 if (ok[i]) c->copied.push_back(pages[i]), c->slots.push_back((uint32_t)i);
             c->nbytes = (size_t)n * 4096;
-            flush_mapped(c->alloc, c->nbytes);
+            flush_mapped_range(c->alloc, c->slice.offset, c->nbytes);
         }
     }
     if (pages) host->free_pages(pages);
+#ifdef _WIN32
+    if (arrival_trace) {
+        const uint64_t after = capture_trace::qpc();
+        const auto nanos = [](auto span) {
+            return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(span).count());
+        };
+        capture_trace::add({"arrival_snapshot", arrival_scan, capture_trace::frame(), GetCurrentThreadId(),
+                            after, uint64_t(std::max<int64_t>(0,n)), uint64_t(c->copied.size()),
+                            uint64_t(mirrored.size()), arrival_copy_start, arrival_copy_end,
+                            nanos(t_scan - t0), nanos(t_scan - t_lock), uint64_t(c->late.size())});
+    }
+#endif
     {   // (what it cost, every 600 submits)
         static int64_t subs, written, copied;
         static double ms, ms_lock, ms_scan;
@@ -1891,11 +2461,59 @@ void note_in_place_read(bool outside = false) {
     while (seen < part && !mem_in_place_part.compare_exchange_weak(seen, part)) {}
 }
 } // namespace
+namespace {
+struct SmallReadCheck {
+    uint64_t guest, owner, value, frame, size;
+    uint32_t crc;
+};
+std::deque<SmallReadCheck> small_read_checks;
+
+uint32_t small_read_crc(const uint8_t* data, size_t size) {
+    static const auto table = [] {
+        std::array<uint32_t, 256> result{};
+        for (uint32_t i = 0; i < result.size(); ++i) {
+            uint32_t crc = i;
+            for (int bit = 0; bit < 8; ++bit)
+                crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+            result[i] = crc;
+        }
+        return result;
+    }();
+    uint32_t crc = ~0u;
+    for (size_t i = 0; i < size; ++i) crc = table[(crc ^ data[i]) & 255u] ^ (crc >> 8);
+    return ~crc;
+}
+
+void check_completed_small_reads(uint64_t completed) {
+#ifdef _WIN32
+    std::array<uint8_t, 4096> data;
+    while (!small_read_checks.empty() && small_read_checks.front().value <= completed) {
+        const SmallReadCheck check = small_read_checks.front();
+        small_read_checks.pop_front();
+        const bool read = guarded_copy(data.data(), host->guest_base() + check.guest, check.size);
+        const uint32_t crc = read ? small_read_crc(data.data(), check.size) : 0;
+        capture_trace::add({"small_crc", capture_trace::qpc(), check.frame, GetCurrentThreadId(), check.guest, check.owner,
+                            check.size, check.value, check.crc, crc, read});
+    }
+#endif
+}
+} // namespace
+
+#ifdef _WIN32
+void diagnostic_small_copy_loading();
+
+extern "C" __declspec(dllexport) void jinra_preview_request_capture_trim() {
+    diagnostic_small_copy_loading();
+    preview_capture_trim_until.store(GetTickCount64() + 200);
+}
+#endif
+
 void memory_recording_part(uint64_t part) { mem_rec_part.store(part); }
 uint64_t memory_in_place_part() { return mem_in_place_part.load(); }
 void memory_recording_value(uint64_t value, uint64_t completed) {
     mem_rec_value = value;
     if (completed > mem_completed) mem_completed = completed;
+    if (!small_read_checks.empty()) check_completed_small_reads(completed);
 }
 /// (RX_VK_FRAME_TRACE) The time the replay has waited for the GPU in take_capture, for the pages a submission still
 /// on the GPU writes back: part of the trace's memsync_ms, and the part that is a wait. Frames of 36-201 ms of memory sync in a
@@ -1904,12 +2522,45 @@ std::atomic<int64_t> st_late_wait_ns{0};
 int64_t memory_late_wait_ns() { return st_late_wait_ns.load(std::memory_order_relaxed); }
 bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed) {
     const auto tk0 = std::chrono::steady_clock::now();
+#ifdef _WIN32
+    const uint64_t arrival_take = capture_trace::arrival_detail() ? capture_trace::qpc() : 0;
+    uint64_t gpu_wait_end = 0, late_copy_end = 0, shadow_copy_ticks = 0, shadow_copy_pages = 0;
+    const size_t written_pages = c->pages.size(), late_pages = c->late.size();
+#endif
     if (c->late_value && c->map) {   // (the pages a submission still on the GPU writes back: see capture_make)
         // (timed apart: the replay thread waits here for the GPU, the more often the fewer pools have a mirror. With
         // RX_VK_MIRROR_MB=1024 on an 8 GB card it was most of a capture's 2.4-3 ms, six submits a frame: Hyrule Field at
         // 35-45 fps instead of 55, issue 995)
         const auto tw = std::chrono::steady_clock::now();
-        vk_timeline_wait(c->late_value);
+#ifdef _WIN32
+        if (c->trace_id) {
+            capture_trace::dependency(c->trace_id, c->trace_part, c->trace_whole);
+            capture_trace::Wait trace;
+            trace.id = c->trace_id;
+            const uint64_t start = capture_trace::qpc();
+            vk_timeline_wait(c->late_value, &trace);
+            const uint64_t end = capture_trace::qpc();
+            capture_trace::add({trace.route, start, capture_trace::frame(), GetCurrentThreadId(), c->trace_id,
+                                c->late_value, trace.target, trace.seen_before, trace.seen_after, end,
+                                c->pages.size(), c->late.size(), static_cast<uint64_t>(trace.result)});
+            if (trace.call_begin)
+                capture_trace::add({"call", trace.call_begin, capture_trace::frame(), GetCurrentThreadId(),
+                                    c->trace_id, trace.call_end, trace.cycles, value, trace.cpu_begin, trace.cpu_end, trace.probed, trace.arm, trace.cowait});
+            static const uint64_t threshold = [] {
+                LARGE_INTEGER frequency{};
+                QueryPerformanceFrequency(&frequency);
+                return uint64_t(frequency.QuadPart) / 500;
+            }();
+            if (end - start > threshold)
+                for (const auto& page : c->trace_pages)
+                    capture_trace::add({"page", start, capture_trace::frame(), GetCurrentThreadId(), c->trace_id,
+                                        page.address, page.value, page.part, page.completed});
+        } else
+#endif
+            vk_timeline_wait(c->late_value);
+#ifdef _WIN32
+        if (arrival_take) gpu_wait_end = capture_trace::qpc();
+#endif
         st_tk_late += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw).count();
         st_late_wait_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - tw).count(),
                                   std::memory_order_relaxed);   // (the frame trace's late_wait_ms)
@@ -1917,7 +2568,10 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
         uint8_t* const base = (uint8_t*)host->guest_base();
         for (uint32_t i : c->late)
             guarded_copy((uint8_t*)c->map + (uint64_t)i * 4096, base + ((uint64_t)c->pages[i] << kPageShift), 4096);
-        flush_mapped(c->alloc, c->nbytes);
+        flush_mapped_range(c->alloc, c->slice.offset, c->nbytes);
+#ifdef _WIN32
+        if (arrival_take) late_copy_end = capture_trace::qpc();
+#endif
     }
     const auto tl = std::chrono::steady_clock::now();
     std::lock_guard lk(pools_mu);
@@ -1934,24 +2588,34 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
     }
     uint32_t g = 0;
     if (!c->pages.empty()) {
+        memory_submit_trace::Scope stamping(memory_submit_trace::stamp, c->pages.size());
         g = ++gen_now;
         for (uint32_t p : c->pages) stamp_page(p, g);
         pages_collected += c->pages.size();
     }
     if (!c->pages.empty() && tex_capture_on()) {   // (the texture storage it took: the shadow, as of this submit)
+        memory_submit_trace::Scope updating_shadow(memory_submit_trace::shadow, c->copied.size());
         std::lock_guard sk(shadow_mu);
         shadow_seq++;
         // (the copies of pages no capture took in the last 256 submits go, over 32 MB of them, every 256 captures: such a page is what guest
         // memory holds (a write drops its copy), and the cap's sweep below came only at 256 MB. RX_VK_SHADOW_SWEEP_OFF=1: the cap's alone)
         static const bool sweep_off = env_on("RX_VK_SHADOW_SWEEP_OFF");
-        if (!sweep_off && shadow_seq % 256 == 0 && shadow_n.load(std::memory_order_relaxed) > 8192)
+        const bool bounded = shadow_bounded_sweep();
+        if (!sweep_off && bounded) shadow_incremental_sweep(c->copied.size());
+#ifdef _WIN32
+        if (tex_shadow_arena_on() && shadow_seq % 8 == 0) {
+            memory_submit_trace::Scope trimming(memory_submit_trace::shadow_decommit);
+            tex_shadow_arena.trim_one(shadow_seq);
+        }
+#endif
+        if (!sweep_off && !bounded && shadow_seq % 256 == 0 && shadow_n.load(std::memory_order_relaxed) > 8192) {
+            memory_submit_trace::Scope sweeping(memory_submit_trace::sweep, shadow.size());
             for (auto it = shadow.begin(); it != shadow.end();) {
                 if (it->second.seq + 256 >= shadow_seq) { ++it; continue; }
-                auto r = shadow_regions.find(it->first >> 9);
-                if (r != shadow_regions.end() && --r->second == 0) shadow_regions.erase(r);
-                it = shadow.erase(it);
-                shadow_n--;
+                it = shadow_erase_at(it);
+                sweeping.bytes += 4096;
             }
+        }
         if (!tex_merged.empty()) {
             // (every page written since the last capture: its old copy is stale; the ones copied now replace it)
             // (those copied now are overwritten in place below, their buffers kept: erasing every written page and
@@ -1980,20 +2644,29 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
                 if (shadow_n.load(std::memory_order_relaxed) >= kShadowMax && !shadow.count(p)) {
                     if (swept) break;
                     swept = true;
+                    memory_submit_trace::Scope sweeping(memory_submit_trace::sweep, shadow.size());
                     for (auto it = shadow.begin(); it != shadow.end();) {
                         if (it->second.seq + 64 >= shadow_seq) { ++it; continue; }
-                        auto r = shadow_regions.find(it->first >> 9);
-                        if (r != shadow_regions.end() && --r->second == 0) shadow_regions.erase(r);
-                        it = shadow.erase(it);
-                        shadow_n--;
+                        it = shadow_erase_at(it);
+                        sweeping.bytes += 4096;
                     }
                     if (shadow_n.load(std::memory_order_relaxed) >= kShadowMax) break;
                 }
+                const auto buckets = bounded ? shadow.bucket_count() : 0;
                 ShadowPage& slot = shadow[p];
+                if (bounded && buckets != shadow.bucket_count()) shadow_sweep_next = shadow.begin();
                 if (!slot.b) {
-                    slot.b.reset(new uint8_t[4096]);
+                    uint8_t* bytes = nullptr;
+#ifdef _WIN32
+                    if (tex_shadow_arena_on()) bytes = tex_shadow_arena.allocate();
+#endif
+                    slot.b.reset(bytes ? bytes : new uint8_t[4096]);
                     shadow_regions[p >> 9]++;
-                    shadow_n++;
+                    const size_t count = ++shadow_n;
+                    tex_shadow_peak = std::max(tex_shadow_peak, count);
+                    ++tex_shadow_allocated;
+                } else {
+                    ++tex_shadow_updated;
                 }
                 slot.seq = shadow_seq;
                 // (the staging, ordinary RAM, when it holds the page; else the capture buffer, maybe write-combined)
@@ -2002,7 +2675,19 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
                 else pairs.push_back({slot.b.get(), (const uint8_t*)c->map + (uint64_t)c->slots[i] * 4096}), from_map++;
             }
             // (shadow_mu still held: no slot taken here goes before its copy; the sweep above drops only older ones)
-            if (!pairs.empty()) copy_pairs(pairs.data(), (int64_t)pairs.size());
+            if (!pairs.empty()) {
+                memory_submit_trace::Scope copying(memory_submit_trace::shadow_copy, pairs.size(), pairs.size() * 4096);
+#ifdef _WIN32
+                const uint64_t begin = arrival_take ? capture_trace::qpc() : 0;
+#endif
+                copy_pairs(pairs.data(), (int64_t)pairs.size());
+#ifdef _WIN32
+                if (begin) {
+                    shadow_copy_ticks += capture_trace::qpc() - begin;
+                    shadow_copy_pages += pairs.size();
+                }
+#endif
+            }
             st_from_stage += from_stage, st_from_map += from_map, st_cached += c->buf_cached ? 1 : 0;
             if (++st_takes % 600 == 0) {
                 logf("vk: shadow staging (600 takes): %lld shadow copies from staging, %lld from the capture buffer; capture buffers: %lld "
@@ -2016,20 +2701,33 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
     }
     const auto tk1 = std::chrono::steady_clock::now();
     if (!c->copied.empty() && g && c->map) {   // (its buffer kept with the captures, for the mirror syncs)
-        CapBuf b{value, c->buffer, c->alloc, c->bsize, c->map};
+        memory_submit_trace::Scope publishing(memory_submit_trace::publish, c->copied.size(), c->nbytes);
+        CapBuf b{value, c->buffer, c->alloc, c->bsize, c->map, 0, c->slice};
+        c->slice = {};
         c->buffer = VK_NULL_HANDLE, c->alloc = nullptr, c->map = nullptr, c->bsize = 0;
         cap_bufs.emplace(g, b);
         cap_bytes += b.size;
         cur_cap_gen = g;
         for (size_t i = 0; i < c->copied.size(); i++) cap_entry_set(c->copied[i], CapEntry{g, c->slots[i]});
     }
-    cap_view_bump();
-    stage_put(*c);   // (the shadow's copies from it are done: copy_pairs returned)
-    if (c->map) cap_buf_free(c->buffer, c->alloc, c->map, c->bsize), c->buffer = VK_NULL_HANDLE, c->map = nullptr;
     {
+        memory_submit_trace::Scope recycling(memory_submit_trace::recycle, c->map ? 1 : 0,
+                                             c->stage_bytes + (c->map ? c->bsize : 0));
+        cap_view_bump();
+        stage_put(*c);   // (the shadow's copies from it are done: copy_pairs returned)
+        if (c->map) cap_buf_free(c->buffer, c->alloc, c->map, c->bsize, false, c->slice), c->buffer = VK_NULL_HANDLE, c->map = nullptr;
         std::lock_guard lk(cap_mu);
         if (spare.size() < 8) spare.push_back(std::move(c));
     }
+#ifdef _WIN32
+    if (arrival_take) {
+        const uint64_t after = capture_trace::qpc();
+        const auto lock_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(tk_locked - tl).count();
+        capture_trace::add({"arrival_take", arrival_take, capture_trace::frame(), GetCurrentThreadId(),
+                            after, gpu_wait_end, late_copy_end, uint64_t(lock_ns), written_pages,
+                            late_pages, shadow_copy_ticks, shadow_copy_pages, value});
+    }
+#endif
     {   // (every 600 takes: where a take's time went)
         const auto tk2 = std::chrono::steady_clock::now();
         static int64_t n;
@@ -2078,12 +2776,17 @@ struct TlPool {
 };
 thread_local TlPool tl_pools[1024];   // (a parallel replay thread's: by 64 KB page, read without the lock)
 
-Pool* pool_of(uint64_t guest, uint64_t size) {
+struct ImportUse {
+    const char* kind;
+    uint64_t program;
+};
+
+Pool* pool_of(uint64_t guest, uint64_t size, ImportUse use = {}) {
     if (!size || size > UINT64_MAX - guest) return nullptr;
     if (last_pool && guest >= last_pool->lo && guest + size <= last_pool->hi) return last_pool;
     Pool*& slot = pool_cache[(guest >> 16) & 4095];
     if (slot && guest >= slot->lo && guest + size <= slot->hi) return last_pool = slot;
-    Pool* found = pool_lookup(guest, size);
+    Pool* found = pool_lookup(guest, size, use.kind, use.program);
     if (found) slot = found;
     return found;
 }
@@ -2111,14 +2814,25 @@ void bg_main() {
     SetThreadDescription(GetCurrentThread(), L"mkw_vk imports");
     for (;;) {
         std::pair<uint64_t, uint64_t> r;
+        static uint64_t begin = 0;
         {
             std::unique_lock lk(bg_mu);
             bg_cv.wait(lk, [] { return !bg_queue.empty(); });
             r = bg_queue.front();
             bg_queue.pop_front();
+#ifdef _WIN32
+            begin = capture_trace::file() && (env_on("JINRA_TEST_ASYNC_TRACE") || env_on("JINRA_TEST_SMALL_READ_BG")) ? capture_trace::qpc() : 0;
+#endif
         }
         Pool p;
+        small_read_worker = begin != 0;
         const bool ok = import_pool(r.first, r.second, p);
+        small_read_worker = false;
+#ifdef _WIN32
+        if (begin)
+            capture_trace::add({"small_bg", begin, capture_trace::frame(), GetCurrentThreadId(), r.first, r.second,
+                                capture_trace::qpc(), ok});
+#endif
         std::lock_guard lk(bg_mu);
         p.prefetched = true;
         if (ok) bg_ready.push_back({r.first, p}), st_bg_imports++;
@@ -2253,7 +2967,34 @@ void span_game_pools(uint64_t& lo, uint64_t& hi, uint64_t chunk) {
     }
 }
 
-Pool* pool_lookup(uint64_t guest, uint64_t size) {
+std::atomic<uint64_t> import_count{0}, import_ns{0};
+struct CopyWindow { uint64_t count = 0, first = 0; };
+constexpr unsigned copy_window_shift = 22;
+constexpr uint64_t copy_window_count = 1ull << (40 - copy_window_shift);
+std::vector<CopyWindow> copy_windows;
+
+bool copy_profile_on() {
+    static const bool on = env_on("JINRA_TEST_COPY_PROFILE");
+    return on;
+}
+
+void note_copied_window(uint64_t guest, uint64_t size, uint64_t owner, uint64_t ticks) {
+    if (copy_windows.empty()) copy_windows.resize(copy_window_count);
+    const uint64_t first = guest >> copy_window_shift;
+    const uint64_t last = (guest + size - 1) >> copy_window_shift;
+    if (last >= copy_windows.size()) return;
+    for (uint64_t window = first; window <= last; ++window) {
+        auto& record = copy_windows[window];
+        if (record.count++ == 0) {
+            record.first = ticks;
+            logf("vk: copy first-window ticks %llu base %llx request %llu owner %llu",
+                 (unsigned long long)ticks, (unsigned long long)(window << copy_window_shift),
+                 (unsigned long long)size, (unsigned long long)owner);
+        }
+    }
+}
+
+Pool* pool_lookup(uint64_t guest, uint64_t size, const char* kind, uint64_t program) {
     if (guest_pools.empty()) return nullptr;
     bg_drain();
     auto it = std::upper_bound(guest_pools.begin(), guest_pools.end(), guest,
@@ -2261,6 +3002,7 @@ Pool* pool_lookup(uint64_t guest, uint64_t size) {
     if (it == guest_pools.begin()) return nullptr;
     --it;
     if (guest < it->lo || guest >= it->hi || !size || size > it->hi - guest) return nullptr;
+    const GuestPool owner = *it;
     const uint64_t chunk = import_chunk();
     const GuestPool range = chunk ? GuestPool{guest, guest + size} : *it;
     auto covering = [&]() {
@@ -2284,7 +3026,16 @@ Pool* pool_lookup(uint64_t guest, uint64_t size) {
                 return false;
             };
             if (under_way()) {
+#ifdef _WIN32
+                static const bool detail = capture_trace::file() && env_on("JINRA_TEST_SMALL_READ");
+                const uint64_t begin = detail ? capture_trace::qpc() : 0;
+#endif
                 bg_done_cv.wait(lk, [&] { return !under_way(); });
+#ifdef _WIN32
+                if (begin)
+                    capture_trace::add({"small_bg_wait", begin, capture_trace::frame(), GetCurrentThreadId(), guest, size,
+                                        capture_trace::qpc()});
+#endif
                 waited = true;
                 st_bg_waits++;
             }
@@ -2303,9 +3054,38 @@ Pool* pool_lookup(uint64_t guest, uint64_t size) {
         // write-back: the instances of a frame before or older, objects popping in and out, one-frame flashes.)
         uint64_t lo = 0, hi = 0;
         std::vector<uint64_t> overlapped;
-        auto plan = [&](bool spanned) {   // (the range, the imported pools it takes in; spanned: span_game_pools's chunks too)
+        constexpr uint64_t block = 128ull << 20;
+        static const bool wide = env_on("JINRA_TEST_IMPORT_BLOCKS");
+        const bool wide_owner = wide && chunk && owner.hi - owner.lo >= block;
+        static const char* mid_mode = getenv("JINRA_TEST_IMPORT_MIDOWNER");
+        uint64_t mid_lo = 0, mid_hi = 0;
+        if (mid_mode && chunk == (4ull << 20) && kind && std::strcmp(kind, "buffer-read") == 0 &&
+            owner.hi - owner.lo >= (32ull << 20) && owner.hi - owner.lo < block && imp == imported.end()) {
+            // Experiment: first read in a medium pool. Test the exact extent or just
+            // the requested chunk and its next neighbour, without a save address.
+            if (std::strcmp(mid_mode, "full") == 0) {
+                mid_lo = owner.lo;
+                mid_hi = owner.hi;
+            } else if (std::strcmp(mid_mode, "adjacent") == 0 && want_hi - want_lo == chunk &&
+                       want_lo >= owner.lo && want_hi <= owner.hi && owner.hi - want_hi >= chunk) {
+                mid_lo = want_lo;
+                mid_hi = want_hi + chunk;
+            }
+            if (mid_hi > mid_lo) {
+                const auto next = imported.lower_bound(mid_hi);
+                if (next != imported.begin() && std::prev(next)->second.hi > mid_lo) mid_hi = 0;
+            }
+        }
+        const bool mid_owner = mid_hi > mid_lo && mid_lo % align == 0 && mid_hi % align == 0;
+        auto plan = [&](bool spanned, bool widen = false) {   // (the range, the imported pools it takes in; spanned: span_game_pools's chunks too)
             lo = want_lo, hi = std::max(want_hi, imp != imported.end() ? imp->second.hi : 0);
-            if (spanned && chunk) span_game_pools(lo, hi, chunk);
+            if (widen && mid_owner) {
+                lo = mid_lo;
+                hi = mid_hi;
+            } else if (widen) {
+                lo = std::max(owner.lo, range.lo / block * block);
+                hi = std::min(owner.hi, (range.hi + block - 1) / block * block);
+            } else if (spanned && chunk) span_game_pools(lo, hi, chunk);
             for (bool grew = true; grew;) {
                 grew = false;
                 overlapped.clear();
@@ -2331,21 +3111,52 @@ Pool* pool_lookup(uint64_t guest, uint64_t size) {
                 if (imp != imported.end()) overlapped.push_back(imp->first);
             }
         };
-        plan(true);
-        const uint64_t spanned_lo = lo, spanned_hi = hi;
+        uint64_t previous_lo = 0, previous_hi = 0;
         Pool p;
         bool ok = false;
-        for (int pass = 0; pass < 2 && !ok; pass++) {
-            if (pass) {   // (a spanned import that failed: the range without the span, as imported before)
-                plan(false);
-                if (lo == spanned_lo && hi == spanned_hi) break;
-            }
+        for (int pass = (wide_owner || mid_owner) ? 0 : 1; pass < 3 && !ok; pass++) {
+            plan(pass == 1, pass == 0);
+            if ((pass == 0 && hi - lo > block) || (lo == previous_lo && hi == previous_hi)) continue;
+            previous_lo = lo;
+            previous_hi = hi;
             const auto t0 = std::chrono::steady_clock::now();
             ok = import_pool(lo, hi, p);
             const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            import_count.fetch_add(1, std::memory_order_relaxed);
+            import_ns.fetch_add((uint64_t)(ms * 1000000), std::memory_order_relaxed);
             static double total_ms;
             static int n, logged;
             total_ms += ms, n++;
+            static const bool trace = env_on("JINRA_TEST_POOL_LIFETIME");
+            if (trace && mid_owner && pass == 0) {
+                const auto start = std::chrono::duration_cast<std::chrono::nanoseconds>(t0.time_since_epoch()).count();
+                logf("vk: midowner %s %lld %s requested %llx+%llx mapped %llx..%llx owner %llx..%llx %.3f ms",
+                     mid_mode, (long long)start, ok ? "ok" : "failed",
+                     (unsigned long long)guest, (unsigned long long)size,
+                     (unsigned long long)lo, (unsigned long long)hi,
+                     (unsigned long long)owner.lo, (unsigned long long)owner.hi, ms);
+            }
+            static const bool copy_profile = env_on("JINRA_TEST_COPY_PROFILE");
+            if (copy_profile && ok && !copy_windows.empty()) {
+                const uint64_t end = std::min((hi - 1) >> copy_window_shift, uint64_t(copy_windows.size()-1));
+                uint64_t prior = 0, first = 0;
+                for (uint64_t w = lo >> copy_window_shift; w <= end; ++w) {
+                    const auto& rec = copy_windows[w];
+                    prior += rec.count;
+                    if (rec.first && (!first || rec.first < first)) first = rec.first;
+                }
+                if (prior) logf("vk: copy prior-import qpc_ns %lld base %llx copies %llu first_ticks %llu",
+                                 (long long)std::chrono::duration_cast<std::chrono::nanoseconds>(t0.time_since_epoch()).count(),
+                                 (unsigned long long)lo, (unsigned long long)prior, (unsigned long long)first);
+            }
+            if (trace && ok && (ms >= 2.0 || copy_profile)) {
+                const auto start = std::chrono::duration_cast<std::chrono::nanoseconds>(t0.time_since_epoch()).count();
+                logf("vk: lifetime import %lld requested %llx+%llx mapped %llx..%llx owner %llx..%llx use %s program %016llx %.3f ms",
+                     (long long)start, (unsigned long long)guest, (unsigned long long)size,
+                     (unsigned long long)lo, (unsigned long long)hi,
+                     (unsigned long long)owner.lo, (unsigned long long)owner.hi,
+                     kind ? kind : "other", (unsigned long long)program, ms);
+            }
             if ((ms >= 2.0 && logged++ < 200) || n % 256 == 0)
                 logf("vk: pool %#llx+%#llx imported in %.1f ms as %#llx..%#llx (%d imports, %.0f ms in all)",
                      (unsigned long long)range.lo, (unsigned long long)(range.hi - range.lo), ms, (unsigned long long)lo,
@@ -2454,6 +3265,12 @@ bool import_in_background(uint64_t guest, uint64_t size) {
     bg_inflight.push_back(lo);
     bg_queue.push_back({lo, hi});
     bg_cv.notify_one();
+#ifdef _WIN32
+    static const bool detail = capture_trace::file() && env_on("JINRA_TEST_SMALL_READ_BG");
+    if (detail)
+        capture_trace::add({"small_req", capture_trace::qpc(), capture_trace::frame(), GetCurrentThreadId(),
+                            guest, size, lo, hi});
+#endif
     if (st_async_sent++ % 32 == 0)
         logf("vk: imports in the background: %lld sent, %lld bindings served from a copy meanwhile", (long long)st_async_sent,
              (long long)st_async_copies);
@@ -2672,7 +3489,7 @@ void mirror_sync(Pool& p) {
                 if (b != cap_bufs.end()) {
                     const uint64_t ga = std::max(page << kPageShift, p.lo), gb = std::min((page + 1) << kPageShift, p.hi);
                     append_capture_copy(cap_runs[b->second.buffer],
-                        {(uint64_t)e.slot * 4096 + (ga - (page << kPageShift)), ga - p.lo, gb - ga});
+                        {b->second.slice.offset + (uint64_t)e.slot * 4096 + (ga - (page << kPageShift)), ga - p.lo, gb - ga});
                     b->second.last_use = std::max(b->second.last_use, cur_cap_value);
                     (e.gen == cur_cap_gen ? st_sync_cap_pages : st_sync_old_pages)++;
                     page++;
@@ -2946,19 +3763,53 @@ bool memory_rb_refresh(VkCommandBuffer up) {
     return true;
 }
 
-BufferRef gpu_buffer(uint64_t gpu, uint64_t size) {
+BufferRef gpu_buffer(uint64_t gpu, uint64_t size, bool allow_import) {
     uint64_t avail = 0;
     if (!host->gpu_ptr(gpu, &avail) || avail < size) return {};
     const uint64_t guest = host->gpu_guest(gpu);
     std::lock_guard lk(pools_mu);
-    Pool* p = pool_of(guest, size);
+    Pool* p = nullptr;
+    if (allow_import) {
+        p = pool_of(guest, size, {"texture-read", diagnostic_compute_program});
+    } else if (auto it = imported.upper_bound(guest); it != imported.begin()) {
+        Pool& existing = std::prev(it)->second;
+        if (guest < existing.hi && size <= existing.hi - guest) p = &existing;
+    }
     if (!p) return {};
     if (p->last_value < mem_rec_value) p->last_value = mem_rec_value;   // (in use: not given back under it, imports_give_back)
     note_in_place_read();   // (the pool itself, read by the GPU where the caller's work runs)
     return {p->buffer, guest - p->lo, size, p->address + (guest - p->lo)};
 }
 
+thread_local uint64_t diagnostic_compute_program = 0;
+
 void memory_pool_created(uint64_t gpu, uint64_t size) {
+    static const bool trace = env_on("JINRA_TEST_POOL_LIFETIME");
+    if (trace && gpu < (1ull << 40) && size) {
+        const auto qpc = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        logf("vk: lifetime create %lld %llx..%llx", (long long)qpc,
+             (unsigned long long)gpu, (unsigned long long)(gpu + size));
+    }
+    // This benchmark targets one repeatedly observed write-capable range in the Planície save.
+    static const bool test = env_on("JINRA_TEST_COMPUTE_PREIMPORT");
+    constexpr uint64_t owner_lo = 0x1010eb7000ull;
+    constexpr uint64_t owner_hi = 0x103bdb7000ull;
+    if (test && gpu == owner_lo && size == owner_hi - owner_lo && dev.external_memory_host) {
+        constexpr uint64_t lo = 0x1014800000ull;
+        constexpr uint64_t hi = 0x1015000000ull;
+        std::lock_guard lk(bg_mu);
+        static bool sent = false;
+        if (!sent && lo % align == 0 && hi % align == 0) {
+            sent = true;
+            bg_start();
+            bg_inflight.push_back(lo);
+            bg_queue.push_back({lo, hi});
+            bg_cv.notify_one();
+            logf("vk: lifetime compute preimport queued %llx..%llx",
+                 (unsigned long long)lo, (unsigned long long)hi);
+        }
+    }
     // (RX_VK_BG_IMPORT=1 only: imported eagerly, every pool the game made, most never used by the GPU, the thread's
     // page locking stalled the game's threads (3-7 fps); chunked imports at first use are the default)
     static const bool on = env_on("RX_VK_BG_IMPORT");
@@ -2972,8 +3823,7 @@ void memory_pool_created(uint64_t gpu, uint64_t size) {
     bg_cv.notify_one();
 }
 
-int memory_guest_imported(uint64_t lo, uint64_t hi) {
-    std::lock_guard lk(pools_mu);
+static int guest_imported_locked(uint64_t lo, uint64_t hi) {
     auto it = imported.upper_bound(hi);   // (pools by lo: those starting below hi, the last ones checked first)
     while (it != imported.begin()) {
         --it;
@@ -2984,6 +3834,22 @@ int memory_guest_imported(uint64_t lo, uint64_t hi) {
         if (nh.mapped().memory && nh.mapped().lo < hi && lo < nh.mapped().hi) return 1;
     return 0;
 }
+
+int memory_guest_imported(uint64_t lo, uint64_t hi) {
+    std::lock_guard lk(pools_mu);
+    return guest_imported_locked(lo, hi);
+}
+
+#ifdef _WIN32
+extern "C" __declspec(dllexport) int jinra_resource_range_free(uint64_t lo, uint64_t hi) {
+    std::unique_lock pool(pools_mu, std::try_to_lock);
+    if (!pool.owns_lock()) return -1;
+    std::unique_lock pending(bg_mu, std::try_to_lock);
+    if (!pending.owns_lock() || !bg_inflight.empty() || !bg_ready.empty()) return -1;
+    return !guest_imported_locked(lo, hi);
+}
+#endif
+
 
 bool mirror_make(Pool& pool);   // (below)
 /// The mirrored pools, for the submit-time capture (memory_capture_submit) (pools_mu held)
@@ -3086,6 +3952,219 @@ void note_direct_write(Pool& p, uint64_t off, uint64_t size) {   // (pools_mu he
         wb_pages_note(p.lo + off, p.lo + std::min(off + size, p.hi - p.lo), mem_rec_value, 0);
 }
 
+BufferRef diagnostic_small_stream_copy(const uint8_t* data, uint64_t size);
+
+#ifdef _WIN32
+namespace {
+std::mutex copy_phase_mu;
+std::atomic<bool> copy_phase_playing{false};
+uint64_t phase_camera = 0, phase_frame = 0;
+unsigned phase_follow_frames = 0;
+
+bool phase_switch_enabled() {
+    static const bool enabled = env_on("RX_VK_SMALL_COPY_PHASE");
+    return enabled;
+}
+}
+
+void diagnostic_small_copy_loading() {
+    if (!phase_switch_enabled()) return;
+    std::lock_guard lock(copy_phase_mu);
+    phase_camera = phase_frame = 0;
+    phase_follow_frames = 0;
+    copy_phase_playing.store(false, std::memory_order_release);
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    logf("vk: copy-phase loading qpc_ns %lld",
+         (long long)std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
+}
+
+extern "C" __declspec(dllexport) void jinra_small_copy_camera(uint64_t camera, uint64_t frame, int state, int64_t now) {
+    if (copy_phase_playing.load(std::memory_order_acquire)) return;
+    std::lock_guard lock(copy_phase_mu);
+    if (state != 3 || camera != phase_camera || frame > phase_frame + 1 || frame < phase_frame)
+        phase_follow_frames = state == 3 ? 1 : 0;
+    else if (frame > phase_frame)
+        ++phase_follow_frames;
+    phase_camera = camera;
+    phase_frame = frame;
+    if (phase_follow_frames == 60) {
+        copy_phase_playing.store(true, std::memory_order_release);
+        logf("vk: copy-phase play qpc_ns %lld camera_frame %llu",
+             (long long)now, (unsigned long long)frame);
+    }
+}
+#endif
+
+namespace {
+struct CopyFrame {
+    uint64_t fresh = 0, reused = 0, bytes = 0, ticks = 0, fallbacks = 0;
+};
+CopyFrame copy_frame;
+
+struct CopySample {
+    uint64_t start;
+    ~CopySample() {
+        if (start) copy_frame.ticks += load_path_qpc() - start;
+    }
+};
+
+// Read each page from the same submission snapshot the ordinary small copy
+// uses, or from guest memory when that page has no applicable snapshot.
+BufferRef small_read_binding(uint64_t guest, uint64_t size, bool par) {
+#ifdef _WIN32
+    static const bool enabled = env_on("JINRA_TEST_SMALL_READ");
+    static const bool copy = env_on("JINRA_TEST_SMALL_READ_COPY");
+    static const bool local_copy = env_on("JINRA_TEST_SMALL_COPY_ONLY");
+    static const bool background = env_on("JINRA_TEST_SMALL_READ_BG");
+    static const bool trace = capture_trace::file() && env_on("JINRA_TEST_SMALL_READ") && !copy_profile_on();
+    static const bool extended = local_copy && env_on("JINRA_TEST_COPY_64K");
+    static const bool profile = local_copy && env_on("JINRA_TEST_COPY_PROFILE");
+    if ((!enabled && !local_copy) || !size || size > (extended ? 65536u : 4096u) ||
+        guest >= (1ull << 40) || par || !mirror_upload ||
+        !dev.external_memory_host || (!trace && !local_copy)) return {};
+    // Loading uses the normal import path, allowing hot windows to stay mapped.
+    if (local_copy && phase_switch_enabled() && !copy_phase_playing.load(std::memory_order_acquire)) return {};
+    if (last_pool && guest >= last_pool->lo && guest < last_pool->hi && size <= last_pool->hi - guest) return {};
+    uint64_t lo = 0, hi = 0;
+    const uint64_t lookup = profile ? load_path_qpc() : 0;
+    if (!game_pool_of(guest, lo, hi) || size > hi-guest ||
+        (extended ? hi-lo > 65536u : hi-lo != 4096u)) return {};
+    const bool one_page = (guest >> kPageShift) == ((guest + size - 1) >> kPageShift);
+    if (local_copy && ((lo & 4095) || (!extended && !one_page))) return {};
+    const CopySample sample{lookup};
+    bg_drain();
+    auto owner = imported.lower_bound(hi);
+    if (owner != imported.begin() && std::prev(owner)->second.hi > lo) return {};
+    if (rb_hazards_epoch == mirror_epoch &&
+        std::any_of(rb_hazards.begin(), rb_hazards.end(), [&](const RbHazard& range) {
+            return range.hi > guest && range.lo < guest + size;
+        })) return {};
+    const uint64_t start = trace ? capture_trace::qpc() : 0;
+    const uint64_t frame = trace ? capture_trace::frame() : 0;
+    if (!copy && !background && !local_copy) {
+        capture_trace::add({"small_sync", start, frame, GetCurrentThreadId(), guest, size, lo,
+                            diagnostic_compute_program, mem_rec_value});
+        return {};
+    }
+    if (local_copy && (memory_writeback_value(guest, size, nullptr) > mem_completed ||
+                       texture_gpu_written_in(guest, size) || texture_pending_copy_writeback(guest, size))) {
+        if (trace) capture_trace::add({"local_hazard", start, frame, GetCurrentThreadId(), guest, size});
+        return {};
+    }
+    if (!local_copy && small_read_checks.size() >= 512) {
+        capture_trace::add({"small_uncopied", start, frame, GetCurrentThreadId(), guest, size, lo, 1});
+        return {};
+    }
+    const uint64_t page = guest >> kPageShift;
+    if (extended && !one_page) {
+        static thread_local std::array<uint8_t, 65536> staged;
+        unsigned captured_pages = 0;
+        for (uint64_t at = guest, end = guest + size; at < end;) {
+            const uint64_t p = at >> kPageShift;
+            const uint64_t offset = at & 4095;
+            const uint64_t count = std::min(end - at, 4096 - offset);
+            const CapEntry entry = cap_entry(p);
+            const uint8_t* src = host->guest_base() + at;
+            if (entry.gen && entry.gen == page_gen(p)) {
+                const auto found = cap_bufs.find(entry.gen);
+                if (found != cap_bufs.end() && found->second.map) {
+                    src = static_cast<const uint8_t*>(found->second.map) + uint64_t(entry.slot)*4096 + offset;
+                    ++captured_pages;
+                }
+            }
+            if (!guarded_copy(staged.data() + (at - guest), src, count)) {
+                if (profile) ++copy_frame.fallbacks;
+                if (trace) capture_trace::add({"small_uncopied", start, frame, GetCurrentThreadId(), guest, size, lo, 2});
+                return {};
+            }
+            at += count;
+        }
+        const BufferRef ref = diagnostic_small_stream_copy(staged.data(), size);
+        if (ref) {
+            if (profile) {
+                ++copy_frame.fresh;
+                copy_frame.bytes += size;
+                note_copied_window(guest, size, hi-lo, lookup);
+            }
+            if (trace) capture_trace::add({"local_copy", start, frame, GetCurrentThreadId(), guest, size,
+                                          capture_trace::qpc(), mem_rec_value, captured_pages, hi-lo});
+        } else {
+            if (profile) ++copy_frame.fallbacks;
+            if (trace) capture_trace::add({"small_uncopied", start, frame, GetCurrentThreadId(), guest, size, lo, 3});
+        }
+        return ref;
+    }
+    const CapEntry entry = cap_entry(page);
+    const uint8_t* src = host->guest_base() + guest;
+    bool captured = false;
+    if (entry.gen && entry.gen == page_gen(page)) {
+        const auto buf = cap_bufs.find(entry.gen);
+        if (buf != cap_bufs.end() && buf->second.map) {
+            src = static_cast<const uint8_t*>(buf->second.map) + uint64_t(entry.slot)*4096 + (guest & 4095);
+            captured = true;
+        }
+    }
+    std::array<uint8_t, 4096> data;
+    if (!guarded_copy(data.data(), src, size)) {
+        if (profile) ++copy_frame.fallbacks;
+        if (trace) capture_trace::add({"small_uncopied", start, frame, GetCurrentThreadId(), guest, size, lo, 2});
+        return {};
+    }
+    struct LocalCopy {
+        uint64_t guest, size, recording, part, view;
+        uint32_t generation;
+        BufferRef ref;
+        std::array<uint8_t, 4096> bytes;
+    };
+    static thread_local LocalCopy recent[16]{};
+    auto& last = recent[bind_slot(guest, size) % std::size(recent)];
+    const auto part = mem_rec_part.load();
+    const auto view = memory_capture_view();
+    const auto generation = page_gen(page);
+    if (local_copy && last.ref && last.guest == guest && last.size == size &&
+        last.recording == mem_rec_value && last.part == part && last.view == view &&
+        last.generation == generation && !std::memcmp(last.bytes.data(), data.data(), size)) {
+        if (profile) ++copy_frame.reused;
+        if (trace) capture_trace::add({"local_reuse", start, frame, GetCurrentThreadId(), guest, size, mem_rec_value});
+        return last.ref;
+    }
+    const BufferRef ref = diagnostic_small_stream_copy(data.data(), size);
+    if (!ref) {
+        if (profile) ++copy_frame.fallbacks;
+        if (trace) capture_trace::add({"small_uncopied", start, frame, GetCurrentThreadId(), guest, size, lo, 3});
+        return {};
+    }
+    if (local_copy) {
+        if (profile) {
+            ++copy_frame.fresh;
+            copy_frame.bytes += size;
+            note_copied_window(guest, size, hi-lo, lookup);
+        }
+        last.guest = guest;
+        last.size = size;
+        last.recording = mem_rec_value;
+        last.part = part;
+        last.view = view;
+        last.generation = generation;
+        last.ref = ref;
+        std::memcpy(last.bytes.data(), data.data(), size);
+        if (trace) capture_trace::add({"local_copy", start, frame, GetCurrentThreadId(), guest, size,
+                                      capture_trace::qpc(), mem_rec_value, captured, hi-lo});
+        return ref;
+    }
+    const uint64_t end = capture_trace::qpc();
+    const uint32_t crc = small_read_crc(data.data(), size);
+    small_read_checks.push_back({guest, lo, mem_rec_value, frame, size, crc});
+    const bool queued = background && import_in_background(guest, size);
+    capture_trace::add({"small_copy", start, frame, GetCurrentThreadId(), guest, size, lo,
+                        diagnostic_compute_program, end, ref.offset, mem_rec_value, queued, captured});
+    return ref;
+#else
+    return {};
+#endif
+}
+} // namespace
+
 BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
     if (written) texture_gpu_wrote(gpu, size);
     // (below 1 TB a GPU address is the guest address itself, and a pool holds the whole range or nothing: the host's
@@ -3127,20 +4206,35 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
     }
     ParLock plk;   // (before pools_mu, always: a mirror sync records into the shared upload command buffer)
     std::lock_guard lk(pools_mu);
+    if (!written && gpu == guest)
+        if (const BufferRef small = small_read_binding(guest, size, par)) return small;
     {   // (smoothness: import_in_background above. Reads up to 4 MB; not in a parallel replay's segment)
         static const bool async_import = [] { const char* e = getenv("RX_VK_ASYNC_IMPORT"); return e && atoi(e) != 0; }();
         if (async_import && !written && !par && size <= (4u << 20) && guest < (1ull << 40) &&
             !(last_pool && guest >= last_pool->lo && guest + size <= last_pool->hi) && import_in_background(guest, size)) {
+#ifdef _WIN32
+            static const bool trace = capture_trace::file() && env_on("JINRA_TEST_ASYNC_TRACE");
+            const uint64_t start = trace ? capture_trace::qpc() : 0;
+#endif
             uint64_t avail = 0;
             const uint8_t* src = host->gpu_ptr(gpu, &avail);
-            if (src && avail >= size)
-                if (const BufferRef r = stream_copy(src, size)) {
-                    st_async_copies++;
-                    return r;
-                }
+            const BufferRef r = src && avail >= size ? stream_copy(src, size) : BufferRef{};
+#ifdef _WIN32
+            if (trace) {
+                uint64_t lo = 0, hi = 0;
+                game_pool_of(guest, lo, hi);
+                capture_trace::add({r ? "async_copy" : src && avail >= size ? "async_stream_full" : "async_source_missing",
+                                    start, capture_trace::frame(), GetCurrentThreadId(), guest, size, hi - lo,
+                                    capture_trace::qpc(), mem_rec_value});
+            }
+#endif
+            if (r) {
+                st_async_copies++;
+                return r;
+            }
         }
     }
-    Pool* p = pool_of(guest, size);
+    Pool* p = pool_of(guest, size, {written ? "buffer-may-write" : "buffer-read", diagnostic_compute_program});
     if (!p) return {};
     tl = {p, pools_gen.load(std::memory_order_relaxed)};
     if (p->last_value < mem_rec_value) p->last_value = mem_rec_value;
@@ -3510,16 +4604,19 @@ bool mirrors_trim() {   // (pools_mu held; true when one was trimmed: its parts 
     if (!on || !chunk || mirror_epoch % 64 || par_active.load(std::memory_order_relaxed)) return false;
     uint64_t used = 0, allowed = 0;
     const bool pressed = vram_usage(&used, &allowed) && mirror_trim::pressed(used, allowed);
+    static const uint64_t own_budget = uint64_t(std::max(0, env_int("JINRA_TEST_MIRROR_TRIM_MB", 0))) << 20;
+    const bool mirror_pressure = own_budget && mirror_bytes > own_budget;
     Pool* pick = nullptr;
     std::vector<mirror_trim::Range> parts, pick_parts;
     for (auto& [lo, p] : imported) {
         const unsigned trims = mirror_trim::counted(p.trims, mirror_epoch - p.trim_epoch);
-        if (!pressed || p.mstate != Pool::MIRROR_ON || !mirror_trim::wait(trims)) {
+        if ((!pressed && !mirror_pressure) || p.mstate != Pool::MIRROR_ON || !mirror_trim::wait(trims)) {
             p.dead_since = 0;
             continue;
         }
         parts = mirror_trim::live(p.lo, p.hi, chunk, mirror_trim::kJoin, guest_pools);
-        if (!mirror_trim::worth(p.hi - p.lo, parts)) {
+        // The experimental threshold never asks the replay to import several live ranges at once.
+        if (!mirror_trim::worth(p.hi - p.lo, parts) || (mirror_pressure && !pressed && parts.size() != 1)) {
             p.dead_since = 0;
             continue;
         }
@@ -3535,6 +4632,7 @@ bool mirrors_trim() {   // (pools_mu held; true when one was trimmed: its parts 
     for (const Pool* w : mirror_wanted) wanted += w->hi - w->lo;
     static const bool tight_rule = env_on("RX_VK_MIRROR_TIGHT");
     if (mirror_bytes + wanted + kept > mirror_budget() || (tight_rule && used > allowed / 100 * 90)) return false;
+    const auto trim_start = std::chrono::steady_clock::now();
     std::vector<Pool> made;
     for (const mirror_trim::Range& r : pick_parts) {   // (all of them first: one that fails leaves everything as it was)
         Pool np;
@@ -3563,6 +4661,12 @@ bool mirrors_trim() {   // (pools_mu held; true when one was trimmed: its parts 
         mirror_wanted.push_back(&it->second);
     }
     st_trims++, st_trim_bytes += size - kept;
+    if (own_budget) {
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - trim_start).count();
+        logf("vk: mirror trim test: frame %llu, budget %llu MiB, in use %llu MiB, reclaim %llu MiB, CPU %.3f ms",
+             (unsigned long long)texture_frame_no(), (unsigned long long)(own_budget >> 20),
+             (unsigned long long)(mirror_bytes >> 20), (unsigned long long)((size - kept) >> 20), ms);
+    }
     static int logged;
     if (logged++ < 40 || st_trims % 64 == 0)
         logf("vk: pool %#llx..%#llx (%llu MB) trimmed to its %zu live part(s), %llu MB: the rest outside every game pool for %llu "
@@ -3764,7 +4868,7 @@ bool mirror_make(Pool& pool) {
                 auto b = cap_bufs.find(e.gen);
                 if (b == cap_bufs.end()) continue;
                 const uint64_t ga = std::max(page << kPageShift, p->lo), gb = std::min((page + 1) << kPageShift, p->hi);
-                over[b->second.buffer].push_back({(uint64_t)e.slot * 4096 + (ga - (page << kPageShift)), ga - p->lo, gb - ga});
+                over[b->second.buffer].push_back({b->second.slice.offset + (uint64_t)e.slot * 4096 + (ga - (page << kPageShift)), ga - p->lo, gb - ga});
                 b->second.last_use = std::max(b->second.last_use, mem_rec_value);
             }
             if (!over.empty()) {
@@ -4194,6 +5298,27 @@ VkDeviceAddress wbd_observe_begin(WbdTable& t, uint64_t count) {
     return t.address + offset;
 }
 
+// Only prioritise small mirror copies for pages the CPU has recently read.
+bool jinra_pending_small_readback() {
+    std::lock_guard lock(pools_mu);
+    if (writebacks.empty() || writebacks.size() > 16 || rb_pages.empty()) return false;
+    bool recently_read = false;
+    uint64_t bytes = 0;
+    for (const auto& range : writebacks) {
+        if (!range.pool->mirror || range.hi <= range.lo) return false;
+        bytes += range.hi - range.lo;
+        if (bytes > 64 * 1024) return false;
+        const uint64_t first = (range.pool->lo + range.lo) >> kPageShift;
+        const uint64_t last = (range.pool->lo + range.hi - 1) >> kPageShift;
+        for (uint64_t page = first; page <= last; ++page) {
+            const auto read = rb_pages.find(static_cast<uint32_t>(page));
+            if (read != rb_pages.end() && mirror_epoch >= read->second && mirror_epoch - read->second <= 48)
+                recently_read = true;
+        }
+    }
+    return recently_read;
+}
+
 void memory_end_submission(VkCommandBuffer cmd, uint64_t part) {
     std::lock_guard lk(pools_mu);
     {   // (every 600 submissions: how the mirror syncs' dirty pages were read)
@@ -4428,8 +5553,237 @@ void memory_end_submission(VkCommandBuffer cmd, uint64_t part) {
     mirror_upload = false;
 }
 
+void diagnostic_import_stats(uint64_t& count, uint64_t& ns) {
+    count = import_count.load(std::memory_order_relaxed);
+    ns = import_ns.load(std::memory_order_relaxed);
+}
+
+void diagnostic_copy_frame(FILE* file, uint64_t frame) {
+    std::lock_guard lk(pools_mu);
+    static const double us_per_tick = [] {
+        LARGE_INTEGER hz{};
+        QueryPerformanceFrequency(&hz);
+        return hz.QuadPart ? 1e6 / double(hz.QuadPart) : 0.0;
+    }();
+    std::fprintf(file, "%llu,%llu,%llu,%llu,%.3f,%llu\n", (unsigned long long)frame,
+                 (unsigned long long)copy_frame.fresh, (unsigned long long)copy_frame.reused,
+                 (unsigned long long)copy_frame.bytes, double(copy_frame.ticks) * us_per_tick,
+                 (unsigned long long)copy_frame.fallbacks);
+    copy_frame = {};
+    if (frame % 60 == 0) std::fflush(file);
+}
+
+#ifdef _WIN32
+void jinra_capture_block_log(const char* label, char status, VmaAllocation allocation, uint64_t bytes,
+                             uint64_t age, uint64_t highest_fence, uint64_t completed_fence);
+void jinra_defer_graphics_after_checkpoint(const char* label);
+
+extern "C" __declspec(dllexport) int jinra_ram_imports_snapshot(const char* label) {
+    const char* dir = std::getenv("JINRA_TEST_IMPORT_SNAPSHOT_DIR");
+    if (!dir || !*dir || !label || !*label) return 0;
+    struct Row {
+        char state;
+        uint64_t lo, hi, last;
+        uint32_t heap;
+        bool mirrored = false, gpu_only = false, gpu_written = false;
+        uint64_t synced = 0, direct_write = 0;
+    };
+    std::vector<GuestPool> mapped;
+    uint64_t epoch = 0;
+    uint32_t exact_generation = 0, observed_generation = 0;
+    using ExactRanges = int (*)(uint64_t (*)[2], int, uint32_t*);
+    static const auto exact_ranges = reinterpret_cast<ExactRanges>(GetProcAddress(
+        GetModuleHandleW(nullptr), "jinra_ram_mapped_ranges"));
+    std::vector<std::array<uint64_t, 2>> ranges;
+    bool has_exact = false;
+    if (exact_ranges) {
+        const int capacity = exact_ranges(nullptr, 0, &exact_generation) + 256;
+        if (capacity > 0 && capacity <= 65536) {
+            ranges.resize(static_cast<size_t>(capacity));
+            const int filled = exact_ranges(reinterpret_cast<uint64_t (*)[2]>(ranges.data()), capacity, &exact_generation);
+            has_exact = filled >= 0 && filled <= capacity;
+            if (has_exact) ranges.resize(static_cast<size_t>(filled));
+        }
+    }
+    std::vector<Row> rows;
+    uint64_t stamp = 0, completed = 0, recording = 0;
+    {
+        std::lock_guard lock(pools_mu);
+        stamp = load_path_qpc();
+        completed = mem_completed;
+        recording = mem_rec_value;
+        epoch = mirror_epoch;
+        observed_generation = host->maps_generation();
+        mapped = guest_pools;
+        rows.reserve(imported.size() + retired_pools.size() + evicted_pools.size() + dead_imports.size());
+        auto add = [&](char state, const Pool& p) {
+            if (p.memory) rows.push_back({state, p.lo, p.hi, p.last_value, p.import_heap,
+                                          p.mstate == Pool::MIRROR_ON, p.gpu_only, p.gpu_written,
+                                          p.synced_epoch, p.direct_write_epoch});
+        };
+        for (const auto& entry : imported) add('I', entry.second);
+        for (const auto& entry : retired_pools) add('R', entry.mapped());
+        for (const auto& entry : evicted_pools) add('E', entry.mapped());
+        for (const auto& entry : dead_imports)
+            rows.push_back({'D',0,entry.bytes,entry.value,UINT32_MAX});
+        static const bool examine_captures = env_on("JINRA_TEST_CAPTURE_BLOCKS");
+        if (examine_captures && std::string_view(label).ends_with("_pre")) {
+            std::unique_lock capture(cap_free_mu, std::try_to_lock);
+            if (capture) {
+                const uint64_t now = GetTickCount64();
+                for (const auto& [_, item] : cap_bufs) {
+                    const uint64_t highest_fence = std::max(item.value, item.last_use);
+                    jinra_capture_block_log(label, highest_fence > completed ? 'G' : 'K',
+                                            item.alloc, item.size, 0, highest_fence, completed);
+                }
+                for (const auto& item : cap_free)
+                    jinra_capture_block_log(label, 'S', item.alloc, item.size, now - item.cached_at, 0, completed);
+            } else {
+                logf("Jinra capture block %s skipped: the spare list was busy", label);
+            }
+        }
+    }
+    if (!std::strcmp(label, "zone_01_pre") || !std::strcmp(label, "zone_09_pre") ||
+        !std::strcmp(label, "zone_14_pre") || !std::strcmp(label, "rest_60_pre") ||
+        !std::strcmp(label, "recall_rest_pre")) {
+        std::unique_lock capture(cap_free_mu, std::try_to_lock);
+        if (capture) {
+            if (shared_capture_pool.mapped)
+                logf("Jinra shared capture checkpoint=%s live=%llu peak=%llu requests=%llu overflow=%llu",
+                     label, (unsigned long long)shared_capture_pool.live, (unsigned long long)shared_capture_pool.high_water,
+                     (unsigned long long)shared_capture_pool.requests, (unsigned long long)shared_capture_pool.overflow);
+            for (size_t mib = 0; mib < std::size(capture_use_by_mib); ++mib) {
+                const CaptureUse use = capture_use_by_mib[mib];
+                if (use.takes || use.allocations)
+                    logf("Jinra capture use %s mib=%zu takes=%llu allocations=%llu", label, mib,
+                         (unsigned long long)use.takes, (unsigned long long)use.allocations);
+            }
+            for (const FreeBuf& spare : cap_free) {
+                logf("Jinra capture idle %s bytes=%llu age_ms=%llu", label, (unsigned long long)spare.size,
+                     (unsigned long long)(GetTickCount64() - spare.cached_at));
+                MEMORY_BASIC_INFORMATION region{};
+                if (spare.map && VirtualQuery(spare.map, &region, sizeof region))
+                    logf("Jinra capture spare %s size=%llu mapped=%p base=%p", label,
+                         (unsigned long long)spare.size, spare.map, region.AllocationBase);
+            }
+        }
+    }
+    if (capture_fit_enabled() || env_on("JINRA_TEST_CAPTURE_BUDGET_CHECKPOINTS")) {
+        uint64_t used = 0, allowed = 0, spare = 0;
+        if (vram_usage(&used, &allowed, &spare)) {
+            logf("Jinra capture checkpoint %s qpc=%llu vram_used=%llu vram_allowed=%llu vram_free_in_blocks=%llu", label,
+                 (unsigned long long)load_path_qpc(), (unsigned long long)used,
+                 (unsigned long long)allowed, (unsigned long long)spare);
+            vma_log_heaps();
+        }
+    }
+    has_exact = has_exact && exact_generation == observed_generation;
+    if (has_exact) {
+        mapped.clear();
+        for (const auto& range : ranges) mapped.push_back({range[0], range[1]});
+        std::sort(mapped.begin(), mapped.end(), [](const auto& left, const auto& right) { return left.lo < right.lo; });
+    }
+    const std::string path = std::string(dir) + "/imports-live-" + label + ".csv";
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) return 0;
+    std::fprintf(f, "# qpc=%llu,completed=%llu,recording=%llu,mirror_epoch=%llu,host_ranges_exact=%u\n", (unsigned long long)stamp,
+                 (unsigned long long)completed, (unsigned long long)recording, (unsigned long long)epoch, (unsigned)has_exact);
+    std::fputs("state,lo,hi,last_submit,heap,mapped_bytes,mirrored,gpu_only,gpu_written,synced_epoch,direct_write_epoch\n", f);
+    for (const auto& r : rows) {
+        uint64_t covered = 0;
+        uint64_t cursor = r.lo;
+        for (const auto& group : mapped) {
+            if (r.state != 'I' || group.lo >= r.hi) break;
+            const uint64_t first = std::max(cursor, group.lo);
+            const uint64_t last = std::min(r.hi, group.hi);
+            if (last <= first) continue;
+            covered += last - first;
+            cursor = last;
+        }
+        std::fprintf(f, "%c,%llx,%llx,%llu,%u,%llu,%u,%u,%u,%llu,%llu\n", r.state,
+                     (unsigned long long)r.lo, (unsigned long long)r.hi, (unsigned long long)r.last, (unsigned)r.heap,
+                     (unsigned long long)covered, (unsigned)r.mirrored, (unsigned)r.gpu_only, (unsigned)r.gpu_written,
+                     (unsigned long long)r.synced, (unsigned long long)r.direct_write);
+    }
+    const bool saved = std::fclose(f) == 0;
+    if (has_exact && env_on("JINRA_TEST_IMPORT_ORIGIN")) {
+        const std::string map_path = std::string(dir) + "/gpu-native-maps-" + label + ".csv";
+        FILE* native_maps = std::fopen(map_path.c_str(), "wb");
+        if (native_maps) {
+            std::fputs("lo,hi\n", native_maps);
+            for (const auto& range : mapped)
+                std::fprintf(native_maps, "%llx,%llx\n", (unsigned long long)range.lo, (unsigned long long)range.hi);
+            std::fclose(native_maps);
+        }
+        const std::string origin_path = std::string(dir) + "/gpu-import-origin-" + label + ".csv";
+        FILE* origin_file = std::fopen(origin_path.c_str(), "wb");
+        if (origin_file) {
+            std::vector<ImportOrigin> entries;
+            {
+                std::lock_guard lock(import_origins_mu);
+                entries = import_origins;
+            }
+            std::fputs("qpc,lo,hi,kind,first,last,pre_resident\n", origin_file);
+            for (const auto& entry : entries) {
+                if (entry.qpc > stamp) continue;
+                const auto qpc = (unsigned long long)entry.qpc;
+                const auto lo = (unsigned long long)entry.lo;
+                const auto hi = (unsigned long long)entry.hi;
+                std::fprintf(origin_file, "%llu,%llx,%llx,I,0,0,\n", qpc, lo, hi);
+                for (const auto& r : entry.reserved)
+                    std::fprintf(origin_file, "%llu,%llx,%llx,R,%llx,%llx,\n", qpc, lo, hi,
+                                 (unsigned long long)r.lo, (unsigned long long)r.hi);
+                for (const auto& sample : entry.samples) {
+                    const auto address = static_cast<uint8_t*>(sample.VirtualAddress) - host->guest_base();
+                    std::fprintf(origin_file, "%llu,%llx,%llx,S,%llx,0,%u\n", qpc, lo, hi,
+                                 (unsigned long long)address, (unsigned)sample.VirtualAttributes.Valid);
+                }
+            }
+            std::fclose(origin_file);
+        }
+    }
+    if (saved) aged_capture_checkpoint(label);
+    if (saved) jinra_defer_graphics_after_checkpoint(label);
+    return saved;
+}
+#endif
+
+void diagnostic_memory_frame(uint64_t frame) {
+    std::lock_guard lk(pools_mu);
+    if (env_on("JINRA_TEST_TRACK_IMPORT_HEAPS")) {
+        uint64_t live[VK_MAX_MEMORY_HEAPS]{}, retired[VK_MAX_MEMORY_HEAPS]{};
+        unsigned live_count[VK_MAX_MEMORY_HEAPS]{}, retired_count[VK_MAX_MEMORY_HEAPS]{};
+        for (const auto& [key, p] : imported) {
+            if (p.memory && p.import_heap < VK_MAX_MEMORY_HEAPS)
+                live[p.import_heap] += p.hi - p.lo, ++live_count[p.import_heap];
+        }
+        for (const auto& entry : retired_pools) {
+            const auto& p = entry.mapped();
+            if (p.memory && p.import_heap < VK_MAX_MEMORY_HEAPS)
+                retired[p.import_heap] += p.hi - p.lo, ++retired_count[p.import_heap];
+        }
+        for (uint32_t h = 0; h < dev.memory.memoryHeapCount; ++h) {
+            logf("vk: census imports frame %llu heap %u active %u %llu retired %u %llu", (unsigned long long)frame, h,
+                 live_count[h], (unsigned long long)live[h], retired_count[h], (unsigned long long)retired[h]);
+        }
+    }
+    logf("vk: lifetime memory frame %llu mirrors %llu shadows %llu",
+         (unsigned long long)frame, (unsigned long long)mirror_bytes, (unsigned long long)shadow_bytes);
+    std::lock_guard shadow_lock(shadow_mu);
+#ifdef _WIN32
+    logf("vk: texture copies frame %llu live %zu peak %zu created %llu erased %llu updated %llu "
+         "blocks %u empty %u commits %llu decommits %llu recommits %llu",
+         (unsigned long long)frame, shadow_n.load(std::memory_order_relaxed), tex_shadow_peak,
+         (unsigned long long)tex_shadow_allocated, (unsigned long long)tex_shadow_erased,
+         (unsigned long long)tex_shadow_updated, tex_shadow_arena.committed(), tex_shadow_arena.empty(),
+         (unsigned long long)tex_shadow_arena.commits(), (unsigned long long)tex_shadow_arena.decommits(),
+         (unsigned long long)tex_shadow_arena.recommits());
+#endif
+}
+
 void memory_stats(int64_t* mirrors, uint64_t* mirror_mb, int64_t* sync_bytes, int64_t* sync_copies, int64_t* wb_bytes) {
     *mirrors = st_mirrors, *mirror_mb = mirror_bytes >> 20, *sync_bytes = st_sync_bytes, *sync_copies = st_sync_copies;
     *wb_bytes = st_wb_bytes;
 }
 } // namespace mkwvk
+

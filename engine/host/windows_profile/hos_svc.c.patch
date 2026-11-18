@@ -1,0 +1,42 @@
+--- hos_svc.c
++++ hos_svc.c
+@@ -3,6 +3,14 @@
+    (debug output, ticks, info queries) or a sign that an SDK function above it wants an HLE. Unknown ones stop the
+    run with the svc number and the caller, so the log says what to do next. Numbers: switchbrew.org "SVC". */
+ #include "hos.h"
++
++#ifdef _WIN32
++extern void guest_ram_audit(char action, uint64_t lo, uint64_t length, uint64_t caller);
++#define LIFE(action, lo, bytes) guest_ram_audit(action, lo, bytes, (uint64_t)__builtin_return_address(0))
++#else
++#define LIFE(action, lo, bytes) ((void)0)
++#endif
++
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -349,7 +357,7 @@
+     hos_vcore_checkpoint();
+     switch (imm) {
+     case 0x01: { /* SetHeapSize(-, size) -> (result, heap address) */
+-        int hos_heap_size_fits(uint64_t size);   /* (hos_mem.c: the heap stays in the guest window) */
++        int hos_heap_size_fits(uint64_t size);   /* (jinra, hos_mem.c: the heap stays in the guest window) */
+         if (!hos_heap_size_fits(c->x[1])) {
+             c->x[0] = 0xCA01;   /* svc::ResultOutOfMemory */
+             return;
+@@ -464,6 +472,7 @@
+     }
+     case 0x2C:   /* MapPhysicalMemory(address, size) */
+         hos_commit(c->x[0], c->x[1]);
++        if (hos_guest_range(c->x[0], c->x[1])) LIFE('P', c->x[0], c->x[1]);
+         if (hos_trace) hos_log("MapPhysicalMemory(%#llx, %#llx)", (unsigned long long)c->x[0], (unsigned long long)c->x[1]);
+         c->x[0] = R_OK;
+         return;
+@@ -477,6 +486,7 @@
+             if (rx_guest_imported(c->x[0], c->x[0] + c->x[1])) memset(GP(c->x[0]), 0, (size_t)c->x[1]);
+             else VirtualFree(GP(c->x[0]), (SIZE_T)c->x[1], MEM_DECOMMIT);
+         }
++        LIFE('U', c->x[0], c->x[1]);
+         c->x[0] = R_OK;
+         return;
+     case 0x1F: { /* ConnectToNamedPort(-, name) -> (result, session handle): SDK code that resolves a

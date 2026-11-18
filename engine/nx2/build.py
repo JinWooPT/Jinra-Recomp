@@ -1054,6 +1054,17 @@ def main():
         srcs = [s for s in srcs if os.path.exists(s)]
     if a.dry_run:   # (the lift's files: there is no game here)
         srcs = [s for s in srcs if os.path.dirname(s) != gen]
+    managed_host = a.standalone and not LINUX and toolchain.mingw() and not kit.env_on("RX_VK_ONLY")
+    hook_source = None
+    if managed_host:
+        import windows_host
+        host_srcs = windows_host.sources(HOST, os.path.join(out, "jinra-windows-host"), host_srcs)
+        if not a.dry_run:
+            import resource_hooks
+            hook_source = resource_hooks.prepare(gen, bool(KEPT))
+            if hook_source is None:
+                print("Preparing the local translation needed for the resource hooks.", flush=True)
+                return KEPT_STALE
     # the longest first, so the long ones do not end up alone at the end (compile_cost)
     costs = chunk_costs(gen)
     srcs.sort(key=lambda s: -compile_cost(s, costs))
@@ -1116,6 +1127,8 @@ def main():
               (["-I" + ZSTD] if os.path.basename(s) in ZSTD_HOST else []) +
               (dav1d_fl if os.path.basename(s) in ("nn_video.c", "dav1d_av1.c") else []),
               host_deps + (zstd_api if os.path.basename(s) in ZSTD_HOST else b"")) for s in host_srcs]
+    if hook_source:
+        jobs.append((cc, hook_source, os.path.join(obj_dir, "host_resource_hooks.o"), host_fl, host_deps))
     # libopus 1.5.2 (third_party/opus, from TOTKPort): nn::codec's hardware Opus decoder (host/nn_codec.c)
     # (built for the same CPU target as the rest (CPU), so its float code can be vectorized where the target has
     # AVX2: the vendored copy has no x86 intrinsics files of its own)
@@ -1361,7 +1374,8 @@ def main():
         exe = os.path.join(out, "Jinra-Ocarina.exe")   # (+ jinra.map: crash offsets -> f_<guest address>)
         t = time.time()
         r = subprocess.run([cc] + toolchain.native_target() + toolchain.native_link() +
-                           ["-o", exe] + linker("/map:" + exe[:-4] + ".map") + [toolchain.link_opt("/stack:8388608"), "@" + rsp] + HOT_ORDER() + HOST_LIBS +
+                           ["-o", exe] + linker("/map:" + exe[:-4] + ".map") + [toolchain.link_opt("/stack:8388608"), "@" + rsp] +
+                           (["-Wl,--wrap=" + symbol for symbol in resource_hooks.SITES] if hook_source else []) + HOT_ORDER() + HOST_LIBS +
                            ([toolchain.link_opt("/nodefaultlib:clang_rt.profile.lib")] if PGO == "gen" else []) +
                            ([os.path.join(kit.WORK, "jinra.res")] if os.path.exists(os.path.join(kit.WORK, "jinra.res")) else []) +   # (nx2/make_icon.py)
                            [win_manifest.write(os.path.join(out, "jinra_manifest.res"))] +   # (UTF-8 paths: nx2/win_manifest.py)
@@ -1416,7 +1430,7 @@ def main():
                 ([ngx_library(NGX_SDK, True)] if NGX_SDK else []) + ["-ldl", "-lpthread", "-lm"]
         else:
             link = [cc] + toolchain.native_target() + toolchain.native_link() + \
-                ["-shared", "-o", vdll] + linker("/map:" + vdll[:-4] + ".map") + ["@" + vrsp, "-luser32"] +                 (["-lc++", "-lunwind"] if toolchain.mingw() else []) + ngx_link(NGX_SDK, toolchain.mingw())
+                ["-shared", "-o", vdll] + linker("/map:" + vdll[:-4] + ".map") + ["@" + vrsp, "-luser32", "-lbcrypt"] +                 (["-lc++", "-lunwind"] if toolchain.mingw() else []) + ngx_link(NGX_SDK, toolchain.mingw())
         r = subprocess.run(link, capture_output=True, text=True)
         if r.returncode:
             undefined = sorted({l.strip() for l in (r.stdout + r.stderr).splitlines() if "undefined symbol" in l})

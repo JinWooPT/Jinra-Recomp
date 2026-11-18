@@ -4,6 +4,7 @@
 #include "vk_paths.h"
 #include "vk_loader.h"
 
+
 #include <atomic>
 #include <chrono>
 #include <cstdarg>
@@ -74,8 +75,18 @@ void load_device(VkDevice device) {
 } // namespace vkx
 
 namespace mkwvk {
+#ifdef _WIN32
+extern const char* capture_trace_clock;
+extern uint32_t capture_trace_clock_bits;
+#endif
 
+#include "jinra-ram-startup-arena.h"
+extern "C" void jinra_lazy_graphics_stats();
 std::vector<std::string> gpu_device_names;
+bool display_timing_supported;
+bool jinra_absolute_present_supported;
+bool display_timing_chain(VkSwapchainCreateInfoKHR& ci);
+void display_timing_created(VkSwapchainKHR sc, bool enabled);
 const MkwVkHost* host;
 int64_t prof_ns[PROF_COUNT];
 Device dev;
@@ -155,6 +166,10 @@ bool create_instance() {
         std::vector<VkExtensionProperties> all(n);
         vkEnumerateInstanceExtensionProperties(nullptr, &n, all.data());
         dlss_instance_extensions(ext_list, all);
+        if (getenv("JINRA_DISPLAY_TRACE") && has_extension(all, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME) &&
+            std::find_if(ext_list.begin(), ext_list.end(), [](const char* ext) {
+                return !strcmp(ext, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
+            }) == ext_list.end()) ext_list.push_back(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
         // the HDR10 colour space for the Insert menu's HDR (the menu's settings are read after the instance is made, so
         // whenever the driver has it; the SDR choice in create_swapchain keeps to the sRGB surface)
         if (has_extension(all, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME))
@@ -259,6 +274,17 @@ bool create_device() {
     std::vector<VkExtensionProperties> exts(n);
     vkEnumerateDeviceExtensionProperties(dev.physical, nullptr, &n, exts.data());
     std::vector<const char*> want = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+#ifdef _WIN32
+    if (getenv("RX_VK_CAPTURE_TRACE_FILE")) {
+        if (has_extension(exts, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) {
+            want.push_back(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+            capture_trace_clock = "vkGetCalibratedTimestampsKHR";
+        } else if (has_extension(exts, VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) {
+            want.push_back(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+            capture_trace_clock = "vkGetCalibratedTimestampsEXT";
+        }
+    }
+#endif
     auto optional = [&](const char* name, bool& flag) {
         flag = has_extension(exts, name);
         if (flag) want.push_back(name);
@@ -360,6 +386,9 @@ bool create_device() {
             (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT))
             dev.queue_family = i;
     if (dev.queue_family == UINT32_MAX) return false;
+#ifdef _WIN32
+    capture_trace_clock_bits = families[dev.queue_family].timestampValidBits;
+#endif
     const float priority = 1.0f;
     VkDeviceQueueCreateInfo q{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     q.queueFamilyIndex = dev.queue_family;
@@ -466,6 +495,16 @@ bool create_device() {
     if (atomic_float) *tail = &afloat, tail = &afloat.pNext;
     VkPhysicalDeviceDescriptorBufferFeaturesEXT descriptor_buffer{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT};
     if (fsr_descriptor_buffer) *tail = &descriptor_buffer, tail = &descriptor_buffer.pNext;
+    VkPhysicalDevicePresentId2FeaturesKHR id2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR};
+    VkPhysicalDevicePresentTimingFeaturesEXT timing{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_TIMING_FEATURES_EXT};
+    const bool need_timing = getenv("JINRA_DISPLAY_TRACE") &&
+        has_extension(exts, VK_EXT_PRESENT_TIMING_EXTENSION_NAME) &&
+        has_extension(exts, VK_KHR_PRESENT_ID_2_EXTENSION_NAME) &&
+        has_extension(exts, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+    if (need_timing) {
+        *tail = &id2, tail = &id2.pNext;
+        *tail = &timing, tail = &timing.pNext;
+    }
     reflex_device_features(tail);   // (present ids, when NVIDIA Reflex's extensions are there)
     VkPhysicalDevicePresentIdFeaturesKHR present_id{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR};
     VkPhysicalDevicePresentWaitFeaturesKHR present_wait{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR};
@@ -475,6 +514,18 @@ bool create_device() {
     }
     antilag_device_features(tail);   // (AMD Anti-Lag 2's, when its extension is there)
     vkGetPhysicalDeviceFeatures2(dev.physical, &f);
+    display_timing_supported = need_timing && id2.presentId2 && timing.presentTiming;
+    jinra_absolute_present_supported = display_timing_supported && timing.presentAtAbsoluteTime &&
+        env_on("JINRA_TEST_FIFO_CADENCE");
+    timing.presentAtAbsoluteTime = jinra_absolute_present_supported;
+    timing.presentAtRelativeTime = VK_FALSE;
+    if (display_timing_supported) {
+        for (const char* ext : {VK_EXT_PRESENT_TIMING_EXTENSION_NAME, VK_KHR_PRESENT_ID_2_EXTENSION_NAME,
+                                VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME}) {
+            if (std::find_if(want.begin(), want.end(), [ext](const char* item) { return !strcmp(item, ext); }) == want.end())
+                want.push_back(ext);
+        }
+    }
     if (module_id && module_idf.shaderModuleIdentifier) module_ids_on();
     descriptor_buffer.descriptorBufferCaptureReplay = VK_FALSE;
     dev.view_2d_of_3d = dev.view_2d_of_3d && v2d3d.sampler2DViewOf3D;
@@ -916,6 +967,7 @@ bool create_swapchain(uint32_t width, uint32_t height) {
         ci.pNext = &format_list;
     }
     reflex_swapchain_info(ci);   // (NVIDIA Reflex: latency mode on)
+    const bool timing_enabled = display_timing_chain(ci);
     VkSwapchainKHR sc;
     result = vkCreateSwapchainKHR(dev.device, &ci, nullptr, &sc);
     // Passing oldSwapchain retires it even when creation fails. Nothing may acquire from it again.
@@ -956,6 +1008,7 @@ bool create_swapchain(uint32_t width, uint32_t height) {
          mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "fifo",
          vsync == 1 ? "On" : vsync == 2 ? "Off" : "Auto");
     swap_views_make(ci.imageUsage, mutable_view ? view_formats[1] : fmt.format);
+    display_timing_created(sc, timing_enabled);
     reflex_swapchain_created(sc);   // (NVIDIA Reflex: its sleep mode on the new swapchain)
     return true;
 }
@@ -1257,7 +1310,13 @@ void prepare_with_screen() {
 }
 bool started_up() {
     if (const char* e = getenv("RX_VK_START_DELAY")) Sleep((DWORD)atoi(e) * 1000);   // (diagnosis: a long start, as the first one is)
+#ifdef _WIN32
+    jinra_startup_arenas("before_replay_start");
+#endif
     if (!replay_start()) return false;
+#ifdef _WIN32
+    jinra_startup_arenas("replay_started");
+#endif
     driver_cache_log("at the start");
     if (prepare_only()) {
         // (three parts: the programs, the pipelines the notes predict, then those they name, on one bar whose total has all three
@@ -1482,6 +1541,7 @@ __declspec(dllexport)
 __attribute__((visibility("default")))
 #endif
 void mkwvk_close_asked(void) {
+    mkwvk::jinra_lazy_graphics_stats();
     using namespace mkwvk;
     programs_census_log("close");
     module_ids_flush();
@@ -1509,22 +1569,37 @@ const MkwVkRenderer* mkwvk_init(const MkwVkHost* h) {
         return nullptr;
     }
     host = h;
+#ifdef _WIN32
+    jinra_startup_arenas("before_vulkan");
+#endif
     if (!load_global()) {
         logf("vk: load_global failed (Vulkan loader library or vkCreateInstance missing)");
         return nullptr;
     }
+#ifdef _WIN32
+    jinra_startup_arenas("vulkan_loaded");
+#endif
     if (!create_instance()) {
         logf("vk: create_instance failed");
         return nullptr;
     }
+#ifdef _WIN32
+    jinra_startup_arenas("instance_created");
+#endif
     if (!pick_device()) {
         logf("vk: pick_device failed");
         return nullptr;
     }
+#ifdef _WIN32
+    jinra_startup_arenas("adapter_chosen");
+#endif
     if (!create_device()) {
         logf("vk: create_device failed");
         return nullptr;
     }
+#ifdef _WIN32
+    jinra_startup_arenas("device_created");
+#endif
     logf("vk: %s, Vulkan %u.%u, driver %#x; mesh shaders %s, host memory import %s, pipeline libraries %s",
          dev.props.deviceName, VK_VERSION_MAJOR(dev.props.apiVersion), VK_VERSION_MINOR(dev.props.apiVersion),
          dev.props.driverVersion, dev.mesh_shader ? "yes" : "no", dev.external_memory_host ? "yes" : "no",
@@ -1554,6 +1629,10 @@ const MkwVkRenderer* mkwvk_init(const MkwVkHost* h) {
 }
 
 namespace mkwvk {
+#ifdef _WIN32
+extern const char* capture_trace_clock;
+extern uint32_t capture_trace_clock_bits;
+#endif
 HWND app_window() { return main_window; }   // (the Insert menu's Fullscreen row)
 
 /// The refresh rate of the display the window is on, in mHz; 0 when not known (frame generation's Auto). Asked
@@ -1586,3 +1665,4 @@ int display_refresh_mhz() {
     return mhz;
 }
 } // namespace mkwvk
+

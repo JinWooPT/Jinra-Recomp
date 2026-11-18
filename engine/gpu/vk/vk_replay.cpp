@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <sys/stat.h>
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <cerrno>
 #include <cmath>
@@ -55,11 +56,21 @@
 #include "jinra_env.h"
 #endif
 #include "vk_programs.h"
+#include "capture_trace.h"
+#include "memory_submit_trace.h"
+#include "semaphore_probe.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
 namespace mkwvk {
+
+bool jinra_pending_small_readback();
 extern std::atomic<bool> movie_networks_slow;   // (vk_draw.cpp: the movie networks left out, issue 109)
 int64_t presents_now;   // (the presents so far, for SlowWatch)
+#ifdef _WIN32
+const char* capture_trace_clock = nullptr;
+uint32_t capture_trace_clock_bits = 0;
+uint64_t capture_trace::frame() { return __atomic_load_n(&presents_now, __ATOMIC_RELAXED); }
+#endif
 void hang_watch_start();   // (vk_hangdump.cpp: RX_VK_HANG_DUMP)
 void gpu_hang_watch_start();   // (below: a GPU that stops finishing work, reported and ended)
 struct CondNote { int64_t present; uint64_t addr, x, y; int mode; bool on; };   // (the last render conditions, for a dark frame)
@@ -141,6 +152,12 @@ struct Recording {
     VkCommandPool init_pool = VK_NULL_HANDLE;
     VkCommandBuffer init = VK_NULL_HANDLE;
     uint64_t value = 0;   // the timeline value its submit signals (reusable once reached)
+#ifdef _WIN32
+    uint64_t trace_seq = 0;
+    VkCommandBuffer trace_end_cmd = VK_NULL_HANDLE;
+    bool trace_end_pending = false;
+    bool trace_upload_pending = false;
+#endif
     int slot = 0;         // its index: the draw path keeps a descriptor pool and stream per recording
     // (its slot comes round again once its own submit is done: a fence of its own. The timeline is signalled as far
     // as no older submission is unfinished (submit_job), and a slot waiting on its value could wait on the replay)
@@ -215,6 +232,18 @@ bool batch_on() {
     return on && batch_tl != VK_NULL_HANDLE;
 }
 } // namespace
+#ifdef _WIN32
+void capture_trace::dependency(uint64_t id, uint64_t part, uint64_t whole) {
+    uint64_t producer = 0, whole_seq = 0;
+    {
+        std::lock_guard lock(rec_map_mu);
+        if (const auto i = part_rec.find(part); i != part_rec.end()) producer = i->second;
+        if (const auto i = value_rec.find(whole); i != value_rec.end()) whole_seq = i->second;
+    }
+    add({"dependency", qpc(), frame(), GetCurrentThreadId(), id, part, whole, producer, whole_seq});
+}
+#endif
+
 void queue_flush_locked() {   // (dev.present_mu held)
     if (pend.cbs.empty()) return;
     VkSemaphoreSubmitInfo sig[3]{{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO}, {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO},
@@ -241,6 +270,11 @@ void queue_flush_locked() {   // (dev.present_mu held)
     static int failures;
     if (res != VK_SUCCESS && failures++ < 8) logf("vk: batched submit %llu failed (%d)", (unsigned long long)batch_next, (int)res);
     if (res == VK_ERROR_DEVICE_LOST) device_lost();
+#ifdef _WIN32
+    if (capture_trace::file())
+        capture_trace::add({"flush", capture_trace::qpc(), capture_trace::frame(), GetCurrentThreadId(),
+                            batch_next, pend.rec, pend.signal, uint64_t(flush_reason), pend.cbs.size()});
+#endif
     if (res == VK_SUCCESS && pend.any_signal) note_timeline_sent(pend.signal);
     batch_flushed = batch_next;
     st_flushes++, st_batched_cbs += (int64_t)pend.cbs.size();
@@ -290,15 +324,22 @@ void wait_value(uint64_t v) {
     wi.pValues = &v;
     vkWaitSemaphores(dev.device, &wi, UINT64_MAX);
 }
-bool wait_recorded(uint64_t f, uint64_t timeout_ns, int* ok);
+bool wait_recorded(uint64_t f, uint64_t timeout_ns, int* ok, capture_trace::Wait* diagnostic = nullptr);
 } // namespace
 uint64_t vk_timeline_completed() { return timeline ? completed() : 0; }
-void vk_timeline_wait(uint64_t v) {   // (at most 250 ms: a submission held back behind the caller's thread goes on without it)
+void vk_timeline_wait(uint64_t v, capture_trace::Wait* diagnostic) {   // (at most 250 ms: a submission held back behind the caller's thread goes on without it)
+#ifdef _WIN32
+    if (diagnostic) {
+        diagnostic->target = v;
+        diagnostic->seen_before = timeline ? completed() : 0;
+        diagnostic->seen_after = diagnostic->seen_before;
+    }
+#endif
     if (!timeline || completed() >= v) return;
     // (a burst recording whose write-back stamped wb_pages with burst_value does not advance `timeline` while an older queue
     // submission is stopped at an event wait; wait on `rec_timeline` where that recording actually signalled completion)
     int ok = 0;
-    if (wait_recorded(v, 250000000ull, &ok)) {
+    if (wait_recorded(v, 250000000ull, &ok, diagnostic)) {
         if (!ok) {
             static std::atomic<int> logged{0};
             if (logged++ < 8)
@@ -312,7 +353,27 @@ void vk_timeline_wait(uint64_t v) {   // (at most 250 ms: a submission held back
     wi.semaphoreCount = 1;
     wi.pSemaphores = &timeline;
     wi.pValues = &v;
-    if (vkWaitSemaphores(dev.device, &wi, 250000000ull) == VK_TIMEOUT) {
+#ifdef _WIN32
+    capture_trace::ProbeLease probe(diagnostic, timeline, v);
+    if (diagnostic) {
+        diagnostic->probed = probe.probe != nullptr;
+        diagnostic->cpu_begin = GetCurrentProcessorNumber();
+        diagnostic->cycles = capture_trace::thread_cycles();
+        diagnostic->call_begin = capture_trace::qpc();
+    }
+#endif
+    const VkResult result = vkWaitSemaphores(dev.device, &wi, 250000000ull);
+#ifdef _WIN32
+    if (diagnostic) {
+        diagnostic->call_end = capture_trace::qpc();
+        diagnostic->cpu_end = GetCurrentProcessorNumber();
+        diagnostic->cycles = capture_trace::thread_cycles() - diagnostic->cycles;
+        diagnostic->route = "whole";
+        diagnostic->result = result == VK_SUCCESS;
+        diagnostic->seen_after = completed();
+    }
+#endif
+    if (result == VK_TIMEOUT) {
         static std::atomic<int> logged{0};
         if (logged++ < 8) logf("vk: a capture's wait for write-back %llu timed out (done %llu)", (unsigned long long)v, (unsigned long long)completed());
     }
@@ -325,13 +386,118 @@ int64_t st_wait_ns;   // (time the replay waited for a recording slot: the GPU b
 // round again (the work done by then)
 VkQueryPool ts_pool = VK_NULL_HANDLE;
 bool ts_pending[kRecordings];
+#ifdef _WIN32
+VkQueryPool submit_end_pool = VK_NULL_HANDLE;
+
+VkQueryPool trace_upload_pool = VK_NULL_HANDLE;
+
+bool entry_trace_on() {
+    static const bool enabled = capture_trace::file() && env_on("RX_VK_ENTRY_TRACE");
+    return enabled && capture_trace_clock_bits;
+}
+
+bool trace_span_begin(VkCommandBuffer cmd, VkQueryPool& pool, uint32_t slot, uint32_t slots) {
+    if (!entry_trace_on()) return false;
+    if (!pool) {
+        VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qi.queryCount = 2 * slots;
+        if (vkCreateQueryPool(dev.device, &qi, nullptr, &pool) != VK_SUCCESS) return false;
+    }
+    vkCmdResetQueryPool(cmd, pool, 2 * slot, 2);
+    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, pool, 2 * slot);
+    return true;
+}
+
+void trace_span_collect(const char* event, VkQueryPool pool, uint32_t slot, uint64_t id) {
+    uint64_t times[2]{};
+    if (vkGetQueryPoolResults(dev.device, pool, 2 * slot, 2, sizeof times,
+                              times, sizeof times[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+        capture_trace::add({event, capture_trace::qpc(), capture_trace::frame(), GetCurrentThreadId(),
+                            id, times[0], times[1], slot});
+    }
+}
+
+VkResult trace_entry_submit(const VkSubmitInfo2& info, VkFence fence, uint64_t id, bool present) {
+    if (!entry_trace_on()) return vkQueueSubmit2(dev.queue, 1, &info, fence);
+    const uint64_t start = capture_trace::qpc();
+    const VkResult result = vkQueueSubmit2(dev.queue, 1, &info, fence);
+    const uint64_t end = capture_trace::qpc();
+    const uint64_t frame = capture_trace::frame();
+    const uint64_t thread = GetCurrentThreadId();
+    capture_trace::add({"queue_call", start, frame, thread, id, end, uint64_t(present),
+                        uint64_t(dev.queue_family), info.commandBufferInfoCount,
+                        info.waitSemaphoreInfoCount, info.signalSemaphoreInfoCount, uint64_t(result),
+                        reinterpret_cast<uintptr_t>(dev.queue)});
+    for (uint32_t i = 0; i < info.waitSemaphoreInfoCount; ++i) {
+        const auto& dep = info.pWaitSemaphoreInfos[i];
+        capture_trace::add({"queue_dep", start, frame, thread, id, uint64_t(present), 0,
+                            reinterpret_cast<uintptr_t>(dep.semaphore), dep.value, dep.stageMask, dep.deviceIndex});
+    }
+    for (uint32_t i = 0; i < info.signalSemaphoreInfoCount; ++i) {
+        const auto& dep = info.pSignalSemaphoreInfos[i];
+        capture_trace::add({"queue_dep", start, frame, thread, id, uint64_t(present), 1,
+                            reinterpret_cast<uintptr_t>(dep.semaphore), dep.value, dep.stageMask, dep.deviceIndex});
+    }
+    return result;
+}
+
+void trace_submit_end(Recording& r, uint64_t seq, uint64_t timeline_value, VkCommandBufferSubmitInfo* cb, uint32_t& count) {
+    static const bool enabled = capture_trace::file() && env_on("RX_VK_BATCH_END_TS");
+    if (!enabled || !seq || !capture_trace_clock_bits) return;
+    if (!submit_end_pool) {
+        VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qi.queryCount = kRecordings;
+        if (vkCreateQueryPool(dev.device, &qi, nullptr, &submit_end_pool) != VK_SUCCESS) return;
+    }
+    if (!r.trace_end_cmd) {
+        VkCommandBufferAllocateInfo ci{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        ci.commandPool = r.pool;
+        ci.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        ci.commandBufferCount = 1;
+        if (vkAllocateCommandBuffers(dev.device, &ci, &r.trace_end_cmd) != VK_SUCCESS) return;
+    }
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(r.trace_end_cmd, &bi) != VK_SUCCESS) return;
+    vkCmdResetQueryPool(r.trace_end_cmd, submit_end_pool, r.slot, 1);
+    vkCmdWriteTimestamp2(r.trace_end_cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, submit_end_pool, r.slot);
+    if (vkEndCommandBuffer(r.trace_end_cmd) != VK_SUCCESS) return;
+    cb[count] = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+    cb[count++].commandBuffer = r.trace_end_cmd;
+    r.trace_end_pending = true;
+    capture_trace::add({"submit_end_tag", capture_trace::qpc(), capture_trace::frame(), GetCurrentThreadId(),
+                        seq, timeline_value, count - 1, uint64_t(r.slot), r.fence != VK_NULL_HANDLE});
+}
+#endif
 int64_t st_gpu_ns, st_gpu_max_ns;
 void gpu_time_collect(Recording& r) {
+#ifdef _WIN32
+    if (r.trace_upload_pending) {
+        r.trace_upload_pending = false;
+        trace_span_collect("upload_ts", trace_upload_pool, r.slot, r.trace_seq);
+    }
+    if (r.trace_end_pending) {
+        r.trace_end_pending = false;
+        uint64_t t = 0;
+        if (vkGetQueryPoolResults(dev.device, submit_end_pool, r.slot, 1, sizeof t, &t, sizeof t, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+            capture_trace::add({"submit_end", capture_trace::qpc(), capture_trace::frame(), GetCurrentThreadId(),
+                                r.trace_seq, t, uint64_t(r.slot)});
+    }
+#endif
     if (!ts_pool || !ts_pending[r.slot]) return;
     ts_pending[r.slot] = false;
     uint64_t t[2] = {0, 0};
     if (vkGetQueryPoolResults(dev.device, ts_pool, 2 * r.slot, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
         return;
+#ifdef _WIN32
+    if (capture_trace::file()) {
+        capture_trace::add({"gpu", capture_trace::qpc(), capture_trace::frame(), GetCurrentThreadId(),
+                            r.value, r.part, r.trace_seq, t[0], t[1]});
+        if (!r.part) return;  // Parallel segments are sampled only for this diagnostic.
+    }
+#endif
     if (t[1] <= t[0]) return;
     const int64_t ns = (int64_t)((t[1] - t[0]) * (double)dev.props.limits.timestampPeriod);
     st_gpu_ns += ns;
@@ -379,9 +545,15 @@ Recording& begin_recording(uint64_t value) {
     vkBeginCommandBuffer(r.cmd, &bi);
     vkBeginCommandBuffer(r.upload, &bi);
     gpu_time_begin(r);
+#ifdef _WIN32
+    r.trace_upload_pending = !batch_on() && trace_span_begin(r.upload, trace_upload_pool, r.slot, kRecordings);
+#endif
     gprof_begin_recording(r.slot, r.cmd, r.upload);
     r.value = value;
     r.part = ++rec_part_next;
+#ifdef _WIN32
+    r.trace_seq = 0;
+#endif
     memory_recording_part(r.part);
     memory_recording_value(value, completed());
     texture_begin_recording(r.upload, value);
@@ -392,6 +564,11 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
     draw_flush_recording(r.slot);
     const bool uploads = texture_uploads_recorded();
     gprof_submitted(r.slot, uploads);
+#ifdef _WIN32
+    r.trace_upload_pending = r.trace_upload_pending && uploads;
+    if (r.trace_upload_pending)
+        vkCmdWriteTimestamp2(r.upload, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, trace_upload_pool, 2 * r.slot + 1);
+#endif
     gpu_time_end(r);
     vkEndCommandBuffer(r.upload);
     vkEndCommandBuffer(r.cmd);
@@ -399,7 +576,7 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
     signal.semaphore = timeline;
     signal.value = signal_at ? signal_at : r.value;
     signal.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-    VkCommandBufferSubmitInfo cb[2]{{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO}, {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO}};
+    VkCommandBufferSubmitInfo cb[3]{{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO}, {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO}};
     uint32_t n = 0;
     if (uploads) cb[n++].commandBuffer = r.upload;
     cb[n++].commandBuffer = r.cmd;
@@ -446,6 +623,14 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
     si.signalSemaphoreInfoCount = nsig;
     si.pSignalSemaphoreInfos = nsig ? signals : nullptr;
     std::lock_guard lk(dev.present_mu);   // (one queue: submits and presents take turns)
+#ifdef _WIN32
+    const auto trace_submit = [&](uint64_t batch) {
+        if (!capture_trace::file()) return;
+        r.trace_seq = seq;
+        capture_trace::add({"submit", capture_trace::qpc(), capture_trace::frame(), GetCurrentThreadId(),
+                            r.value, r.part, seq, signal_value ? signal.value : 0, batch, n, uploads});
+    };
+#endif
     if (batch_on()) {
         // (NVIDIA Reflex: the batch is tagged with the game frame its first command buffer belongs to, read here. A batch that
         // spans two game frames counts as the first's; one begun before the frame's sleep returned (reflex_frame() 0) goes
@@ -460,13 +645,26 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
         r.submitted = true;
         // (RX_VK_BATCH_MAX=<command buffers>: held at most this many, default 32)
         static const size_t cap = getenv("RX_VK_BATCH_MAX") ? (size_t)std::max(1, atoi(getenv("RX_VK_BATCH_MAX"))) : 32;
+#ifdef _WIN32
+        trace_submit(batch_next);
+#endif
         if (pend.cbs.size() >= cap) flush_reason = FR_CAP, queue_flush_locked();
         if (!pend.cbs.empty() && batch_gpu_idle()) flush_reason = FR_OTHER, queue_flush_locked();   // (#1993)
         return;
     }
     PROF(PROF_QSUBMIT);
     si.pNext = reflex_submit_id(nullptr);   // (NVIDIA Reflex: the frame being made)
+#ifdef _WIN32
+    trace_submit(0);
+    trace_submit_end(r, seq, signal_value ? signal.value : 0, cb, n);
+    si.commandBufferInfoCount = n;
+#endif
+#ifdef _WIN32
+    const VkResult res = trace_entry_submit(si, r.fence, seq, false);
+    if (res != VK_SUCCESS) r.trace_upload_pending = false;
+#else
     const VkResult res = vkQueueSubmit2(dev.queue, 1, &si, r.fence);
+#endif
     r.submitted = res == VK_SUCCESS;
     static int failures;
     if (res != VK_SUCCESS && failures++ < 8) logf("vk: submit %llu failed (%d)", (unsigned long long)r.value, (int)res);
@@ -1458,6 +1656,12 @@ Recording& begin_segment_recording(uint64_t value) {
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(r.cmd, &bi);
     r.value = value;
+#ifdef _WIN32
+    if (capture_trace::file()) {
+        r.trace_seq = 0;
+        gpu_time_begin(r);
+    }
+#endif
     r.part = 0;   // (a parallel replay's segment: it writes nothing back itself, and its submit is not on the recordings' timeline)
     memory_recording_part(++rec_part_next);   // (a number of its own all the same: what it reads in place comes after the parts before it)
     return r;
@@ -1470,6 +1674,9 @@ struct Segment {
 };
 /// One segment recorded into cmd from the state at its start (any thread: the replay thread's own included)
 void record_segment(VkCommandBuffer& cmd, const Segment& g) {
+#ifdef _WIN32
+    LoadPathFrame path_frame;
+#endif
     rmode = Mode::Worker;
     NvnState s = *g.s;
     ub_limit = g.ub, cond_at = g.cond;
@@ -1660,6 +1867,9 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
                 j->uploads = texture_uploads_recorded();
                 j->inits = texture_segment_end(j->index);   // (after its last new image)
                 texture_segment_worker(-1);
+#ifdef _WIN32
+                if (capture_trace::file()) gpu_time_end(*j->r);
+#endif
                 vkEndCommandBuffer(j->r->upload);
                 vkEndCommandBuffer(j->r->cmd);
                 {
@@ -1694,6 +1904,11 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         std::lock_guard lk(dev.present_mu);
         queue_flush_locked();
         si.pNext = reflex_submit_id(nullptr);   // (NVIDIA Reflex: the frame being made; after the flush, which tags its own)
+#ifdef _WIN32
+        if (capture_trace::file())
+            capture_trace::add({"segment", capture_trace::qpc(), capture_trace::frame(), GetCurrentThreadId(),
+                                j->r->value, 0, 0, 0, 0, n, j->uploads, uint64_t(j->r->slot)});
+#endif
         const VkResult res = vkQueueSubmit2(dev.queue, 1, &si, j->r->fence);
         j->r->submitted = res == VK_SUCCESS;
         if (res != VK_SUCCESS) logf("vk: segment submit %llu failed (%d)", (unsigned long long)j->r->value, (int)res);
@@ -1852,17 +2067,26 @@ struct SlowWatch {
 /// (replay_mu held). In the order of the submits: one behind its queue's stopped one (submit_job) has it done as it comes.
 void submit_memory_work(uint64_t value) {
     PROF(PROF_MEMSYNC);
+    memory_submit_trace::Submit sample(value);
     const auto m0 = std::chrono::steady_clock::now();
-    memory_sync();
+    { memory_submit_trace::Scope timer(memory_submit_trace::maps); memory_sync(); }
     const auto m1a = std::chrono::steady_clock::now();
     memsync_part_ns[0] += std::chrono::duration_cast<std::chrono::nanoseconds>(m1a - m0).count();
     // (the capture takes only the mirrored pools' pages, the collection the rest: skipping it whenever a capture was
     // taken, which with the replay thread is at every submit, left every other CPU write uncollected. Textures never
     // saw them: MK World's font cache kept its first glyphs (the menus lost letters), CPU-streamed terrain went stale)
     const auto m1 = std::chrono::steady_clock::now();
+#ifdef _WIN32
+    {
+        memory_submit_trace::Scope timer(memory_submit_trace::take);
+        capture_trace::FrameCpu cpu_scope("capture_cpu");
+        memory_take_capture(value, completed());
+    }
+#else
     memory_take_capture(value, completed());
+#endif
     const auto m2 = std::chrono::steady_clock::now();
-    memory_collect_written();
+    { memory_submit_trace::Scope timer(memory_submit_trace::collect); memory_collect_written(); }
     const auto m3 = std::chrono::steady_clock::now();
     memsync_part_ns[1] += std::chrono::duration_cast<std::chrono::nanoseconds>(m2 - m1).count();
     memsync_part_ns[2] += std::chrono::duration_cast<std::chrono::nanoseconds>(m3 - m2).count();
@@ -2061,6 +2285,43 @@ uint64_t replay_pin_mask() {
 }
 thread_local int replay_pin_depth = 0;
 thread_local DWORD_PTR replay_pin_prev = 0;
+// Report only slow submissions. Boundaries use the same QPC as the host trace.
+struct SubmitPhases {
+    const char* event;
+    uint64_t queue;
+    uint64_t count;
+    uint64_t start = 0, cycles = 0;
+    uint64_t lock = 0, pinned = 0, snapshot = 0, recording = 0;
+    SubmitPhases(const char* kind, uint64_t q, int n) : event(kind), queue(q), count(n > 0 ? n : 0) {
+#ifdef _WIN32
+        static const bool on = capture_trace::file() && env_on("JINRA_TEST_SUBMIT_PHASE");
+        if (on) { start = capture_trace::qpc(); cycles = capture_trace::thread_cycles(); }
+#endif
+    }
+    void mark(uint64_t& at) const {
+#ifdef _WIN32
+        if (start) at = capture_trace::qpc();
+#else
+        (void)at;
+#endif
+    }
+    ~SubmitPhases() {
+#ifdef _WIN32
+        if (!start) return;
+        const auto end = capture_trace::qpc();
+        static const uint64_t threshold = [] {
+            LARGE_INTEGER hz{};
+            QueryPerformanceFrequency(&hz);
+            return uint64_t(hz.QuadPart / 500);
+        }();
+        if (end - start < threshold) return;
+        const auto delta = capture_trace::thread_cycles() - cycles;
+        capture_trace::add({event, start, capture_trace::frame(), GetCurrentThreadId(),
+                            end, lock, pinned, snapshot, delta, queue, count, recording});
+#endif
+    }
+};
+
 struct ReplayPin {
     bool counted = false;
     ReplayPin() {
@@ -2080,10 +2341,21 @@ struct ReplayPin {
 /// A submission's command buffers from command buffer cb (op p; null: its start) on, into recordings of its own,
 /// submitted: true when it finished; false when it stopped at a wait not met (may_stop), its place kept in qruns.
 /// memory_work: its memory work first (else done as it came)
+bool per_queue_fences_off();
+
 bool run_submit(const uint64_t* handles, int n, uint64_t value, uint64_t queue, bool memory_work, int cb = 0,
                 const uint8_t* p = nullptr, bool may_stop = false) {
+    SubmitPhases phases("replay_phase", queue, n);
     std::lock_guard lk(replay_mu);
+    phases.mark(phases.lock);
     ReplayPin pin;
+    phases.mark(phases.pinned);
+#ifdef _WIN32
+    capture_trace::FrameCpu cpu_scope("submit_cpu");
+#ifdef _WIN32
+    LoadPathFrame path_frame;
+#endif
+#endif
     SlowWatch slow("submit");
     PROF(PROF_SUBMIT);
     if (memory_work) {
@@ -2091,6 +2363,7 @@ bool run_submit(const uint64_t* handles, int n, uint64_t value, uint64_t queue, 
         frame_submits.emplace_back(handles, handles + std::max(n, 0));
         submit_memory_work(value);
     }
+    phases.mark(phases.snapshot);
     if (burst_open && rec_cur) {   // (the burst's recording goes on: what the piece before did, done first)
         end_pass(rec_cur->cmd);
         full_barrier(rec_cur->cmd, "barrier (a burst's next submit start)");
@@ -2113,6 +2386,7 @@ bool run_submit(const uint64_t* handles, int n, uint64_t value, uint64_t queue, 
         stop = replay_handle(cmd, p ? p : reinterpret_cast<const uint8_t*>(handles[cb]), may_stop);
         if (stop) break;
     }
+    phases.mark(phases.recording);
     if (stop) {
         QueueRun& q = qruns[queue];
         q.waiting = true;
@@ -2129,7 +2403,20 @@ bool run_submit(const uint64_t* handles, int n, uint64_t value, uint64_t queue, 
         done_max = std::max(done_max, value);
         rec_open_values.push_back(value);
     }
-    if (!burst_open) finish_recording(value);   // (a burst's: at its end)
+    static const bool early_readback = env_on("JINRA_TEST_EARLY_READBACK");
+    // Finish the producer with the normal barriers before appending other queues' work.
+    // Make at most one extra cut per displayed frame and preserve legacy wait modes.
+    static int64_t last_cut = -1;
+    static unsigned cuts = 0;
+    if (!burst_open) {
+        finish_recording(value);
+    } else if (early_readback && !stop && !per_queue_fences_off() && !async_on() &&
+               presents_now >= 1 && last_cut != presents_now && jinra_pending_small_readback()) {
+        finish_recording(value);
+        last_cut = presents_now;
+        if (++cuts <= 4 || cuts % 300 == 0)
+            logf("vk: early readback submitted producer at frame %lld, cuts %u", (long long)last_cut, cuts);
+    }
     if (stop) return false;
     if (pushed.load() < value) pushed = value;
     st_submits++;
@@ -2307,8 +2594,8 @@ uint64_t get_replayed() {
 }
 /// Waits for the recording submission value f (or the recording of value f) was finished in, on the recordings'
 /// timeline: true when that recording is known (the result in *ok), false when it is not (f not finished yet)
-static void wait_rec_seq(uint64_t seq, uint64_t timeout_ns, int* ok);
-bool wait_recorded(uint64_t f, uint64_t timeout_ns, int* ok) {
+static void wait_rec_seq(uint64_t seq, uint64_t timeout_ns, int* ok, capture_trace::Wait* diagnostic = nullptr);
+bool wait_recorded(uint64_t f, uint64_t timeout_ns, int* ok, capture_trace::Wait* diagnostic) {
     if (!rec_timeline) return false;
     uint64_t seq = 0;
     {
@@ -2317,7 +2604,7 @@ bool wait_recorded(uint64_t f, uint64_t timeout_ns, int* ok) {
         if (it == value_rec.end()) return false;
         seq = it->second;
     }
-    wait_rec_seq(seq, timeout_ns, ok);
+    wait_rec_seq(seq, timeout_ns, ok, diagnostic);
     return true;
 }
 /// The same for one part of a submission (Recording::part, as memory_end_submission noted it with the pages that
@@ -2344,13 +2631,21 @@ bool wait_recorded_part(uint64_t part, uint64_t timeout_ns, int* ok) {
     wait_rec_seq(seq, timeout_ns, ok);
     return true;
 }
-static void wait_rec_seq(uint64_t seq, uint64_t timeout_ns, int* ok) {
+static void wait_rec_seq(uint64_t seq, uint64_t timeout_ns, int* ok, capture_trace::Wait* diagnostic) {
     // reached already: nothing to wait for, and nothing to flush for it. The flush below took dev.present_mu,
     // which a present holds for as long as it takes: a readback whose recording was long done waited there for the
     // presenting thread's present, 4-5 ms (Hyrule Field: a job thread at 9 % of all instants; queue_flush_for now looks
     // at pend_held first)
     uint64_t reached = 0;
-    if (vkGetSemaphoreCounterValue(dev.device, rec_timeline, &reached) == VK_SUCCESS && reached >= seq) {
+    const VkResult read = vkGetSemaphoreCounterValue(dev.device, rec_timeline, &reached);
+#ifdef _WIN32
+    if (diagnostic) {
+        diagnostic->route = "recording";
+        diagnostic->target = seq;
+        diagnostic->seen_before = diagnostic->seen_after = reached;
+    }
+#endif
+    if (read == VK_SUCCESS && reached >= seq) {
         *ok = 1;
         return;
     }
@@ -2363,8 +2658,30 @@ static void wait_rec_seq(uint64_t seq, uint64_t timeout_ns, int* ok) {
     wi.pValues = &seq;
     {
         FpsWait fw(fps_stats::kGpuWait);   // (the FPS counter's Breakdown)
+#ifdef _WIN32
+        capture_trace::ProbeLease probe(diagnostic, rec_timeline, seq);
+        if (diagnostic) {
+            diagnostic->probed = probe.probe != nullptr;
+            diagnostic->cpu_begin = GetCurrentProcessorNumber();
+            diagnostic->cycles = capture_trace::thread_cycles();
+            diagnostic->call_begin = capture_trace::qpc();
+        }
+#endif
         *ok = vkWaitSemaphores(dev.device, &wi, timeout_ns) == VK_SUCCESS;
+#ifdef _WIN32
+        if (diagnostic) {
+            diagnostic->call_end = capture_trace::qpc();
+            diagnostic->cpu_end = GetCurrentProcessorNumber();
+            diagnostic->cycles = capture_trace::thread_cycles() - diagnostic->cycles;
+        }
+#endif
     }
+#ifdef _WIN32
+    if (diagnostic) {
+        diagnostic->result = *ok;
+        vkGetSemaphoreCounterValue(dev.device, rec_timeline, &diagnostic->seen_after);
+    }
+#endif
 }
 uint64_t fence();
 /// A fence of one queue (nvnQueueFenceSync): the value of that queue's last submission
@@ -2679,6 +2996,10 @@ struct Frame {
     VkSemaphore acquired = VK_NULL_HANDLE;
 };
 Frame frames[3];
+#ifdef _WIN32
+VkQueryPool trace_present_pool = VK_NULL_HANDLE;
+uint64_t trace_present_ids[3]{}, trace_present_next = 0;
+#endif
 uint32_t frame_index = 0;
 int64_t presents = 0;
 
@@ -3208,6 +3529,35 @@ void log_frame_stats() {
     }
 }
 
+#ifdef _WIN32
+void capture_trace_tick(uint64_t frame) {
+    if (!capture_trace::file()) return;
+    static uint64_t last = 0;
+    static const uint64_t qpc_hz = [] {
+        LARGE_INTEGER frequency{};
+        QueryPerformanceFrequency(&frequency);
+        return uint64_t(frequency.QuadPart);
+    }();
+    const uint64_t now = capture_trace::qpc();
+    if (last && now - last < qpc_hz) return;
+    last = now;
+    static const auto clock = capture_trace_clock
+        ? reinterpret_cast<PFN_vkGetCalibratedTimestampsKHR>(vkGetDeviceProcAddr(dev.device, capture_trace_clock)) : nullptr;
+    if (clock && capture_trace_clock_bits) {
+        const VkCalibratedTimestampInfoKHR clocks[2] = {
+            {VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR, nullptr, VK_TIME_DOMAIN_DEVICE_KHR},
+            {VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR, nullptr, VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR}};
+        uint64_t values[2]{}, deviation = 0;
+        if (clock(dev.device, 2, clocks, values, &deviation) == VK_SUCCESS)
+            capture_trace::add({"clock", values[1], frame, GetCurrentThreadId(), values[0], deviation,
+                                uint64_t(dev.props.limits.timestampPeriod * 1000000.0), capture_trace_clock_bits});
+    }
+    uint64_t used = 0, budget = 0;
+    if (vram_usage_now(&used, &budget))
+        capture_trace::add({"vram", now, frame, GetCurrentThreadId(), used, budget});
+}
+#endif
+
 /// Once a game frame: every 600 a status line (the video memory, DLSS's details while it draws), and every 60
 /// a look at the driver's allowance, warned of once when the use passes it (again only after it was back under)
 void status_tick() {
@@ -3234,7 +3584,7 @@ void status_tick() {
         }
         if (f) fprintf(f, "frame,ms,pipe_waits,pipe_wait_ms,left_out,translate_ms,uploads,upload_mb,textures,memsync_ms,pipelines_ms,"
                           "uploads_ms,programs_ms,slot_wait_ms,gpu_behind_ms,draw_ms,desc_ms,cmds_ms,tex_lookup_ms,textures_gone,"
-                          "late_wait_ms,readback_wait_ms,tex_frame_ms\n");
+                          "late_wait_ms,readback_wait_ms,tex_frame_ms,import_count,import_ms\n");
         return f;
     }();
     if (trace && last_ns) {
@@ -3252,18 +3602,45 @@ void status_tick() {
         // texture_frame as a whole (the present's eviction and sweeps; the read-back's wait is inside it when an eviction asked))
         static int64_t l_late, l_rb, l_tf;
         const int64_t late = memory_late_wait_ns(), rb = texture_readback_wait_ns(), tf = texture_frame_ns();
-        fprintf(trace, "%llu,%.2f,%lld,%.2f,%lld,%.1f,%lld,%.2f,%zu,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%llu,%.2f,%.2f,%.2f\n",
+        static uint64_t last_import_count, last_import_ns;
+        uint64_t import_count = 0, import_ns = 0;
+        diagnostic_import_stats(import_count, import_ns);
+        fprintf(trace, "%llu,%.2f,%lld,%.2f,%lld,%.1f,%lld,%.2f,%zu,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%llu,%.2f,%.2f,%.2f,%llu,%.3f\n",
                 (unsigned long long)frames, (now_ns - last_ns) / 1e6, (long long)(pw - l_pw), pwms - l_pwms, (long long)(ps - l_ps),
                 tr - l_tr, (long long)(up - l_up), (upb - l_upb) / 1048576.0, texture_count(), dp(PROF_MEMSYNC), dp(PROF_PIPE),
                 dp(PROF_UPLOAD), dp(PROF_PROGRAM), dp(PROF_SLOTWAIT), (st_wait_ns - l_wait) / 1e6, dp(PROF_DRAW), dp(PROF_DESC),
                 dp(PROF_CMDS), dp(PROF_TEXGET), (unsigned long long)(gone - l_gone), (late - l_late) / 1e6, (rb - l_rb) / 1e6,
-                (tf - l_tf) / 1e6);
+                (tf - l_tf) / 1e6, (unsigned long long)(import_count - last_import_count),
+                (import_ns - last_import_ns) / 1e6);
+        last_import_count = import_count;
+        last_import_ns = import_ns;
         l_gone = gone, l_late = late, l_rb = rb, l_tf = tf;
         if (frames % 60 == 0) fflush(trace);
         l_ps = ps, l_pw = pw, l_pwms = pwms, l_up = up, l_upb = upb, l_tr = tr, l_wait = st_wait_ns;
         std::memcpy(l_prof, prof_ns, sizeof l_prof);
     }
     last_ns = now_ns;
+    static FILE* copies = []() -> FILE* {
+        const char* path = getenv("JINRA_TEST_COPY_PROFILE_FILE");
+        FILE* file = path ? std::fopen(path, "w") : nullptr;
+        if (file) std::fputs("frame,new,reuse,bytes,copy_us,stream_fallbacks\n", file);
+        return file;
+    }();
+    if (copies) diagnostic_copy_frame(copies, frames);
+#ifdef _WIN32
+    capture_trace_tick(frames);
+#endif
+    static const bool lifetime = env_on("JINRA_TEST_MEMORY_LIFETIME");
+    if (lifetime && frames % 30 == 0) {
+        diagnostic_memory_frame(frames);
+        diagnostic_target_frame(frames);
+        uint64_t used = 0, budget = 0;
+        if (vram_usage_now(&used, &budget))
+            logf("vk: lifetime vram frame %llu used %llu budget %llu",
+                 (unsigned long long)frames, (unsigned long long)used, (unsigned long long)budget);
+        vma_log_image_blocks();
+    }
+    diagnostic_memory_census(frames);
     if (++frames % sl::kCheckEvery) return;
     uint64_t used = 0, allowed = 0;
     const bool known = vram_usage_now(&used, &allowed);
@@ -3426,7 +3803,39 @@ void do_present(const nvn_tex* t, const int crop[4]) {
     temporal_idle();   // (DLSS, FSR: their video memory let go once not used for a while)
     status_tick();   // (the status line, and the video-memory warning)
     reflex_present_begins();
-    struct ReflexSleep { ~ReflexSleep() { FpsWait fw(fps_stats::kPace); reflex_sleep(); antilag_input(); } } reflex_sleep_after;
+    struct ReflexSleep {
+        ~ReflexSleep() {
+            FpsWait fw(fps_stats::kPace);
+#ifdef _WIN32
+            static FILE* trace = []() -> FILE* {
+                const char* path = getenv("JINRA_REFLEX_WAIT_TRACE");
+                FILE* output = path && *path ? std::fopen(path, "w") : nullptr;
+                if (output) {
+                    LARGE_INTEGER frequency{};
+                    QueryPerformanceFrequency(&frequency);
+                    std::fprintf(output, "# qpc_hz=%llu\n", (unsigned long long)frequency.QuadPart);
+                    std::fputs("frame,start_qpc,end_qpc,thread,processor_start,processor_end\n", output);
+                }
+                return output;
+            }();
+            const uint64_t begin = trace ? capture_trace::qpc() : 0;
+            const DWORD processor = trace ? GetCurrentProcessorNumber() : 0;
+#endif
+            reflex_sleep();
+#ifdef _WIN32
+            if (trace) {
+                const uint64_t end = capture_trace::qpc();
+                const uint64_t frame = texture_frame_no();
+                std::fprintf(trace, "%llu,%llu,%llu,%lu,%lu,%lu\n",
+                             (unsigned long long)frame, (unsigned long long)begin,
+                             (unsigned long long)end, (unsigned long)GetCurrentThreadId(),
+                             (unsigned long)processor, (unsigned long)GetCurrentProcessorNumber());
+                if (frame % 120 == 0) std::fflush(trace);
+            }
+#endif
+            antilag_input();
+        }
+    } reflex_sleep_after;
     {   // (RX_VK_PASS_TRACE_AT=<frames>: the passes of the frames around these frame numbers, for finding what a frame is made of)
         static std::atomic<int64_t> seen{0};
         static const int64_t at = getenv("RX_VK_PASS_TRACE_AT") ? atoll(getenv("RX_VK_PASS_TRACE_AT")) : 0;
@@ -3835,6 +4244,7 @@ struct LogSlot {
     bool used = false;
     int64_t at = 0;
     uint32_t seq = 0, kind = 0;
+    uint64_t qpc = 0, frame = 0;
 };
 LogSlot log_slots[3];
 VkImage log_image = VK_NULL_HANDLE;
@@ -3927,6 +4337,28 @@ bool framelog_ready() {
     logf("vk: the frame log writes every frame shown to %s", framelog_path());
     return true;
 }
+} // namespace
+#ifdef _WIN32
+bool capture_trace::arrival_detail() {
+    static const bool on = file() && env_on("JINRA_TEST_ARRIVAL_DETAIL") && framelog_path();
+    if (!on) return false;
+    static const auto gate = std::string(framelog_path()) + ".go";
+    static thread_local uint64_t next = 0;
+    static thread_local bool active = false;
+    const uint64_t now = qpc();
+    if (now >= next) {
+        static const uint64_t span = [] {
+            LARGE_INTEGER frequency{};
+            QueryPerformanceFrequency(&frequency);
+            return uint64_t(frequency.QuadPart) / 10;
+        }();
+        next = now + span;
+        active = GetFileAttributesA(gate.c_str()) != INVALID_FILE_ATTRIBUTES;
+    }
+    return active;
+}
+#endif
+namespace {
 bool framelog_on() {
     static bool on = false;
     static int64_t next = 0;
@@ -3945,6 +4377,26 @@ void framelog_collect(int slot) {
     l.used = false;
     // present_image waited for this slot's fence; expose its GPU writes before the CPU copy.
     invalidate_mapped(l.alloc, (uint64_t)kLogW * kLogH * 4);
+#ifdef _WIN32
+    static const bool timing = capture_trace::file() && env_on("JINRA_TEST_TIMING");
+    if (timing) {
+        const auto* pixels = static_cast<const uint8_t*>(l.map);
+        uint64_t luma = 0;
+        uint64_t lit = 0;
+        uint64_t samples = 0;
+        for (uint32_t y = kLogH / 8; y < kLogH * 7 / 8; y += 4) {
+            for (uint32_t x = kLogW / 8; x < kLogW * 7 / 8; x += 4) {
+                const uint8_t* rgb = pixels + 4 * (y * kLogW + x);
+                const uint32_t value = (54 * rgb[0] + 183 * rgb[1] + 19 * rgb[2]) / 256;
+                luma += value;
+                lit += value > 16;
+                ++samples;
+            }
+        }
+        capture_trace::add({"picture", l.qpc, l.frame, GetCurrentThreadId(), l.seq, l.kind, luma, lit, samples});
+        return;
+    }
+#endif
     std::vector<uint8_t> rec(16 + (size_t)kLogW * kLogH * 4);
     std::memcpy(rec.data(), &l.at, 8);
     std::memcpy(rec.data() + 8, &l.seq, 4);
@@ -4010,6 +4462,12 @@ static bool present_out(uint32_t index, std::unique_lock<std::mutex>& qk);   // 
 thread_local PendingPresent* present_defer_into = nullptr;
 static VkFence present_copy_done = VK_NULL_HANDLE;   // (present_image's copy, while it presents: the presenter thread may take it)
 namespace {
+#ifdef _WIN32
+constexpr uint32_t display_gpu_slots = 3;
+thread_local int display_gpu_slot = -1;
+bool display_gpu_mark(VkCommandBuffer cmd, uint32_t slot);
+void display_gpu_collect(uint32_t slot);
+#endif
 bool present_thread_on();
 void present_hand_off(uint32_t index, VkFence done);
 void present_finish(VkResult res, bool on_presenter);
@@ -4065,6 +4523,14 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     const int64_t fence_t0 = fps_breakdown_on() ? fps_clock() : 0;   // (the FPS counter's Breakdown: this frame slot's last copy)
     if (vkWaitForFences(dev.device, 1, &f.done, VK_TRUE, UINT64_MAX) == VK_ERROR_DEVICE_LOST) device_lost();
     framelog_collect(log_slot);
+#ifdef _WIN32
+    display_gpu_collect(log_slot);
+    if (trace_present_ids[log_slot]) {
+        trace_span_collect("present_ts", trace_present_pool, log_slot, trace_present_ids[log_slot]);
+        trace_present_ids[log_slot] = 0;
+    }
+    const uint64_t trace_acquire_start = entry_trace_on() ? capture_trace::qpc() : 0;
+#endif
     uint32_t index = 0;
     const int64_t acquire_t0 = fence_t0 ? fps_clock() : 0;   // (then the swapchain's image: the display's pace)
     if (fence_t0) fps_wait(fps_stats::kGpuWait, acquire_t0 - fence_t0);
@@ -4079,6 +4545,11 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     const uint64_t acquire_timeout = unseen ? 0 : 100000000ull;
 #endif
     VkResult res = vkAcquireNextImageKHR(dev.device, dev.swapchain, acquire_timeout, f.acquired, VK_NULL_HANDLE, &index);
+#ifdef _WIN32
+    if (trace_acquire_start)
+        capture_trace::add({"acquire_call", trace_acquire_start, capture_trace::frame(), GetCurrentThreadId(),
+                            capture_trace::qpc(), reinterpret_cast<uintptr_t>(f.acquired), index, uint64_t(res)});
+#endif
     if (res == VK_ERROR_DEVICE_LOST) device_lost();
     if (acquire_t0) fps_wait(fps_stats::kPace, fps_clock() - acquire_t0);
     if (res == VK_ERROR_SURFACE_LOST_KHR) {
@@ -4110,6 +4581,9 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     if (vkBeginCommandBuffer(f.cmd, &bi) == VK_ERROR_DEVICE_LOST) device_lost();
+#ifdef _WIN32
+    const bool trace_present = trace_span_begin(f.cmd, trace_present_pool, log_slot, 3);
+#endif
     VkImage dst = dev.swap_images[index];
     full_barrier(f.cmd);   // (after the game's work for the frame: earlier submits on this queue)
     image_barrier(f.cmd, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -4163,6 +4637,12 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
         vkCmdCopyImageToBuffer(f.cmd, log_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, l.buf, 1, &c);
         capture_host_read_barrier(f.cmd, l.buf, (VkDeviceSize)kLogW * kLogH * 4);
         l.used = true, l.at = host->now_ns(), l.seq = seq++, l.kind = present_kind.load();
+#ifdef _WIN32
+        if (capture_trace::file() && env_on("JINRA_TEST_TIMING")) {
+            l.qpc = capture_trace::qpc();
+            l.frame = capture_trace::frame();
+        }
+#endif
     }
     // Geometry trace: after choosing the actual presentation route, without frame-log pixel readback.
     static const bool trace_geometry = getenv("RX_VK_PRESENT_LOG") && atoi(getenv("RX_VK_PRESENT_LOG")) != 0;
@@ -4200,6 +4680,11 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     }
     menu_record(f.cmd, index, dev.swap_extent.width, dev.swap_extent.height);   // Dear ImGui's overlays, over all of it
     image_barrier(f.cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+#ifdef _WIN32
+    if (trace_present)
+        vkCmdWriteTimestamp2(f.cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, trace_present_pool, 2 * log_slot + 1);
+    const bool display_gpu_marked = !present_defer_into && display_gpu_mark(f.cmd, log_slot);
+#endif
     if (vkEndCommandBuffer(f.cmd) == VK_ERROR_DEVICE_LOST) device_lost();
     // after the image's acquisition. (Not on the timeline: one queue runs submits in order, and a wait for a value
     // another thread had counted but not yet submitted blocked the queue for good)
@@ -4236,7 +4721,13 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     reflex_submit_ends();
     // (NVIDIA Reflex: the frame this present shows; with frame generation the set's game frame, none for a made frame)
     si.pNext = reflex_submit_id(nullptr, reflex_present_frame);
+#ifdef _WIN32
+    const uint64_t trace_id = entry_trace_on() ? ++trace_present_next : 0;
+    res = trace_entry_submit(si, f.done, trace_id, true);
+    if (trace_present && res == VK_SUCCESS) trace_present_ids[log_slot] = trace_id;
+#else
     res = vkQueueSubmit2(dev.queue, 1, &si, f.done);
+#endif
     if (res == VK_ERROR_DEVICE_LOST) device_lost();
     if (present_defer_into) {   // (present ahead: the copy is queued; present_commit shows it at its time)
         present_defer_into->used = true;
@@ -4249,7 +4740,13 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
         return;
     }
     present_copy_done = f.done;
+#ifdef _WIN32
+    display_gpu_slot = display_gpu_marked && res == VK_SUCCESS ? log_slot : -1;
+#endif
     present_out(index, qk);
+#ifdef _WIN32
+    display_gpu_slot = -1;
+#endif
     present_copy_done = VK_NULL_HANDLE;
 }
 
@@ -4264,6 +4761,371 @@ bool present_commit(const PendingPresent& p) {
     const bool shown = present_out(p.index, qk);
     reflex_present_frame = was, antilag_present_frame = al_was;
     return shown;
+}
+
+extern bool display_timing_supported;
+extern bool jinra_absolute_present_supported;
+namespace {
+constexpr uint32_t display_batch = 32;
+FILE* display_trace;
+uint64_t display_domain;
+uint64_t display_sequence;
+uint64_t display_generation;
+VkPresentStageFlagsEXT display_stages;
+PFN_vkGetPastPresentationTimingEXT display_query;
+PFN_vkGetSwapchainTimingPropertiesEXT display_properties;
+
+struct DisplayPending { uint64_t id, seq, time; };
+struct DisplayTag { uint64_t chain, id, seq; };
+#ifdef _WIN32
+VkQueryPool display_gpu_pool = VK_NULL_HANDLE;
+bool display_gpu_pool_failed;
+std::array<DisplayTag, display_gpu_slots> display_gpu_tags{};
+
+bool display_gpu_mark(VkCommandBuffer cmd, uint32_t slot) {
+    if (!display_query || !capture_trace_clock_bits || display_gpu_pool_failed) return false;
+    if (!display_gpu_pool) {
+        VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        info.queryCount = display_gpu_slots;
+        if (vkCreateQueryPool(dev.device, &info, nullptr, &display_gpu_pool) != VK_SUCCESS) {
+            display_gpu_pool_failed = true;
+            return false;
+        }
+    }
+    vkCmdResetQueryPool(cmd, display_gpu_pool, slot, 1);
+    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, display_gpu_pool, slot);
+    return true;
+}
+
+void display_gpu_collect(uint32_t slot) {
+    const DisplayTag tag = display_gpu_tags[slot];
+    if (!tag.seq) return;
+    display_gpu_tags[slot] = {};
+    uint64_t ticks = 0;
+    const VkResult result = vkGetQueryPoolResults(dev.device, display_gpu_pool, slot, 1,
+        sizeof ticks, &ticks, sizeof ticks, VK_QUERY_RESULT_64_BIT);
+    if (result == VK_SUCCESS) {
+        fprintf(display_trace, "gpu,%llu,%llu,0,%llu,0,%llu\n",
+                (unsigned long long)tag.chain, (unsigned long long)tag.id,
+                (unsigned long long)ticks, (unsigned long long)tag.seq);
+    }
+}
+#endif
+std::array<DisplayPending, 256> display_pending{};
+thread_local DisplayTag display_present{};
+std::array<int64_t, 30> display_delays{};
+uint64_t display_refresh, display_last_id, display_last_seen, display_last_pixel;
+bool jinra_cadence_surface, jinra_cadence_absolute;
+uint64_t jinra_cadence_pixel, jinra_cadence_seq;
+unsigned jinra_cadence_samples;
+VkTimeDomainKHR display_domain_type;
+bool display_calibration_ok;
+int64_t display_calibrated_offset;
+size_t display_delay_count, display_delay_index;
+std::atomic<uint64_t> display_phase_data, display_phase_qpc, display_phase_id;
+
+LARGE_INTEGER display_clock() {
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return now;
+}
+
+uint64_t display_ns(uint64_t qpc) {
+    static const uint64_t hz = [] {
+        LARGE_INTEGER frequency;
+        QueryPerformanceFrequency(&frequency);
+        return uint64_t(frequency.QuadPart);
+    }();
+    return (qpc / hz) * 1000000000ull + (qpc % hz) * 1000000000ull / hz;
+}
+
+void display_reset() {
+    display_phase_data.store(0, std::memory_order_release);
+    display_phase_qpc.store(0, std::memory_order_relaxed);
+    display_phase_id.store(0, std::memory_order_relaxed);
+    display_calibration_ok = false;
+    display_calibrated_offset = 0;
+    display_pending.fill({});
+    display_last_id = display_last_seen = display_last_pixel = display_refresh = 0;
+    display_delay_count = display_delay_index = 0;
+    jinra_cadence_pixel = jinra_cadence_seq = 0;
+    jinra_cadence_samples = 0;
+}
+
+void display_calibrate(VkSwapchainKHR swapchain) {
+    auto calibrate = reinterpret_cast<PFN_vkGetCalibratedTimestampsKHR>(
+        vkGetDeviceProcAddr(dev.device, "vkGetCalibratedTimestampsKHR"));
+    if (display_domain_type == VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR)
+        display_calibration_ok = true;
+    if (!calibrate) return;
+#ifdef _WIN32
+    if (display_gpu_pool) {
+        const VkCalibratedTimestampInfoKHR clocks[2] = {
+            {VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR, nullptr, VK_TIME_DOMAIN_DEVICE_KHR},
+            {VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR, nullptr, VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR}};
+        uint64_t stamp[2]{}, deviation = 0;
+        if (calibrate(dev.device, 2, clocks, stamp, &deviation) == VK_SUCCESS && stamp[1]) {
+            fprintf(display_trace, "calibration_gpu,%llu,%llu,%llu,%llu,%u,%llu\n",
+                    (unsigned long long)display_generation, (unsigned long long)display_sequence,
+                    (unsigned long long)deviation, (unsigned long long)stamp[0],
+                    capture_trace_clock_bits, (unsigned long long)display_ns(stamp[1]));
+            fprintf(display_trace, "gpu_period,%llu,%llu,0,%llu,0,0\n",
+                    (unsigned long long)display_generation, (unsigned long long)display_sequence,
+                    (unsigned long long)(double(dev.props.limits.timestampPeriod) * 1000000.0 + 0.5));
+        }
+    }
+#endif
+    if (display_domain_type == VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR) return;
+    VkSwapchainCalibratedTimestampInfoEXT local{VK_STRUCTURE_TYPE_SWAPCHAIN_CALIBRATED_TIMESTAMP_INFO_EXT};
+    local.swapchain = swapchain;
+    local.presentStage = VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT;
+    local.timeDomainId = display_domain;
+    const VkCalibratedTimestampInfoKHR clocks[2] = {
+        {VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR, &local, VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT},
+        {VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR, nullptr, VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR}};
+    uint64_t stamp[2]{}, deviation = 0;
+    const VkResult res = calibrate(dev.device, 2, clocks, stamp, &deviation);
+    if (res == VK_SUCCESS && stamp[0] && stamp[1]) {
+        const uint64_t host = display_ns(stamp[1]);
+        fprintf(display_trace, "calibration,%llu,%llu,%llu,%llu,%d,%llu\n",
+                (unsigned long long)display_generation, (unsigned long long)display_sequence,
+                (unsigned long long)deviation, (unsigned long long)stamp[0], (int)display_domain_type,
+                (unsigned long long)host);
+        if (deviation <= 250000) {
+            display_calibrated_offset = int64_t(host) - int64_t(stamp[0]);
+            display_calibration_ok = true;
+        }
+    } else if (display_sequence % 120 == 0) {
+        logf("vk: display calibration unavailable result %d local %llu qpc %llu",
+             (int)res, (unsigned long long)stamp[0], (unsigned long long)stamp[1]);
+    }
+    if (!(display_stages & VK_PRESENT_STAGE_QUEUE_OPERATIONS_END_BIT_EXT)) return;
+    local.presentStage = VK_PRESENT_STAGE_QUEUE_OPERATIONS_END_BIT_EXT;
+    stamp[0] = stamp[1] = deviation = 0;
+    const VkResult queue_res = calibrate(dev.device, 2, clocks, stamp, &deviation);
+    if (queue_res == VK_SUCCESS && stamp[0] && stamp[1]) {
+        fprintf(display_trace, "calibration_queue,%llu,%llu,%llu,%llu,%d,%llu\n",
+                (unsigned long long)display_generation, (unsigned long long)display_sequence,
+                (unsigned long long)deviation, (unsigned long long)stamp[0], (int)display_domain_type,
+                (unsigned long long)display_ns(stamp[1]));
+    } else {
+        fprintf(display_trace, "calibration_queue_result,%llu,%llu,%d,%llu,0,%llu\n",
+                (unsigned long long)display_generation, (unsigned long long)display_sequence,
+                (int)queue_res, (unsigned long long)stamp[0], (unsigned long long)stamp[1]);
+    }
+}
+
+uint64_t display_convert(uint64_t stamp) {
+    if (!stamp || !display_calibration_ok) return 0;
+    if (display_domain_type == VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR) return stamp;
+    const int64_t converted = int64_t(stamp) + display_calibrated_offset;
+    const uint64_t now = display_ns(display_clock().QuadPart);
+    return converted > 0 && uint64_t(converted) <= now && now - uint64_t(converted) < 1000000000
+        ? uint64_t(converted) : 0;
+}
+
+uint64_t jinra_fifo_target(uint64_t now, uint64_t seq) {
+    if (!jinra_cadence_surface || dev.swap_mode != VK_PRESENT_MODE_FIFO_KHR || framegen_on() ||
+        !display_calibration_ok || jinra_cadence_samples < 4 ||
+        display_refresh < 2000000 || display_refresh > 17000000 ||
+        now < jinra_cadence_pixel || now - jinra_cadence_pixel > 250000000 ||
+        seq <= jinra_cadence_seq || seq - jinra_cadence_seq > 24) return 0;
+    const int cap = fps_stats::cap_rate(opts.fps_cap, getenv("HOS_FPS_MAX") ? atoi(getenv("HOS_FPS_MAX")) : 0);
+    if (cap <= 0) return 0;
+    const uint64_t period = 1000000000ull / static_cast<unsigned>(cap);
+    const uint64_t updates = (period + display_refresh / 2) / display_refresh;
+    if (updates < 2 || updates > 8) return 0;
+    const uint64_t aligned = updates * display_refresh;
+    if (aligned + 100000 < period || period + 100000 < aligned) return 0;
+    const uint64_t target = jinra_cadence_pixel + (seq - jinra_cadence_seq) * aligned;
+    // Tell the compositor about the frame immediately. Only target the next refresh
+    // when the predicted cap interval and the observed display phase agree.
+    return target > now && target - now <= display_refresh + 350000 ? target : 0;
+}
+
+void jinra_fifo_short_hold(uint64_t target) {
+    if (!target || jinra_cadence_absolute) return;
+    const uint64_t deadline = target - display_refresh + 75000;
+    const uint64_t now = display_ns(display_clock().QuadPart);
+    if (deadline <= now || deadline - now > 350000) return;
+    // The frame copy is already submitted. Stay within a small window around
+    // the preceding refresh so the compositor receives the next frame early.
+    while (display_ns(display_clock().QuadPart) < deadline) YieldProcessor();
+    static unsigned holds = 0;
+    if (++holds <= 4 || holds % 600 == 0)
+        logf("vk: FIFO cadence short hold, total %u", holds);
+}
+
+void display_sample(uint64_t id, uint64_t pixel) {
+    if (jinra_cadence_surface && id && pixel > jinra_cadence_pixel) {
+        const auto item = std::find_if(display_pending.begin(), display_pending.end(),
+            [id](const DisplayPending& p) { return p.id == id; });
+        if (item != display_pending.end() && item->seq > jinra_cadence_seq &&
+            pixel >= item->time && pixel - item->time <= 50000000) {
+            jinra_cadence_pixel = pixel;
+            jinra_cadence_seq = item->seq;
+            jinra_cadence_samples = std::min(4u, jinra_cadence_samples + 1);
+        }
+    }
+    if (id == 0 || id <= display_last_seen || pixel <= display_last_pixel ||
+        display_refresh < 3900000 || display_refresh > 4400000) return;
+    display_last_seen = id;
+    display_last_pixel = pixel;
+    const auto p = std::find_if(display_pending.begin(), display_pending.end(),
+                                [id](const DisplayPending& entry) { return entry.id == id; });
+    if (p == display_pending.end() || pixel < p->time || pixel - p->time > display_refresh + 500000) return;
+    display_delays[display_delay_index++ % display_delays.size()] = pixel - p->time;
+    display_delay_count = std::min(display_delay_count + 1, display_delays.size());
+    if (display_delay_count < display_delays.size()) return;
+    auto sorted = display_delays;
+    std::sort(sorted.begin(), sorted.end());
+    const uint64_t latency = (sorted[14] + sorted[15]) / 2;
+    display_phase_qpc.store(pixel, std::memory_order_relaxed);
+    display_phase_id.store(id, std::memory_order_relaxed);
+    display_phase_data.store((display_refresh << 32) | latency, std::memory_order_release);
+}
+}
+
+extern "C" __declspec(dllexport) int jinra_display_phase(int64_t* refresh, int64_t* latency, uint64_t* id) {
+    const auto packed = display_phase_data.load(std::memory_order_acquire);
+    const auto pixel = display_phase_qpc.load(std::memory_order_relaxed);
+    const auto now = display_ns(display_clock().QuadPart);
+    if (!packed || now < pixel || now - pixel > 400000000) return 0;
+    *refresh = packed >> 32;
+    *latency = packed & 0xffffffffu;
+    *id = display_phase_id.load(std::memory_order_relaxed);
+    return 1;
+}
+
+extern "C" __declspec(dllexport) void jinra_display_present_tag(uint64_t* chain, uint64_t* id, uint64_t* seq) {
+    *chain = display_present.chain;
+    *id = display_present.id;
+    *seq = display_present.seq;
+    display_present = {};
+}
+namespace {
+
+
+void display_collect(VkSwapchainKHR swapchain) {
+    std::array<std::array<VkPresentStageTimeEXT, 4>, display_batch> stages{};
+    std::array<VkPastPresentationTimingEXT, display_batch> reports{};
+    for (size_t i = 0; i < reports.size(); ++i) {
+        reports[i].sType = VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_EXT;
+        reports[i].presentStageCount = (uint32_t)stages[i].size();
+        reports[i].pPresentStages = stages[i].data();
+    }
+    VkPastPresentationTimingInfoEXT info{VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_INFO_EXT};
+    info.swapchain = swapchain;
+    VkPastPresentationTimingPropertiesEXT result{VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_PROPERTIES_EXT};
+    result.presentationTimingCount = (uint32_t)reports.size();
+    result.pPresentationTimings = reports.data();
+    if (display_sequence == 8 || display_sequence % 120 == 0 || !display_calibration_ok)
+        display_calibrate(swapchain);
+    const VkResult status = display_query(dev.device, &info, &result);
+    if (status != VK_SUCCESS && status != VK_INCOMPLETE) return;
+    for (uint32_t i = 0; i < result.presentationTimingCount; ++i) {
+        const auto& report = reports[i];
+        fprintf(display_trace, "report,%llu,%llu,%u,%llu,%d,%llu\n",
+                (unsigned long long)display_generation, (unsigned long long)report.presentId,
+                (unsigned)report.reportComplete, (unsigned long long)report.targetTime,
+                (int)report.timeDomain, (unsigned long long)report.presentStageCount);
+        for (uint32_t j = 0; j < report.presentStageCount; ++j) {
+            const auto& item = stages[i][j];
+            if (report.reportComplete && report.timeDomain == display_domain_type &&
+                report.timeDomainId == display_domain && item.stage == VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT)
+                display_sample(report.presentId, display_convert(item.time));
+            fprintf(display_trace, "stage,%llu,%llu,%u,%llu,%d,%llu\n",
+                    (unsigned long long)display_generation, (unsigned long long)report.presentId,
+                    item.stage, (unsigned long long)item.time, (int)report.timeDomain,
+                    (unsigned long long)report.timeDomainId);
+        }
+    }
+    if (display_sequence % 120 == 0) {
+        VkSwapchainTimingPropertiesEXT properties{VK_STRUCTURE_TYPE_SWAPCHAIN_TIMING_PROPERTIES_EXT};
+        if (display_properties && display_properties(dev.device, swapchain, &properties, nullptr) == VK_SUCCESS) {
+            display_refresh = properties.refreshDuration;
+            fprintf(display_trace, "refresh,%llu,%llu,0,%llu,0,%llu\n",
+                    (unsigned long long)display_generation, (unsigned long long)display_sequence,
+                    (unsigned long long)properties.refreshDuration, (unsigned long long)properties.refreshInterval);
+        }
+        uint64_t used = 0, budget = 0;
+        if (vram_usage_now(&used, &budget))
+            fprintf(display_trace, "vram,%llu,%llu,0,%llu,0,%llu\n",
+                    (unsigned long long)display_generation, (unsigned long long)display_sequence,
+                    (unsigned long long)used, (unsigned long long)display_clock().QuadPart);
+        fflush(display_trace);
+    }
+}
+}
+
+bool display_timing_chain(VkSwapchainCreateInfoKHR& ci) {
+    jinra_cadence_surface = jinra_cadence_absolute = false;
+    if (!display_timing_supported) return false;
+    auto caps_fn = (PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR)
+        ::vkx::instance_proc_addr()(dev.instance, "vkGetPhysicalDeviceSurfaceCapabilities2KHR");
+    if (!caps_fn) return false;
+    VkPhysicalDeviceSurfaceInfo2KHR surface{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR};
+    surface.surface = ci.surface;
+    VkSurfaceCapabilities2KHR caps{VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR};
+    VkSurfaceCapabilitiesPresentId2KHR id2{VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_PRESENT_ID_2_KHR};
+    VkPresentTimingSurfaceCapabilitiesEXT timing{VK_STRUCTURE_TYPE_PRESENT_TIMING_SURFACE_CAPABILITIES_EXT};
+    caps.pNext = &id2;
+    id2.pNext = &timing;
+    if (caps_fn(dev.physical, &surface, &caps) != VK_SUCCESS || !id2.presentId2Supported || !timing.presentTimingSupported)
+        return false;
+    display_stages = timing.presentStageQueries;
+    jinra_cadence_surface = env_on("JINRA_TEST_FIFO_CADENCE") &&
+        (display_stages & VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT);
+    jinra_cadence_absolute = jinra_cadence_surface && jinra_absolute_present_supported && timing.presentAtAbsoluteTimeSupported;
+    if (jinra_cadence_surface)
+        logf("vk: FIFO cadence enabled, mode %s", jinra_cadence_absolute ? "display target" : "short hold");
+    ci.flags |= VK_SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR | VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT;
+    logf("vk: display trace surface stages %#x", display_stages);
+    return display_stages != 0;
+}
+
+void display_timing_created(VkSwapchainKHR swapchain, bool enabled) {
+    display_sequence = 0;
+    ++display_generation;
+    display_reset();
+    display_query = nullptr;
+    if (!enabled) return;
+    const auto setsize = (PFN_vkSetSwapchainPresentTimingQueueSizeEXT)
+        vkGetDeviceProcAddr(dev.device, "vkSetSwapchainPresentTimingQueueSizeEXT");
+    const auto domains_fn = (PFN_vkGetSwapchainTimeDomainPropertiesEXT)
+        vkGetDeviceProcAddr(dev.device, "vkGetSwapchainTimeDomainPropertiesEXT");
+    const auto query = (PFN_vkGetPastPresentationTimingEXT)
+        vkGetDeviceProcAddr(dev.device, "vkGetPastPresentationTimingEXT");
+    display_properties = (PFN_vkGetSwapchainTimingPropertiesEXT)
+        vkGetDeviceProcAddr(dev.device, "vkGetSwapchainTimingPropertiesEXT");
+    if (!setsize || !domains_fn || !query || setsize(dev.device, swapchain, 120) != VK_SUCCESS) return;
+    VkSwapchainTimeDomainPropertiesEXT domains{VK_STRUCTURE_TYPE_SWAPCHAIN_TIME_DOMAIN_PROPERTIES_EXT};
+    if (domains_fn(dev.device, swapchain, &domains, nullptr) != VK_SUCCESS || !domains.timeDomainCount) return;
+    std::vector<VkTimeDomainKHR> types(domains.timeDomainCount);
+    std::vector<uint64_t> ids(domains.timeDomainCount);
+    domains.pTimeDomains = types.data();
+    domains.pTimeDomainIds = ids.data();
+    if (domains_fn(dev.device, swapchain, &domains, nullptr) != VK_SUCCESS) return;
+    uint32_t index = domains.timeDomainCount;
+    for (uint32_t i = 0; i < domains.timeDomainCount; ++i) {
+        logf("vk: display trace time domain %d id %llu", (int)types[i], (unsigned long long)ids[i]);
+        if (types[i] == VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR) index = i;
+    }
+    if (index == domains.timeDomainCount) {
+        for (uint32_t i = 0; i < domains.timeDomainCount; ++i)
+            if (types[i] == VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT) { index = i; break; }
+    }
+    if (index == domains.timeDomainCount) return;
+    display_domain_type = types[index];
+    display_domain = ids[index];
+    if (!display_trace) {
+        display_trace = fopen(getenv("JINRA_DISPLAY_TRACE"), "w");
+        if (!display_trace) return;
+        setvbuf(display_trace, nullptr, _IOFBF, 64 * 1024);
+        fputs("kind,chain,id,stage,time,domain,aux\n", display_trace);
+    }
+    display_query = query;
 }
 
 // The present of a swapchain image whose copy is submitted, as present_image ended before; qk holds dev.present_mu
@@ -4281,6 +5143,49 @@ static bool present_out(uint32_t index, std::unique_lock<std::mutex>& qk) {
         qk.unlock();
         present_thread_drain();
         qk.lock();
+    }
+    VkPresentId2KHR id2{VK_STRUCTURE_TYPE_PRESENT_ID_2_KHR};
+    VkPresentTimingInfoEXT timing{VK_STRUCTURE_TYPE_PRESENT_TIMING_INFO_EXT};
+    VkPresentTimingsInfoEXT timings{VK_STRUCTURE_TYPE_PRESENT_TIMINGS_INFO_EXT};
+    uint64_t id = 0, fifo_target = 0;
+    if (display_query) {
+        const auto* reflex_id = static_cast<const VkPresentIdKHR*>(pi.pNext);
+        id = reflex_id ? *reflex_id->pPresentIds : display_last_id + 1;
+        if (id > display_last_id) {
+            display_last_id = id;
+            timing.timeDomainId = display_domain;
+            timing.presentStageQueries = display_stages;
+            timings.swapchainCount = 1;
+            timings.pTimingInfos = &timing;
+            id2.swapchainCount = 1;
+            id2.pPresentIds = &id;
+            id2.pNext = pi.pNext;
+            timings.pNext = &id2;
+            pi.pNext = &timings;
+            const auto now = display_clock();
+            const uint64_t seq = ++display_sequence;
+            const uint64_t host_now = display_ns(now.QuadPart);
+            fifo_target = jinra_fifo_target(host_now, seq);
+            if (jinra_cadence_absolute && fifo_target && fifo_target - host_now <= display_refresh) {
+                const int64_t target = int64_t(fifo_target) -
+                    (display_domain_type == VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR ? 0 : display_calibrated_offset);
+                if (target > 0) timing.targetTime = uint64_t(target);
+            }
+            if (timing.targetTime) {
+                timing.flags = VK_PRESENT_TIMING_INFO_PRESENT_AT_NEAREST_REFRESH_CYCLE_BIT_EXT;
+                if (display_domain_type == VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT)
+                    timing.targetTimeDomainPresentStage = VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT;
+                static unsigned targeted = 0;
+                if (++targeted <= 4 || targeted % 600 == 0)
+                    logf("vk: FIFO cadence scheduled frame %llu, total %u", (unsigned long long)seq, targeted);
+            }
+            display_pending[seq % display_pending.size()] = {id, seq, display_ns(now.QuadPart)};
+            display_present = {display_generation, id, seq};
+            fprintf(display_trace, "submit,%llu,%llu,0,%llu,0,%llu\n", (unsigned long long)display_generation,
+                    (unsigned long long)id, (unsigned long long)now.QuadPart, (unsigned long long)seq);
+        } else {
+            id = 0;
+        }
     }
     pi.waitSemaphoreCount = 1;
     pi.pWaitSemaphores = &dev.swap_rendered[index];
@@ -4301,6 +5206,7 @@ static bool present_out(uint32_t index, std::unique_lock<std::mutex>& qk) {
     const auto copy_done = [&] { return (::vkx::vkWaitForFences)(dev.device, 1, &copy, VK_TRUE, 0) == VK_SUCCESS; };
     const bool copy_was_done = copy && copy_done();
     const int64_t present_t0 = fps_breakdown_on() ? fps_clock() : 0;
+    jinra_fifo_short_hold(fifo_target);
     if (dev.present_queue_supported) {
         qk.unlock();
         std::lock_guard pq(dev.present_queue_mu);
@@ -4314,6 +5220,15 @@ static bool present_out(uint32_t index, std::unique_lock<std::mutex>& qk) {
     }
     if (res == VK_ERROR_DEVICE_LOST) device_lost();
     reflex_presented();
+    if (id) {
+#ifdef _WIN32
+        if (res == VK_SUCCESS && display_gpu_slot >= 0)
+            display_gpu_tags[display_gpu_slot] = display_present;
+#endif
+        fprintf(display_trace, "result,%llu,%llu,%d,0,0,%llu\n", (unsigned long long)display_generation,
+                (unsigned long long)id, (int)res, (unsigned long long)display_sequence);
+        if (res == VK_SUCCESS && display_sequence % 8 == 0) display_collect(dev.swapchain);
+    }
     if (res == VK_ERROR_SURFACE_LOST_KHR) {
         if (!qk.owns_lock()) qk.lock();
         invalidate_lost_surface(res);
@@ -4784,8 +5699,11 @@ std::mutex submit_order_mu;   // (captures and submits queued in the same order)
 void submit_q(const uint64_t* handles, int n, uint64_t queue) {
     FpsRender fr;   // (the FPS counter's Breakdown: the replay, on this thread)
     if (!async_on()) {
+        SubmitPhases phases("submit_phase", queue, n);
         std::lock_guard order(sync_order_mu);
+        phases.mark(phases.lock);
         ReplayPin pin;   // (the capture and the replay on the replay's core)
+        phases.mark(phases.pinned);
         // (the replay here is on the submitting thread, but the game's other threads go on writing their next frames: a pool
         // synced from guest memory later in the frame read those. The capture is taken here too)
         // on by default: without it every mirror sync read guest memory as it was at the replay, the game's later
@@ -4794,6 +5712,7 @@ void submit_q(const uint64_t* handles, int n, uint64_t queue) {
         // With it the syncs take the submits' captures, as the console's GPU sees its memory. RX_VK_SYNC_CAPTURE=0: off.
         static const bool capture = !getenv("RX_VK_SYNC_CAPTURE") || atoi(getenv("RX_VK_SYNC_CAPTURE")) != 0;
         if (capture) memory_capture_submit();
+        phases.mark(phases.snapshot);
         // (RX_VK_SUBMIT_DELAY_US=<us> (a test): a console's GPU starts later than this replay does. Does what a submission reads
         // arrive just after it, from the game's other threads?)
         static const int delay_us = getenv("RX_VK_SUBMIT_DELAY_US") ? atoi(getenv("RX_VK_SUBMIT_DELAY_US")) : 0;
@@ -4828,12 +5747,19 @@ void submit(const uint64_t* handles, int n) {
     submit_q(handles, n, 0);
 }
 void present(const nvn_tex* t, const int crop[4]) {
+    display_present = {};
+#ifdef _WIN32
+    LoadPathFrame path_frame;
+#endif
     fps_presented();   // (the FPS counter: the game's frame ends here, on its presenting thread)
     programs_presented();   // (the programs' life: whether the game is in a load)
     FpsRender fr;
     if (!async_on()) {
         std::lock_guard order(sync_order_mu);
         ReplayPin pin;   // (the frame's last replays and the present on the replay's core)
+#ifdef _WIN32
+        capture_trace::FrameCpu cpu_scope("present_cpu");
+#endif
         if (sync_waits_on()) {
             drain(0);   // (the frame's work whole before it is shown)
             update_blocked();
@@ -5096,3 +6022,30 @@ int64_t par_now_ns() {
 }
 
 } // namespace mkwvk
+
+
+#ifdef _WIN32
+namespace {
+struct LoadPathTotals {
+    uint64_t start = 0, ticks = 0, cycles = 0, count = 0;
+};
+thread_local LoadPathTotals load_path_totals[mkwvk::LOAD_DETAIL_END + 2];
+}
+void mkwvk::load_path_emit(int phase, uint64_t start, uint64_t ticks, uint64_t cycles) {
+    auto& total = load_path_totals[phase + 2];
+    if (!total.start) total.start = start;
+    total.ticks += ticks;
+    total.cycles += cycles;
+    ++total.count;
+}
+void mkwvk::load_path_flush(uint64_t frame) {
+    if (!capture_trace::file()) return;
+    const auto thread = GetCurrentThreadId();
+    for (size_t index = 0; index < mkwvk::LOAD_DETAIL_END + 2; ++index) {
+        auto& total = load_path_totals[index];
+        if (total.start)
+            capture_trace::add({"load_phase", total.start, frame, thread, index, total.ticks, total.cycles, total.count});
+        total = {};
+    }
+}
+#endif

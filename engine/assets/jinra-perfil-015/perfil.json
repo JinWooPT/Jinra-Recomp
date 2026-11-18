@@ -1,0 +1,23 @@
+{
+  "zones": [
+    "HyruleField_Child",
+    "Market_Child",
+    "KakarikoVillage_Child",
+    "KokiriForest_Child",
+    "ZoraDomain_Child",
+    "GerudoValley_Child"
+  ],
+  "inputs": {
+    "catalogue-across-orders-015.json": "e3c00ed5c5bbb9f9c67480fbe12494b7cecd58854e32b0f744eb1bf177d74203",
+    "protected-identities-trace-100.json": "0867541a4824bdb49ef6c1347f8f8ff505a4ca69caf774cb1414104c9968d32f",
+    "protected-identities-trace-102.json": "983a66226332267d1b9a086e4f38999e1a76f1ebb5e3b95da4b1bcc25901b2ff",
+    "protected-identities-trace-104.json": "d742f535929ff799f18d1ad15ab5d6f820493abb9cdb8f2e5b225761084451de",
+    "protected-identities-trace-114.json": "d15359916a0dc286e8ea7540b384e4f8f13ec3c15664a3b97af18d9fb7dd91a9",
+    "protected-identities-trace-32.json": "8bd7c0d9514a1b36935b492c35e363fa6f7a03c1ae638163f9dd1eb045e5ebfa",
+    "protected-identities-trace-35.json": "a0088a48475e0f9b6dad0758b773ade541e909d89195386fa1a968c2d44da263",
+    "protected-identities-trace-36.json": "73fd57a69dfee47b888031a9bf99a7ee8e19783aa7f6c3941a70c9a62d9fde7d",
+    "protected-identities-trace-39.json": "630cf43beb6f1905277ab06117f34dd82d55bc382c647549a9361d82655620bd",
+    "protected-identities-trace-42.json": "080991ed4cd055aed9a52649b2764d6464ab39cb02dd9e99294cf6887b62b50a",
+    "protected-identities-trace-52.json": "fe11f05e792f1e369cf3650e9669db4f88248e2e97eeb2df9975f0b42eeab3df"
+  }
+}

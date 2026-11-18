@@ -1,0 +1,4 @@
+engine/assets/jinra-perfil-015/*.json -text
+engine/assets/scene-recipes/*.txt -text
+native/licenses/dotnet/*.txt -text
+engine/host/windows_profile/*.patch text eol=lf

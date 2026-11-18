@@ -22,6 +22,7 @@
 #endif
 
 #include "vk_internal.h"
+#include "capture_trace.h"
 #include "vk_draw.h"
 #include "vk_shader.h"
 #include "vk_progcache.h"
@@ -94,6 +95,49 @@ std::unordered_set<uint64_t> index_computes;
 std::unordered_set<uint64_t> index_kept;   // (every program key jinra_programs.bin held when the index was made)
 std::unordered_map<uint64_t, std::vector<uint64_t>> index_compute_variants;   // by key: the variants play dispatched before
 std::atomic<bool> index_ready{false};
+bool early_index_enabled() {
+    static const bool enabled = env_on("RX_VK_INDEX_EARLY") && !precompile_wanted();
+    return enabled;
+}
+std::mutex early_creates_mu;
+std::vector<std::pair<uint64_t, CreatedProgram>> early_creates;
+constexpr size_t kEarlyCreateLimit = 8192;
+uint64_t early_program_limit() {
+    static const bool expanded = env_on("JINRA_TEST_TIMING_EXPANDED");
+    return (expanded ? 256ull : 64ull) << 20;
+}
+std::atomic<uint64_t> early_program_rejected{0};
+std::atomic<uint64_t> early_pipeline_rejected{0};
+std::atomic<uint64_t> early_program_bytes{0};
+std::atomic<unsigned> early_pipeline_attempts{0};
+
+bool reserve_early_programs(const std::vector<DiskRecord>& records) {
+    if (!early_index_enabled()) return true;
+    const uint64_t limit = early_program_limit();
+    uint64_t bytes = 0;
+    for (const auto& record : records) {
+        if (record.size > limit - bytes) { ++early_program_rejected; return false; }
+        bytes += record.size;
+    }
+    uint64_t reserved = early_program_bytes.load(std::memory_order_relaxed);
+    while (bytes <= limit - reserved)
+        if (early_program_bytes.compare_exchange_weak(reserved, reserved + bytes, std::memory_order_relaxed))
+            return true;
+    ++early_program_rejected;
+    return false;
+}
+
+bool reserve_early_pipeline() {
+    if (!early_index_enabled()) return true;
+    constexpr unsigned limit = 1024;
+    unsigned reserved = early_pipeline_attempts.load(std::memory_order_relaxed);
+    while (reserved < limit)
+        if (early_pipeline_attempts.compare_exchange_weak(reserved, reserved + 1, std::memory_order_relaxed))
+            return true;
+    ++early_pipeline_rejected;
+    return false;
+}
+void load_at_create(uint64_t serial, const CreatedProgram& made);
 
 /// What one create call queues: the kept variants of a program's keys and their noted pipelines, read and made by a background
 /// worker (or by the first draw that needs it, if no worker began it), then published under shader_mu
@@ -186,6 +230,7 @@ void load_work(LoadJob& job) {
             }
             recs.swap(named);
         }
+        if (!reserve_early_programs(recs)) continue;
         recs = program_cache_take(key, recs);
         std::vector<std::unique_ptr<Program>> made;
         if (job.compute) {
@@ -244,7 +289,8 @@ void load_work(LoadJob& job) {
                 }
             } else if (notes != index_notes.end()) {
                 for (const NoteAt& n : notes->second) {
-                    if (n.variant != p->variant || !pipe_note_at(notes_in, n.at, note.get())) continue;
+                    if (n.variant != p->variant || !reserve_early_pipeline() ||
+                        !pipe_note_at(notes_in, n.at, note.get())) continue;
                     bytes += (int64_t)sizeof(PipeNote);
                     if (const VkPipeline pl = source.graphics(*p, *note)) census.load_pipes += pipeline_keep_ready(n.key, pl);
                     else census.load_pipes_cold++;   // (its first draw makes it, as before)
@@ -399,6 +445,17 @@ void programs_index(std::vector<NoteRef> notes, const std::unordered_set<uint64_
          "%.1f ms (%zu kept program keys); %d workers in play, %d while the game loads; pipelines from: %s",
          notes.size(), index_notes.size(), index_signatures.size(), index_computes.size(), ms_between(t0, Clock::now()), index_kept.size(),
          workers_cap(false), workers_cap(true), pipeline_source().name());
+    if (!early_index_enabled()) return;
+    size_t replayed = 0;
+    for (;;) {
+        std::lock_guard lk(early_creates_mu);
+        if (early_creates.empty()) break;
+        auto [serial, made] = early_creates.back();
+        early_creates.pop_back();
+        load_at_create(serial, made);
+        ++replayed;
+    }
+    logf("vk: startup index: replayed %zu early create calls", replayed);
 }
 
 void programs_slow_upload(double ms, uint32_t width, uint32_t height, uint32_t nvn_format) {
@@ -467,8 +524,16 @@ void programs_load_wait(uint64_t key) {
 
 namespace {
 /// (the game's thread, at a create call) the program's unit queued if the prepare kept something for its stages
-void load_at_create(const nvn_prog& prog, const CreatedProgram& made) {
-    if (!index_ready.load(std::memory_order_acquire)) return void(census.units_early++);
+void load_at_create(uint64_t serial, const CreatedProgram& made) {
+    if (!index_ready.load(std::memory_order_acquire)) {
+        if (!early_index_enabled()) return void(census.units_early++);
+        std::lock_guard lk(early_creates_mu);
+        if (!index_ready.load(std::memory_order_acquire)) {
+            census.units_early++;
+            if (early_creates.size() < kEarlyCreateLimit) early_creates.emplace_back(serial, made);
+            return;
+        }
+    }
     uint64_t unit = made.compute ? 0x5EED : made.mesh ? 0x3E54 : 0x6A;
     for (const uint64_t c : made.codes) unit = (unit ^ c) * 1099511628211ull;
     unit |= 1;
@@ -476,7 +541,7 @@ void load_at_create(const nvn_prog& prog, const CreatedProgram& made) {
     {
         std::lock_guard lk(life_mu);
         if (const program_life::Unit* u = table.find(unit); u && u->state != program_life::State::Released) {
-            table.create(prog.serial, unit, false);   // (stages met before: loaded, loading, or nothing kept for them)
+            table.create(serial, unit, false);   // (stages met before: loaded, loading, or nothing kept for them)
             return;
         }
     }
@@ -484,7 +549,7 @@ void load_at_create(const nvn_prog& prog, const CreatedProgram& made) {
         if (index_kept.count(made.codes[0])) keys.push_back(made.codes[0]);
     } else {
         for (const Signature& sig : index_signatures) {
-            const uint64_t key = program_created_key(prog.serial, sig.vattr, sig.color_types);
+            const uint64_t key = program_created_key(serial, sig.vattr, sig.color_types);
             // (only programs a note names, as RX_VK_LOAD=start keeps ready only those; a kept program no list has a pipeline
             // of is read at its first draw, as there. RX_VK_LOAD_UNLISTED=1 loads those here too: 680 MB more host heap a
             // minute into play on the full tour, and no fewer first uses needing work)
@@ -497,7 +562,7 @@ void load_at_create(const nvn_prog& prog, const CreatedProgram& made) {
     bool queue;
     {
         std::lock_guard lk(life_mu);
-        queue = table.create(prog.serial, unit, !keys.empty());
+        queue = table.create(serial, unit, !keys.empty());
         if (queue) table.loading(unit);
     }
     if (!queue) return void(census.units_nothing += keys.empty());
@@ -547,13 +612,23 @@ void programs_play_begin() {
 void programs_created(const nvn_prog* p) {
     const bool life = programs_life_on(), load = programs_load_at_create();
     if (!p || (!life && !load)) return;
+#ifdef _WIN32
+    static const bool timing = capture_trace::file() && env_on("JINRA_TEST_TIMING");
+    if (timing) {
+        const uint64_t now = capture_trace::qpc();
+        const uint64_t frame = capture_trace::frame();
+        capture_trace::add({"prog_create", now, frame, GetCurrentThreadId(), p->serial});
+        if (life) logf("vk: timing create qpc %llu frame %llu serial %llx",
+                       (unsigned long long)now, (unsigned long long)frame, (unsigned long long)p->serial);
+    }
+#endif
     const auto t0 = Clock::now();
     double since = 0;
     const bool in_load = programs_in_load(&since);
     const long faults0 = life ? thread_major_faults() : 0;
     const CreatedProgram made = program_created_read(*p);
     const auto t_read = Clock::now();
-    if (load && made.ok) load_at_create(*p, made);
+    if (load && made.ok) load_at_create(p->serial, made);
     if (!life) return;
     Life l;
     l.created = t0, l.frame = game_presents.load(std::memory_order_relaxed), l.since_present = since;
@@ -578,6 +653,11 @@ void programs_freed(const nvn_prog* p) {
     const bool life = programs_life_on(), load = programs_load_at_create();
     if (!p || !p->serial || (!life && !load)) return;
     const auto now = Clock::now();
+    std::unique_lock early(early_creates_mu, std::defer_lock);
+    if (load && early_index_enabled()) {
+        early.lock();
+        std::erase_if(early_creates, [&](const auto& item) { return item.first == p->serial; });
+    }
     program_created_forget(p->serial);
     std::lock_guard lk(life_mu);
     if (load) table.free(p->serial);
@@ -610,6 +690,12 @@ void ProgramUse::begin(const nvn_prog& prog, bool is_compute) {
 
 void ProgramUse::end() {
     const auto t1 = Clock::now();
+#ifdef _WIN32
+    static const bool timing = capture_trace::file() && env_on("JINRA_TEST_TIMING");
+    if (timing && p && !p->failed)
+        capture_trace::add({compute ? "prog_dispatch" : "prog_draw", capture_trace::qpc(),
+                            capture_trace::frame(), GetCurrentThreadId(), serial, p->key, p->variant});
+#endif
     NeedProgram np = NeedProgram::Ready;
     if (!p || p->failed) np = NeedProgram::Failed;
     else if (!program_ready || shader_translated() != translated0) np = NeedProgram::Translated;
@@ -700,6 +786,11 @@ void programs_census_log(const char* when) {
         units = table.units(), ready = table.count(program_life::State::Ready), loading = table.count(program_life::State::Loading);
         alive = table.programs();
     }
+    if (early_index_enabled() && env_on("JINRA_TEST_TIMING"))
+        logf("vk: timing budget %s bytes %llu limit %llu denied records %llu pipeline attempts %u denied %llu",
+             when, (unsigned long long)early_program_bytes.load(), (unsigned long long)early_program_limit(),
+             (unsigned long long)early_program_rejected.load(), early_pipeline_attempts.load(),
+             (unsigned long long)early_pipeline_rejected.load());
     logf("vk: program loads at create (%s): %lld queued, %lld loaded (median %.2f ms, 99th percentile %.2f ms, worst %.2f ms, %.0f "
          "ms and %.1f MB read in all); %lld programs (%lld of them compute variants without their code, %lld graphics programs no note names), %lld graphics pipelines (%lld not in a cache), %lld compute pipelines (%lld "
          "not in a cache); a first use ran %lld itself and waited for %lld (%.1f ms); %lld pipelines made at create taken by "

@@ -10,6 +10,12 @@
 #include <atomic>
 #include <cstdlib>
 #include <vector>
+#include <cstring>
+#include <mutex>
+#include <unordered_map>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #ifndef JINRA_ENV_H   // (env_on: the switches' one rule)
 #include "jinra_env.h"
@@ -21,10 +27,167 @@ namespace mkwvk {
 
 VmaAllocator vma;
 
+namespace {
+const char* const census_prefix = std::getenv("JINRA_TEST_MEMORY_CENSUS");
+std::atomic<uint64_t> census_frame;
+thread_local const char* device_image_pool;
+struct DeviceBlock { const char* pool; uint64_t size; };
+std::mutex census_block_mu;
+std::unordered_map<VkDeviceMemory, DeviceBlock> census_blocks;
+
+VKAPI_ATTR void VKAPI_CALL census_free(VkDevice device, VkDeviceMemory memory,
+                                      const VkAllocationCallbacks* callbacks) {
+    DeviceBlock block{};
+    {
+        std::lock_guard lock(census_block_mu);
+        const auto it = census_blocks.find(memory);
+        if (it != census_blocks.end()) {
+            block = it->second;
+            census_blocks.erase(it);
+        }
+    }
+    const auto start = block.pool ? load_path_qpc() : 0;
+    vkFreeMemory(device, memory, callbacks);
+    if (block.pool) {
+        logf("vk: census free %s frame %llu qpc %llu end %llu bytes %llu", block.pool,
+             (unsigned long long)census_frame.load(), (unsigned long long)start,
+             (unsigned long long)load_path_qpc(), (unsigned long long)block.size);
+    }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL census_allocate(VkDevice device, const VkMemoryAllocateInfo* info,
+                                              const VkAllocationCallbacks* callbacks, VkDeviceMemory* memory) {
+    if (!device_image_pool) return vkAllocateMemory(device, info, callbacks, memory);
+    const uint64_t begin = load_path_qpc();
+    const VkResult result = vkAllocateMemory(device, info, callbacks, memory);
+    const uint64_t end = load_path_qpc();
+    if (result == VK_SUCCESS && (std::strcmp(device_image_pool, "render-targets") == 0 ||
+                                 std::strcmp(device_image_pool, "render-targets-small") == 0)) {
+        std::lock_guard lock(census_block_mu);
+        census_blocks.emplace(*memory, DeviceBlock{device_image_pool, info->allocationSize});
+    }
+    logf("vk: census allocate %s frame %llu qpc %llu end %llu bytes %llu result %d", device_image_pool,
+         (unsigned long long)census_frame.load(), (unsigned long long)begin, (unsigned long long)end,
+         (unsigned long long)info->allocationSize, (int)result);
+    return result;
+}
+}  // namespace
+
+#ifdef _WIN32
+namespace {
+
+struct MappingEvent {
+    uint64_t qpc;
+    uint64_t memory;
+    uint64_t address;
+    uint64_t allocation_base;
+    uint64_t offset;
+    uint64_t bytes;
+    uint32_t memory_type;
+    char operation;
+};
+
+constexpr size_t mapping_event_capacity = 32768;
+MappingEvent mapping_events[mapping_event_capacity]{};
+std::atomic<bool> mapping_event_ready[mapping_event_capacity]{};
+std::atomic<size_t> mapping_event_count{};
+const char* mapping_output = nullptr;
+PFN_vkUnmapMemory unmap_memory = nullptr;
+
+void record_mapping(char operation, VkDeviceMemory memory, void* address, uint64_t offset,
+                    uint64_t bytes, uint32_t memory_type, void* allocation_base = nullptr) {
+    if (!mapping_output) return;
+    const size_t index = mapping_event_count.fetch_add(1, std::memory_order_relaxed);
+    if (index >= mapping_event_capacity) return;
+    mapping_events[index] = {load_path_qpc(), (uint64_t)(uintptr_t)memory, (uint64_t)(uintptr_t)address,
+                             (uint64_t)(uintptr_t)allocation_base, offset, bytes, memory_type, operation};
+    mapping_event_ready[index].store(true, std::memory_order_release);
+}
+
+void save_mappings() {
+    FILE* stream = std::fopen(mapping_output, "wb");
+    if (!stream) return;
+    std::fputs("qpc,op,memory,address,allocation_base,offset,bytes,memory_type\n", stream);
+    const size_t total = mapping_event_count.load(std::memory_order_acquire);
+    const size_t used = std::min(total, mapping_event_capacity);
+    size_t incomplete = 0;
+    for (size_t index = 0; index < used; ++index) {
+        if (!mapping_event_ready[index].load(std::memory_order_acquire)) {
+            ++incomplete;
+            continue;
+        }
+        const auto& event = mapping_events[index];
+        std::fprintf(stream, "%llu,%c,%llx,%llx,%llx,%llu,%llu,%u\n", (unsigned long long)event.qpc,
+                     event.operation, (unsigned long long)event.memory, (unsigned long long)event.address,
+                     (unsigned long long)event.allocation_base,
+                     (unsigned long long)event.offset, (unsigned long long)event.bytes, event.memory_type);
+    }
+    std::fprintf(stream, "# lost=%llu\n", (unsigned long long)(total - used + incomplete));
+    std::fclose(stream);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL mapped_allocate(VkDevice device, const VkMemoryAllocateInfo* info,
+                                              const VkAllocationCallbacks* callbacks, VkDeviceMemory* memory) {
+    const VkResult result = census_prefix ? census_allocate(device, info, callbacks, memory)
+                                         : vkAllocateMemory(device, info, callbacks, memory);
+    if (result == VK_SUCCESS)
+        record_mapping('A', *memory, nullptr, 0, info->allocationSize, info->memoryTypeIndex);
+    return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL mapped_free(VkDevice device, VkDeviceMemory memory,
+                                     const VkAllocationCallbacks* callbacks) {
+    if (census_prefix) census_free(device, memory, callbacks);
+    else vkFreeMemory(device, memory, callbacks);
+    record_mapping('F', memory, nullptr, 0, 0, 0);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL mapped_map(VkDevice device, VkDeviceMemory memory, VkDeviceSize offset,
+                                         VkDeviceSize bytes, VkMemoryMapFlags flags, void** data) {
+    const VkResult result = vkMapMemory(device, memory, offset, bytes, flags, data);
+    if (result == VK_SUCCESS) {
+        MEMORY_BASIC_INFORMATION region{};
+        VirtualQuery(*data, &region, sizeof region);
+        record_mapping('M', memory, *data, offset, bytes, 0, region.AllocationBase);
+    }
+    return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL mapped_unmap(VkDevice device, VkDeviceMemory memory) {
+    unmap_memory(device, memory);
+    record_mapping('U', memory, nullptr, 0, 0, 0);
+}
+
+void observe_vma_mappings(VmaVulkanFunctions& functions) {
+    const char* path = std::getenv("JINRA_TEST_VMA_MAPPINGS");
+    if (!path || !*path) return;
+    unmap_memory = reinterpret_cast<PFN_vkUnmapMemory>(functions.vkGetDeviceProcAddr(dev.device, "vkUnmapMemory"));
+    if (!unmap_memory || std::atexit(save_mappings) != 0) return;
+    mapping_output = path;
+    functions.vkAllocateMemory = mapped_allocate;
+    functions.vkFreeMemory = mapped_free;
+    functions.vkMapMemory = mapped_map;
+    functions.vkUnmapMemory = mapped_unmap;
+    for (uint32_t type = 0; type < dev.memory.memoryTypeCount; ++type) {
+        const auto& properties = dev.memory.memoryTypes[type];
+        logf("Jinra VMA mapping type=%u heap=%u flags=%u", type, properties.heapIndex, properties.propertyFlags);
+    }
+}
+
+} // namespace
+#endif
+
 bool vma_init(PFN_vkGetInstanceProcAddr gipa) {
     VmaVulkanFunctions f{};
     f.vkGetInstanceProcAddr = gipa;
     f.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
+    if (census_prefix) {
+        f.vkAllocateMemory = census_allocate;
+        f.vkFreeMemory = census_free;
+    }
+#ifdef _WIN32
+    observe_vma_mappings(f);
+#endif
     VmaAllocatorCreateInfo ci{};
     ci.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT |
                (dev.memory_budget ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0);
@@ -52,6 +215,8 @@ const uint64_t kImageBlock = (getenv("RX_VK_IMAGE_BLOCK_MB") ? (uint64_t)std::ma
 // pool's 47-54 blocks (6-6.9 GB) held 1.9-3.6 GB of images in Kokiri Forest, VRAM sat at 93-98% of what the driver allows, and an
 // image made there then took 30-70 ms (RTX 5070). RX_VK_TARGET_BLOCKS=0: in the textures' blocks, as before
 VmaPool target_image_pool = VK_NULL_HANDLE;
+VmaPool small_target_image_pool = VK_NULL_HANDLE;
+uint32_t target_memory_type;
 bool target_pool_tried = false;
 VmaPool images_pool();
 VmaPool target_images_pool() {
@@ -75,6 +240,15 @@ VmaPool target_images_pool() {
     pi.memoryTypeIndex = type;
     pi.blockSize = kImageBlock;
     if (vmaCreatePool(vma, &pi, &target_image_pool) != VK_SUCCESS) target_image_pool = VK_NULL_HANDLE;
+    if (census_prefix && target_image_pool) vmaSetPoolName(vma, target_image_pool, "render-targets");
+    if (target_image_pool && env_on("RX_VK_RT_SMALL_POOL")) {
+        pi.blockSize = 16ull << 20;
+        if (vmaCreatePool(vma, &pi, &small_target_image_pool) == VK_SUCCESS) {
+            target_memory_type = type;
+            if (census_prefix) vmaSetPoolName(vma, small_target_image_pool, "render-targets-small");
+            logf("vk: small render targets use 16 MiB blocks, memory type %u", type);
+        }
+    }
     logf("vk: render targets' images from blocks of their own (%llu MB, memory type %u)%s", (unsigned long long)(kImageBlock >> 20),
          type, target_image_pool ? "" : ": not made");
     return target_image_pool;
@@ -230,7 +404,35 @@ bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& al
         VmaAllocationCreateInfo pai = ai;
         pai.pool = pool;
         pai.usage = VMA_MEMORY_USAGE_UNKNOWN;
-        if (vmaCreateImage(vma, &ci, &pai, &image, &allocation, nullptr) == VK_SUCCESS) return true;
+        if (pool == target_image_pool && small_target_image_pool && !dedicated && !ci.pNext &&
+            ci.imageType == VK_IMAGE_TYPE_2D &&
+            !(ci.flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_DISJOINT_BIT)) &&
+            uint64_t(ci.extent.width) * ci.extent.height < (2ull << 20)) {
+            static const auto requirements = reinterpret_cast<PFN_vkGetDeviceImageMemoryRequirements>(
+                vkGetDeviceProcAddr(dev.device, "vkGetDeviceImageMemoryRequirements"));
+            if (requirements) {
+                VkDeviceImageMemoryRequirements query{VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS};
+                query.pCreateInfo = &ci;
+                VkMemoryDedicatedRequirements dedicated_req{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS};
+                VkMemoryRequirements2 req{VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2, &dedicated_req};
+                requirements(dev.device, &query, &req);
+                if (req.memoryRequirements.size < (2ull << 20) && !dedicated_req.requiresDedicatedAllocation &&
+                    (req.memoryRequirements.memoryTypeBits & (1u << target_memory_type))) {
+                    pai.pool = small_target_image_pool;
+                    if (census_prefix) device_image_pool = "render-targets-small";
+                    const auto result = vmaCreateImage(vma, &ci, &pai, &image, &allocation, nullptr);
+                    device_image_pool = nullptr;
+                    if (result == VK_SUCCESS) return true;
+                    pai.pool = pool;
+                }
+            }
+        }
+        if (census_prefix) {
+            device_image_pool = pool == target_image_pool ? "render-targets" : pool == texture_pool ? "textures" : "images";
+        }
+        const VkResult result = vmaCreateImage(vma, &ci, &pai, &image, &allocation, nullptr);
+        device_image_pool = nullptr;
+        if (result == VK_SUCCESS) return true;
     }
     if (vmaCreateImage(vma, &ci, &ai, &image, &allocation, nullptr) == VK_SUCCESS) return true;
     if (ai.flags & VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT) {
@@ -253,6 +455,20 @@ bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& al
 void destroy_image(VkImage image, VmaAllocation allocation) {
     vmaDestroyImage(vma, image, allocation);
 }
+#ifdef _WIN32
+void jinra_capture_block_log(const char* label, char status, VmaAllocation allocation, uint64_t bytes,
+                             uint64_t age, uint64_t highest_fence, uint64_t completed_fence) {
+    VmaAllocationInfo2 info{};
+    vmaGetAllocationInfo2(vma, allocation, &info);
+    const auto& basic = info.allocationInfo;
+    logf("Jinra capture block %s class=%c bytes=%llu age=%llu fence=%llu completed=%llu "
+         "memory=%llx offset=%llu block=%llu type=%u dedicated=%u",
+         label, status, (unsigned long long)bytes, (unsigned long long)age,
+         (unsigned long long)highest_fence, (unsigned long long)completed_fence,
+         (unsigned long long)(uintptr_t)basic.deviceMemory, (unsigned long long)basic.offset,
+         (unsigned long long)info.blockSize, basic.memoryType, (unsigned)info.dedicatedMemory);
+}
+#endif
 uint64_t allocation_size(VmaAllocation allocation) {
     VmaAllocationInfo info{};
     if (allocation) vmaGetAllocationInfo(vma, allocation, &info);
@@ -339,6 +555,67 @@ void vma_log_image_blocks() {
              (unsigned long long)(d.unusedRangeSizeMax >> 20));
     }
 }
+void diagnostic_memory_census(uint64_t frame) {
+    if (!census_prefix || !vma) return;
+    census_frame = frame;
+    if (frame % 30) return;
+    const std::string request = std::string(census_prefix) + ".request";
+    FILE* marker = std::fopen(request.c_str(), "r");
+    if (!marker) return;
+    std::fclose(marker);
+    if (std::remove(request.c_str())) return;
+
+    const uint64_t begin = load_path_qpc();
+    const std::string file = std::string(census_prefix) + "-" + std::to_string(frame) + ".json";
+    if (FILE* output = std::fopen(file.c_str(), "wb")) {
+        char* stats = nullptr;
+        vmaBuildStatsString(vma, &stats, VK_TRUE);
+        std::fputs(stats, output);
+        vmaFreeStatsString(vma, stats);
+        std::fclose(output);
+    }
+#ifdef _WIN32
+    struct HeapTotals { DWORD size; SIZE_T allocated, committed, reserved, limit; };
+    using Summary = BOOL(WINAPI*)(HANDLE, DWORD, HeapTotals*);
+    static const auto summarize = reinterpret_cast<Summary>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
+                                                                         "HeapSummary"));
+    if (summarize) {
+        HANDLE heaps[256];
+        const DWORD count = GetProcessHeaps(256, heaps);
+        if (count && count <= 256) {
+            const HANDLE process_heap = GetProcessHeap();
+            for (DWORD i = 0; i < count; ++i) {
+                HeapTotals totals{sizeof(HeapTotals), 0, 0, 0, 0};
+                if (!summarize(heaps[i], 0, &totals)) {
+                    logf("vk: census heap failed frame %llu id %p error %lu", (unsigned long long)frame,
+                         heaps[i], (unsigned long)GetLastError());
+                    continue;
+                }
+                logf("vk: census heap frame %llu id %p main %u allocated %llu committed %llu reserved %llu",
+                     (unsigned long long)frame, heaps[i], heaps[i] == process_heap ? 1u : 0u,
+                     (unsigned long long)totals.allocated, (unsigned long long)totals.committed,
+                     (unsigned long long)totals.reserved);
+            }
+        } else {
+            logf("vk: census heap count unavailable frame %llu count %lu", (unsigned long long)frame, (unsigned long)count);
+        }
+    }
+#endif
+    uint64_t usage = 0, budget = 0;
+    const bool known = vram_usage_now(&usage, &budget);
+    VmaBudget heaps[VK_MAX_MEMORY_HEAPS]{};
+    vmaGetHeapBudgets(vma, heaps);
+    for (uint32_t h = 0; h < dev.memory.memoryHeapCount; ++h) {
+        logf("vk: census heap-budget frame %llu heap %u local %u usage %llu blocks %llu allocations %llu",
+             (unsigned long long)frame, h, (dev.memory.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) ? 1u : 0u,
+             (unsigned long long)heaps[h].usage, (unsigned long long)heaps[h].statistics.blockBytes,
+             (unsigned long long)heaps[h].statistics.allocationBytes);
+    }
+    logf("vk: census sample frame %llu qpc %llu end %llu usage %llu budget %llu known %u",
+         (unsigned long long)frame, (unsigned long long)begin, (unsigned long long)load_path_qpc(),
+         (unsigned long long)usage, (unsigned long long)budget, known ? 1u : 0u);
+}
+
 void vma_log_heaps() {
     VmaBudget b[VK_MAX_MEMORY_HEAPS]{};
     vmaGetHeapBudgets(vma, b);

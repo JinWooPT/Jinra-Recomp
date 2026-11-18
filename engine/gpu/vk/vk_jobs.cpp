@@ -129,7 +129,8 @@ void jobs_notify() {
     std::lock_guard lk(mu);
     done_cv.notify_all();
 }
-void jobs_wait(const std::atomic<bool>& flag) {
+bool jobs_wait(const std::atomic<bool>& flag) {
+    bool ran_here = false;
     std::unique_lock lk(mu);
     // (still queued: run here, now. A draw that must wait for its pipeline waited for every job queued before it, and a new
     // area queues a hundred pipelines: with ten workers at 0.3-2 s a build, frames stopped for 6-12 s, the draw's own build
@@ -142,12 +143,14 @@ void jobs_wait(const std::atomic<bool>& flag) {
                 queue.erase(it);
                 lk.unlock();
                 run_guarded(fn);
+                ran_here = true;
                 pending--;
                 jobs_notify();
                 lk.lock();
                 break;
             }
     done_cv.wait(lk, [&] { return flag.load(std::memory_order_acquire); });
+    return ran_here;
 }
 bool jobs_wait_for(const std::atomic<bool>& flag, double ms) {
     if (flag.load(std::memory_order_acquire)) return true;

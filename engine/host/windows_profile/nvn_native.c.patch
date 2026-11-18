@@ -1,0 +1,121 @@
+--- nvn_native.c
++++ nvn_native.c
+@@ -19,6 +19,7 @@
+    own procs (program builders, native images, sparse tile layouts, recording modes). The SDK's exports reach the
+    same functions as the proc table (nvn2_dispatch, from gen/nvn2_exports.c). */
+ #include "hos.h"
++#include "jinra_gap.h"
+ #include "../gpu/render/rx_nvn.h"
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -310,7 +311,7 @@
+     o->gpu = b->mem;
+     hos_gpu_track(o->gpu, o->size, 1);   /* (the CPU's writes to it reach the renderer through write watch) */
+     rx_nvn_pool_created(o->gpu, o->size);
+-    void hos_prompts_pool(uint64_t mem, uint64_t size);   /* (prompts.c: the button prompts' textures, changed in place) */
++    void hos_prompts_pool(uint64_t mem, uint64_t size);   /* (jinra, prompts.c: the button prompts' textures, changed in place) */
+     hos_prompts_pool(o->mem, o->size);
+     OLOG("pool %#llx size %#llx flags %#x", (unsigned long long)o->gpu, (unsigned long long)o->size, o->flags);
+     RET(1);
+@@ -349,7 +350,7 @@
+         ReleaseSRWLockExclusive(&vmap_lock);
+     } else if (o->mem) {
+         hos_gpu_track(o->gpu, o->size, 0);
+-        void hos_prompts_pool_gone(uint64_t mem);   /* (prompts.c: the prompts' textures no longer written there) */
++        void hos_prompts_pool_gone(uint64_t mem);   /* (jinra, prompts.c: the prompts' textures no longer written there) */
+         hos_prompts_pool_gone(o->mem);
+     }
+     o->magic = 0;
+@@ -470,7 +471,7 @@
+     RET(1);
+ }
+ NV(nvnBufferFinalize) { memset(P(0), 0, sizeof(nvn_buffer)); }
+-/* (issue 287) A buffer with no memory pool, mapped: the game filled 0x3d0 bytes at what it got back, 0, and crashed
++/* (jinra, issue 287) A buffer with no memory pool, mapped: the game filled 0x3d0 bytes at what it got back, 0, and crashed
+    on a scene change (Hyrule Castle / Castle Town / Hyrule Field, Kakariko day to night; thread OptimizeChangeBanc, right after
+    "flags of no memory pool"). Zeroed scratch memory in the game's address space instead, as large as the biggest asked for
+    (never freed: it comes rarely), and who asked, once. */
+@@ -609,7 +610,7 @@
+ static int storage_class(const nvn_texdesc *d) { return d->target == NVN_TEXTURE_TARGET_BUFFER ? 0 : 1; }
+ NV(nvnTextureBuilderGetStorageClass) { RET(storage_class(&CTB(P(0))->d)); }
+ NV(nvnTextureBuilderGetFlags) { RET((uint32_t)CTB(P(0))->d.flags); }
+-/* (issues 284 and 287) A size or alignment asked of no builder: the game passed 0 here while a scene loaded (thread
++/* (jinra, issues 284 and 287) A size or alignment asked of no builder: the game passed 0 here while a scene loaded (thread
+    OptimizeChangeBanc, entering Castle Town), and the format read at +4 of it crashed the game. Size 0 then, and who asked, once */
+ static int no_builder(Ctx *c, const char *what) {
+     if (c->x[0]) return 0;
+@@ -1115,6 +1116,10 @@
+     const int away = hos_vcore_away();
+     const int64_t t0 = hos_now_ns();
+     const int ok = rx_nvn_wait(s->fence, block ? ~0ull >> 1 : U64(1));
++    if (jinra_gap_enabled) {
++        const int64_t done = hos_now_ns();
++        JINRA_GAP_LONG("nvn_sync", t0, done, 0, 0, s->fence, c->x[30]);
++    }
+     wait_note(ok ? 0 : 1, t0);
+     if (away) hos_vcore_back();
+     RET(ok ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED);
+@@ -1139,7 +1144,7 @@
+     return 1;
+ }
+ NV(nvnEventGetValue) {
+-    {   /* (experiment) HOS_PRESENT_NOWAIT=1: OoT's present poll (hos_thread.c present_poll) sees its frame's
++    {   /* (jinra, experiment) HOS_PRESENT_NOWAIT=1: OoT's present poll (hos_thread.c present_poll) sees its frame's
+            event signalled at once: the replay reads memory as submitted, so the game may go on to the next frame
+            while this one is replayed, as far as the window's textures and the replay's queue let it */
+         static int nowait = -1;
+@@ -1192,6 +1197,10 @@
+     const int away = hos_vcore_away();
+     const int64_t t0 = hos_now_ns();
+     rx_nvn_finish();
++    if (jinra_gap_enabled) {
++        const int64_t done = hos_now_ns();
++        JINRA_GAP_LONG("nvn_finish", t0, done, 0, 0, P(0) ? U64(0) : 0, c->x[30]);
++    }
+     wait_note(2, t0);
+     if (away) hos_vcore_back();
+ }
+@@ -2161,7 +2170,7 @@
+     set_view(&r->view, &r->has_view, U64(3));
+     r->r = *(const NVNcopyRegion *)P(4);
+     r->flags = I(5);
+-    {   /* (RX_VK_LOG_B2T=1) who records the big copies: the caller's chain, each new source once */
++    {   /* (jinra, RX_VK_LOG_B2T=1) who records the big copies: the caller's chain, each new source once */
+         static int on = -1;
+         if (on < 0) on = env_on("RX_VK_LOG_B2T");
+         static uint64_t seen[16];
+@@ -2383,8 +2392,15 @@
+            core is given up for it, as Present and AcquireTexture do, so the game's other threads run on it meanwhile.
+            Nothing in the replay runs guest code or needs the core) */
+         const int away = hos_vcore_away();
++        const int64_t gap_begin = JINRA_GAP_NOW();
+         rx_nvn_submit_q(h, n, (uint64_t)(uintptr_t)q);
++        const int64_t replay_done = JINRA_GAP_NOW();
+         if (away) hos_vcore_back();
++        if (gap_begin) {
++            const int64_t back = hos_now_ns();
++            JINRA_GAP_LONG("nvn_submit", gap_begin, replay_done, 0, 0, U64(0), c->x[30]);
++            JINRA_GAP_LONG("nvn_submit_back", replay_done, back, 0, 0, U64(0), c->x[30]);
++        }
+         return;
+     }
+     EnterCriticalSection(&held_cs);
+@@ -2485,7 +2501,10 @@
+     {
+         const int away = hos_vcore_away();
+         hos_vi_native_acquire(o->active ? o->active : o->ntex);
++        const int64_t ready = JINRA_GAP_NOW();
++        if (ready) jinra_gap_note("acquire_ready", 0, ready, 0, 0, away, c->x[30]);
+         if (away) hos_vcore_back();
++        if (ready) jinra_gap_note("acquire_back", ready, hos_now_ns(), 0, 0, away, c->x[30]);
+     }
+     /* the acquire sync: this texture is no longer read by the display path (presents copy it in GPU order) */
+     if (s) s->fenced = 3, s->fence = 0;
+@@ -2499,6 +2518,7 @@
+     const int trace = hos_vi_present_trace_enabled();
+     int64_t phases[4] = {0};
+     if (trace) phases[0] = hos_now_ns();
++    if (jinra_gap_enabled) jinra_gap_note("present_begin", 0, phases[0], 0, 0, 0, c->x[30]);
+     held_flush();   /* (a present flushes the queue) */
+     {
+         const int away = hos_vcore_away();

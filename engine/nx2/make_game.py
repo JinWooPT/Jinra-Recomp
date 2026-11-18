@@ -2441,6 +2441,31 @@ def main(a=None):
         if os.path.exists(src):
             staged.append((src, os.path.join(game_dir, n)))
     staged.append((os.path.join(work, "sa", "image", "image.bin"), os.path.join(out, "image.bin")))
+
+    if not LINUX:
+        assets = os.path.join(ROOT, "assets")
+        support = os.path.join(assets, "jinra-perfil-015")
+        plans = os.path.join(assets, "scene-recipes")
+        if not os.path.isfile(os.path.join(support, "gestao.py")):
+            fail("The game memory profile is missing from the build kit.")
+        profile_files = [(os.path.join(folder, name), os.path.join(out, "jinra-perfil-015",
+                          os.path.relpath(os.path.join(folder, name), support)))
+                         for folder, _, names in os.walk(support) for name in sorted(names)
+                         if "__pycache__" not in os.path.relpath(folder, support).split(os.sep) and not name.endswith(".pyc")]
+        for source, relative in (("hyrule-field.txt", "jinra_planicie_pipelines.txt"),
+                                 ("hyrule-field.txt", "jinra-previa-ram/planicie.txt"),
+                                 ("hyrule-field-priority.txt", "jinra_planicie_prioritarias.txt"),
+                                 ("kakariko.txt", "jinra-previa-ram/kakariko.txt")):
+            profile_files.append((os.path.join(plans, source), os.path.join(out, relative)))
+        cache_dir = os.path.join(out, "jinra-previa-ram", "driver")
+        check_cache_paths(out, [cache_dir, os.path.dirname(cache_dir)] +
+                          [path for _, dst in profile_files for path in (dst, os.path.dirname(dst), dst + ".new")])
+        os.makedirs(cache_dir, exist_ok=True)
+        for source, destination in profile_files:
+            if not os.path.isfile(source):
+                fail("Incomplete game profile: " + source)
+            os.makedirs(os.path.dirname(destination), exist_ok=True)
+        staged.extend(profile_files)
     if launcher:
         staged.append((launcher, os.path.join(out, BESIDE[0])))
     for src, dst in staged:

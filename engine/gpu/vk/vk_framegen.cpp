@@ -518,7 +518,7 @@ void display_main() {
 // The last sets' makers (framegen_maker): each framegen_record notes its set's on the replay thread; the menu's
 // thread reads the counts. A ring of kMakerSets, the counts of each maker in it
 constexpr int kMakerSets = 64;
-std::atomic<int> maker_count[4] = {kMakerSets, 0, 0, 0};
+std::atomic<int> maker_count[5] = {kMakerSets, 0, 0, 0};
 uint8_t maker_ring[kMakerSets] = {};
 int maker_pos = 0;
 std::atomic<int64_t> maker_at{0};
@@ -540,6 +540,8 @@ FgMaker framegen_maker() {
     const int b = maker_count[(int)FgMaker::BuiltIn].load(std::memory_order_relaxed);
     const int d = maker_count[(int)FgMaker::Dlss].load(std::memory_order_relaxed);
     const int f = maker_count[(int)FgMaker::Fsr3].load(std::memory_order_relaxed);
+    const int a = maker_count[(int)FgMaker::Anr].load(std::memory_order_relaxed);
+    if (a && a >= b && a >= d && a >= f) return FgMaker::Anr;
     if (!b && !d && !f) return FgMaker::None;
     return d >= b && d >= f ? FgMaker::Dlss : f >= b ? FgMaker::Fsr3 : FgMaker::BuiltIn;
 }
@@ -885,7 +887,7 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
         for (int k = 0; k < m - 1; k++) outs[k] = set->frame[k].image, views[k] = set->frame[k].view;
         set->made = dlss_fg_frames(cmd, fg.frames[cur].image, fg.frames[cur].view, uw, uh, m - 1, outs, views, blend, sequence);
     }
-    FgMaker maker = set->made ? FgMaker::Dlss : FgMaker::None;
+    FgMaker maker = set->made ? (anr_fg_made_last_set() ? FgMaker::Anr : FgMaker::Dlss) : FgMaker::None;
     // At 2x, AMD FSR 3.1's frame interpolation where it runs; it makes the midpoint only, so 3x and more (and Auto,
     // above) stay with the interpolation below, as does any present it does not take
     if (set->made == 0 && blend && m == 2 && fsr3fi::frames_wanted()) set->made = fsr3fi_frame(cmd, *set, cur, uw, uh, sequence);

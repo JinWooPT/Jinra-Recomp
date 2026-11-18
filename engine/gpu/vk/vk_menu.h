@@ -5,7 +5,7 @@
 
 namespace mkwvk {
 
-enum FramegenEngine { FG_ENGINE_AUTO, FG_ENGINE_BUILT_IN, FG_ENGINE_FSR31 };
+enum FramegenEngine { FG_ENGINE_AUTO, FG_ENGINE_BUILT_IN, FG_ENGINE_FSR31, FG_ENGINE_ANR };
 
 // (out of the box every feature is off: what the game does on its own. The ini beside the executable keeps a player's choices)
 struct Options {

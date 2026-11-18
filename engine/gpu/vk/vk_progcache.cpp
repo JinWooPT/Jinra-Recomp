@@ -38,9 +38,13 @@
 #include "fallback_loaded.h"
 #include "fallback_size_policy.h"
 #include "vk_paths.h"
+#include "capture_trace.h"
 #include "vk_internal.h"
 #include "vk_progcache.h"
 #include "vk_programs.h"
+#include <map>
+#include <shared_mutex>
+#include "jinra-lazy-graphics-shaders.h"
 
 namespace mkwvk {
 
@@ -441,6 +445,172 @@ bool program_cache_payload(const uint8_t* stored, size_t stored_size, uint32_t k
 }
 
 /// The kept variants of key read from the file (in: a handle on it, used under mu when given) and made ready, to variants
+#ifdef _WIN32
+namespace {
+struct ProgramReadTiming {
+    bool enabled;
+    uint64_t key, bytes, start = 0, cycles = 0, lock_end = 0, lock_cycles = 0, io_end = 0, io_cycles = 0;
+    ProgramReadTiming(uint64_t program, uint64_t size) : enabled(on()), key(program), bytes(size) {
+        if (enabled) {
+            start = capture_trace::qpc();
+            cycles = capture_trace::thread_cycles();
+        }
+    }
+    static bool on() {
+        static const bool enabled = capture_trace::file() && env_on("JINRA_TEST_PROGRAM_IO");
+        return enabled;
+    }
+    void locked() {
+        if (enabled) lock_end = capture_trace::qpc(), lock_cycles = capture_trace::thread_cycles();
+    }
+    void read() {
+        if (enabled) io_end = capture_trace::qpc(), io_cycles = capture_trace::thread_cycles();
+    }
+    ~ProgramReadTiming() {
+        if (enabled && io_end) {
+            const uint64_t end = capture_trace::qpc();
+            const uint64_t end_cycles = capture_trace::thread_cycles();
+            capture_trace::add({"program_read", start, capture_trace::frame(), GetCurrentThreadId(), key, bytes,
+                                lock_end - start, io_end - lock_end, end - io_end, lock_cycles - cycles,
+                                io_cycles - lock_cycles, end_cycles - io_cycles, use_counters.background});
+        }
+    }
+};
+}
+#endif
+
+// The plain program cache is append-only. Keep offsets and identifiers for discarded module creation.
+namespace {
+
+std::shared_mutex jinra_graphics_reference_mutex;
+std::map<std::pair<uint64_t, uint64_t>, JinraGraphicsReferences> jinra_graphics_references;
+std::atomic<uint64_t> jinra_deferred_modules{0};
+std::atomic<uint64_t> jinra_eager_mesh_programs{0};
+std::atomic<uint64_t> jinra_reconstructed_modules{0};
+std::atomic<uint64_t> jinra_identifier_hits{0};
+std::atomic<uint64_t> jinra_identifier_misses{0};
+
+PFN_vkGetShaderModuleCreateInfoIdentifierEXT jinra_identifier_from_code() {
+    static const auto query = []() -> PFN_vkGetShaderModuleCreateInfoIdentifierEXT {
+        if (!env_on("JINRA_TEST_LAZY_GRAPHICS_MODULES") || env_on("RX_VK_GPL") ||
+            !dev.vk13.pipelineCreationCacheControl) return nullptr;
+        const auto proc = reinterpret_cast<PFN_vkGetShaderModuleCreateInfoIdentifierEXT>(
+            vkGetDeviceProcAddr(dev.device, "vkGetShaderModuleCreateInfoIdentifierEXT"));
+        logf("Jinra lazy graphics modules active=%u", proc ? 1u : 0u);
+        return proc;
+    }();
+    return query;
+}
+
+}  // namespace
+
+namespace {
+std::atomic<bool> jinra_late_graphics_armed{false};
+
+bool jinra_wait_to_defer_graphics() {
+    static const bool late = env_on("JINRA_TEST_LATE_GRAPHICS_DEFER");
+    return late && !jinra_late_graphics_armed.load(std::memory_order_acquire);
+}
+}  // namespace
+
+void jinra_defer_graphics_after_checkpoint(const char* label) {
+    if (!jinra_wait_to_defer_graphics() || std::strcmp(label, "zone_02_post")) return;
+    const auto armed = !jinra_late_graphics_armed.exchange(true, std::memory_order_release);
+    if (armed) logf("Jinra graphics deferral enabled after the Kakariko census");
+}
+
+bool jinra_lazy_graphics_enabled() { return jinra_identifier_from_code() != nullptr; }
+
+void jinra_identify_shader(const std::vector<uint32_t>& words, JinraShaderReference& stage) {
+    VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    info.codeSize = words.size() * sizeof(uint32_t);
+    info.pCode = words.data();
+    jinra_identifier_from_code()(dev.device, &info, &stage.identifier);
+}
+
+bool jinra_keep_graphics_references(const Program& program, const JinraGraphicsReferences& refs) {
+    if (!refs.size) return false;
+    for (uint32_t i = 0; i < refs.size; ++i) {
+        if (!refs.stages[i].identifier.identifierSize ||
+            refs.stages[i].identifier.identifierSize > VK_MAX_SHADER_MODULE_IDENTIFIER_SIZE_EXT || !refs.stages[i].words)
+            return false;
+    }
+    for (uint32_t i = 0; i < refs.size; ++i) {
+        constexpr auto mesh_stages = VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT;
+        if (refs.stages[i].stage & mesh_stages) {
+            jinra_eager_mesh_programs.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+    }
+    const auto key = std::pair(program.key, program.variant);
+    std::unique_lock lock(jinra_graphics_reference_mutex);
+    const auto [record, inserted] = jinra_graphics_references.try_emplace(key, refs);
+    if (!inserted) {
+        const auto& saved = record->second;
+        if (saved.size != refs.size) return false;
+        for (uint32_t i = 0; i < refs.size; ++i) {
+            const auto& old = saved.stages[i];
+            const auto& current = refs.stages[i];
+            if (old.stage != current.stage || old.identifier.identifierSize != current.identifier.identifierSize ||
+                std::memcmp(old.identifier.identifier, current.identifier.identifier, current.identifier.identifierSize))
+                return false;
+        }
+    }
+    jinra_deferred_modules.fetch_add(refs.size, std::memory_order_relaxed);
+    return true;
+}
+
+bool jinra_read_graphics_references(const Program& program, JinraGraphicsReferences& refs) {
+    std::shared_lock lock(jinra_graphics_reference_mutex);
+    const auto record = jinra_graphics_references.find(std::pair(program.key, program.variant));
+    if (record == jinra_graphics_references.end()) return false;
+    refs = record->second;
+    return true;
+}
+
+VkShaderModule jinra_load_graphics_module(const JinraShaderReference& stage) {
+    // One handle per thread, independent from the main cache read and its lock.
+    static thread_local std::unique_ptr<FILE, decltype(&std::fclose)> file(std::fopen(disk_path.c_str(), "rb"), std::fclose);
+    if (!file || _fseeki64(file.get(), stage.offset, SEEK_SET)) return VK_NULL_HANDLE;
+    std::vector<uint32_t> code(stage.words);
+    if (std::fread(code.data(), sizeof(uint32_t), code.size(), file.get()) != code.size()) return VK_NULL_HANDLE;
+    const VkShaderModule module = make_module(code);
+    if (module) jinra_reconstructed_modules.fetch_add(1, std::memory_order_relaxed);
+    return module;
+}
+
+void jinra_lazy_graphics_result(bool hit) {
+    (hit ? jinra_identifier_hits : jinra_identifier_misses).fetch_add(1, std::memory_order_relaxed);
+}
+
+extern "C" void jinra_lazy_graphics_stats() {
+    logf("Jinra lazy graphics mesh programmes kept eager=%llu",
+         (unsigned long long)jinra_eager_mesh_programs.load(std::memory_order_relaxed));
+    if (!jinra_deferred_modules.load()) return;
+    logf("Jinra lazy graphics modules deferred=%llu restored=%llu hits=%llu misses=%llu",
+         (unsigned long long)jinra_deferred_modules.load(), (unsigned long long)jinra_reconstructed_modules.load(),
+         (unsigned long long)jinra_identifier_hits.load(), (unsigned long long)jinra_identifier_misses.load());
+}
+
+bool jinra_graphics_known_miss(const Program& program) {
+    static const auto misses = [] {
+        std::vector<uint64_t> keys;
+        const char* cursor = std::getenv("JINRA_TEST_GRAPHICS_KNOWN_MISSES");
+        if (!cursor) return keys;
+        while (*cursor && keys.size() < 65536) {
+            char* end = nullptr;
+            const uint64_t key = std::strtoull(cursor, &end, 16);
+            if (end == cursor) break;
+            keys.push_back(key);
+            cursor = end;
+        }
+        std::sort(keys.begin(), keys.end());
+        logf("Jinra selective graphics deferral kept %zu program keys eager", keys.size());
+        return keys;
+    }();
+    return std::binary_search(misses.begin(), misses.end(), program.key);
+}
+
 void program_cache_read(FILE* in, std::mutex* mu, uint64_t key, const std::vector<DiskRecord>& recs,
                         std::vector<std::unique_ptr<Program>>& variants) {
     for (const DiskRecord& d : recs) {
@@ -455,11 +625,21 @@ void program_cache_read(FILE* in, std::mutex* mu, uint64_t key, const std::vecto
         } counted;
         const size_t head_size = disk_zstd ? kZstdHead : 16;
         std::vector<uint8_t> data(head_size + d.size);   // (with its head: the key, size and kind are checked against the file's)
+#ifdef _WIN32
+        ProgramReadTiming timing(key, data.size());
+#endif
         {
             std::unique_lock<std::mutex> lk;
             if (mu) lk = std::unique_lock<std::mutex>(*mu);
+#ifdef _WIN32
+            timing.locked();
+#endif
             _fseeki64(in, d.at - (int64_t)head_size, SEEK_SET);
-            if (fread(data.data(), 1, data.size(), in) != data.size()) continue;
+            const size_t read = fread(data.data(), 1, data.size(), in);
+#ifdef _WIN32
+            timing.read();
+#endif
+            if (read != data.size()) continue;
         }
         uint64_t head[2];
         std::memcpy(head, data.data(), 16);
@@ -488,6 +668,10 @@ void program_cache_read(FILE* in, std::mutex* mu, uint64_t key, const std::vecto
         get_head(r, *p);
         p->variant = answers_hash(*p);
         const uint64_t n = r.count(1);
+        JinraGraphicsReferences deferred{};
+        const bool try_deferred = !p->compute && !p->fallback && !disk_zstd &&
+                                  jinra_lazy_graphics_enabled() && !jinra_graphics_known_miss(*p) &&
+                                  !jinra_wait_to_defer_graphics();
         bool ok = !r.bad && n <= 8;   // (a program has at most a few stages)
         for (uint64_t k = 0; ok && k < n; k++) {
             p->stages.emplace_back();
@@ -496,17 +680,35 @@ void program_cache_read(FILE* in, std::mutex* mu, uint64_t key, const std::vecto
             st.vk_stage = r.get<VkShaderStageFlagBits>();
             std::vector<uint32_t> spirv;
             r.list(spirv);
+            const auto code_end = r.p;
             r.list(st.c1);
             get_info(r, st.info);
             if (r.bad || spirv.empty()) {
                 ok = false;
                 break;
             }
-            st.module = make_module(spirv);
             st.phis = fallback_size::spirv_phis(spirv.data(), spirv.size());
-            ok = ok && st.module;
+            if (try_deferred) {
+                auto& ref = deferred.stages[deferred.size++];
+                ref.stage = st.vk_stage;
+                ref.words = spirv.size();
+                ref.offset = d.at + (code_end - payload) - static_cast<int64_t>(spirv.size() * sizeof(uint32_t));
+                jinra_identify_shader(spirv, ref);
+            } else {
+                st.module = make_module(spirv);
+                ok = st.module != VK_NULL_HANDLE;
+            }
         }
         ok = ok && answers_fit(*p, p->answers);   // (an answer past the stages or their slots: not this record)
+        if (ok && try_deferred && !jinra_keep_graphics_references(*p, deferred)) {
+            for (uint32_t i = 0; ok && i < deferred.size; ++i) {
+                const auto& ref = deferred.stages[i];
+                std::vector<uint32_t> code(ref.words);
+                std::memcpy(code.data(), payload + (ref.offset - d.at), code.size() * sizeof(uint32_t));
+                p->stages[i].module = make_module(code);
+                ok = p->stages[i].module != VK_NULL_HANDLE;
+            }
+        }
         if (!ok) {
             static std::atomic<int> logged{0};
             // Program owns the stage containers, but their Vulkan handles are not RAII-managed.
@@ -835,6 +1037,40 @@ void program_cache_borrow(uint64_t key, const std::function<void(Program&)>& fn)
         if (p->layout) vkDestroyPipelineLayout(dev.device, p->layout, nullptr);
         if (p->set_layout) vkDestroyDescriptorSetLayout(dev.device, p->set_layout, nullptr);
     }
+}
+
+// One bounded scene job. Keep ownership local until all variants have been read and the
+// normal shader lookup can adopt them. A competing draw keeps priority and owns its copies.
+bool program_cache_prepare_scene(uint64_t key, uint64_t& remaining, const std::function<void(Program&)>& fn) {
+    const auto records = program_cache_records(key);
+    if (records.empty()) return false;
+    uint64_t bytes = 0;
+    for (const auto& record : records) {
+        if (record.size > remaining - bytes) return false;
+        bytes += record.size;
+    }
+    std::unique_ptr<FILE, decltype(&fclose)> input(fopen(program_cache_path().c_str(), "rb"), fclose);
+    if (!input) return false;
+    std::vector<std::unique_ptr<Program>> variants;
+    program_cache_read(input.get(), nullptr, key, records, variants);
+    for (auto& p : variants) fn(*p);
+    if (variants.size() == records.size()) {
+        std::lock_guard lock(shader_mu);
+        auto& current = programs[key];
+        if (current.empty() && program_cache_records(key).size() == records.size()) {
+            program_cache_take(key, records);
+            current.swap(variants);
+            remaining -= bytes;
+            return true;
+        }
+    }
+    for (auto& p : variants) {
+        for (auto& stage : p->stages)
+            if (stage.module) vkDestroyShaderModule(dev.device, stage.module, nullptr);
+        if (p->layout) vkDestroyPipelineLayout(dev.device, p->layout, nullptr);
+        if (p->set_layout) vkDestroyDescriptorSetLayout(dev.device, p->set_layout, nullptr);
+    }
+    return false;
 }
 
 /// (the prepare's driver part: vk_draw.cpp warm_libraries) the key of every kept graphics and mesh program, whoever made

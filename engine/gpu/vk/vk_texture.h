@@ -200,6 +200,7 @@ void texture_log_guest(const Texture* t);
 void texture_describe_written(uint64_t gpu, uint64_t size, std::string& out);
 /// (a host hook's fast check, any thread) whether a texture the GPU wrote may lie in virtual pages [gpu, gpu + size)
 bool texture_gpu_written_in(uint64_t gpu, uint64_t size);
+bool texture_pending_copy_writeback(uint64_t gpu, uint64_t size);
 /// Textures the GPU wrote in [gpu, gpu + size) read back and written into their memory, block linear, as the GPU
 /// would have left them there: before those virtual pages are unmapped or remapped (the work recorded before is
 /// submitted; the replay's lock held). How many were.

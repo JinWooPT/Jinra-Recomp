@@ -34,6 +34,8 @@ UNIFORM(4) uint x_shift;
 UNIFORM(5) uint block_height;
 UNIFORM(6) uint block_height_mask;
 UNIFORM(7) uint native_tiling;
+UNIFORM(8) uint width;
+UNIFORM(9) uint height;
 END_PUSH_CONSTANTS
 
 struct EncodingData {
@@ -1434,6 +1436,7 @@ void main() {
 
     const ivec3 coord = ivec3(gl_GlobalInvocationID * uvec3(block_dims, 1));
     image_extent = imageSize(dest_image);
+    image_extent.xy = min(image_extent.xy, ivec2(width, height));
     if (any(greaterThanEqual(coord, image_extent))) {
         return;
     }

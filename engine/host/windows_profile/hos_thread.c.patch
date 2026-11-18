@@ -1,0 +1,113 @@
+--- hos_thread.c
++++ hos_thread.c
+@@ -5,6 +5,7 @@
+    there. TPIDRRO_EL0 (thread-local region): 0x200 bytes; the SDK's nn::os keeps the current ThreadType* at
+    +0x1F8, so lifted SDK code that reads it inline finds the same thread the HLE knows. */
+ #include "hos.h"
++#include "jinra_gap.h"
+ #ifndef JINRA_ENV_H   /* (env_on: the switches' one rule) */
+ #include "../gpu/vk/compat/jinra_env.h"
+ #endif
+@@ -43,6 +44,10 @@
+     int vc_held, vc_last, vc_queued, vc_escaped;
+     volatile int vc_kick;
+     int64_t vc_since;
++    int64_t gap_vc_grant;
++    DWORD gap_vc_signaler;
++    volatile LONG64 gap_svc_signal;
++    volatile LONG gap_svc_signaler;
+     CONDITION_VARIABLE vc_cv;
+     /* fibers: the context running now (NULL: ctx, the thread's own), the thread's host fiber once it
+        switched to a guest fiber */
+@@ -446,12 +451,24 @@
+     DWORD ms = timeout_ns < 0 ? INFINITE : (DWORD)((timeout_ns + 999999) / 1000000);
+     HOS_CHAIN(HOS_CHAIN_WAIT, wake_chain_key(t));
+     const int away = hos_vcore_away();
++    const int64_t begin = JINRA_GAP_NOW();
+     *timed_out = WaitForSingleObject(t->wake, ms) == WAIT_TIMEOUT;
++    if (begin) {
++        const int64_t done = hos_now_ns();
++        const int64_t signal = *timed_out ? 0 : InterlockedCompareExchange64(&t->gap_svc_signal, 0, 0);
++        const DWORD tid = signal >= begin && signal <= done ? InterlockedCompareExchange(&t->gap_svc_signaler, 0, 0) : 0;
++        Ctx *ctx = hos_ctx();
++        JINRA_GAP_LONG("kernel_wait", begin, done, tid ? signal : 0, tid, wake_chain_key(t), ctx ? ctx->x[30] : 0);
++    }
+     if (away) hos_vcore_back();
+     HOS_CHAIN(HOS_CHAIN_WOKE, wake_chain_key(t));
+ }
+ void hos_thread_wake(HosThread *t) {
+     HOS_CHAIN(HOS_CHAIN_SIGNAL, wake_chain_key(t));
++    if (jinra_gap_enabled) {
++        InterlockedExchange(&t->gap_svc_signaler, (LONG)GetCurrentThreadId());
++        InterlockedExchange64(&t->gap_svc_signal, hos_now_ns());
++    }
+     SetEvent(t->wake);
+ }
+ 
+@@ -563,7 +580,7 @@
+ void hos_thread_join(HosThread *t) {
+     if (!t->handle) return;
+     const int away = hos_vcore_away();
+-    /* (11-07: a freeze after Load, one thread joining another for good: a join of over 10 s says who joins whom, once) */
++    /* (EvilOOT, 11-07: a freeze after Load, one thread joining another for good: a join of over 10 s says who joins whom, once) */
+     if (WaitForSingleObject(t->handle, 10000) == WAIT_TIMEOUT) {
+         HosThread *self = hos_self();
+         hos_log("thread %s: joining %s for 10 s", self ? hos_thread_name(self) : "?", t->name);
+@@ -1103,7 +1120,13 @@
+     }
+     HOS_CHAIN(HOS_CHAIN_SLEEP, (uint64_t)ns);
+     const int away = hos_vcore_away();
++    const int64_t begin = JINRA_GAP_NOW();
+     sleep_ns(ns, guest);
++    if (begin) {
++        const int64_t done = hos_now_ns();
++        Ctx *ctx = hos_ctx();
++        JINRA_GAP_LONG(guest ? "guest_sleep" : "host_sleep", begin, done, 0, 0, ns, ctx ? ctx->x[30] : 0);
++    }
+     if (away) hos_vcore_back();
+     HOS_CHAIN(HOS_CHAIN_AWAKE, (uint64_t)ns);
+ }
+@@ -1360,7 +1383,7 @@
+ HLE(_ZN2nn2os11SleepThreadENS_8TimeSpanE) {
+     const int64_t t0 = hos_fps_timing ? hos_now_ns() : 0;
+     if (present_poll(c, (int64_t)ARG(0))) { slept_since(c->x[30], t0); return; }
+-    if (c->x[30] == 0x80590520 && env_on("HOS_SLEEP_LOG")) {   /* (diagnostic: OoT's present poll) */
++    if (c->x[30] == 0x80590520 && env_on("HOS_SLEEP_LOG")) {   /* (jinra, diagnostic: OoT's present poll) */
+         static int logged;
+         if (logged++ < 3) {
+             const char *hos_hostcall_name(uint64_t addr);
+@@ -1654,6 +1677,10 @@
+     vc_dequeue(best);
+     vc_take(best, c);
+     HOS_CHAIN(HOS_CHAIN_SIGNAL, vc_chain_key(best));
++    if (jinra_gap_enabled) {
++        best->gap_vc_grant = hos_now_ns();
++        best->gap_vc_signaler = GetCurrentThreadId();
++    }
+     WakeConditionVariable(&best->vc_cv);
+ }
+ static void vc_stats_locked(int64_t now) {
+@@ -1688,6 +1715,7 @@
+     const int64_t t0 = hos_now_ns();
+     HOS_CHAIN(HOS_CHAIN_WAIT, vc_chain_key(t));
+     t->vc_since = t0;
++    if (jinra_gap_enabled) t->gap_vc_grant = 0, t->gap_vc_signaler = 0;
+     t->vc_queued = 1;
+     if (vc_nq < 1024) vc_queue[vc_nq++] = t;
+     vc_st.waits++;
+@@ -1742,8 +1770,15 @@
+     HOS_CHAIN(HOS_CHAIN_WOKE, vc_chain_key(t));
+     vc_st.wait_ns += waited;
+     if (waited > vc_st.max_ns) vc_st.max_ns = waited;
++    const int64_t signal = jinra_gap_enabled ? t->gap_vc_grant : 0;
++    const DWORD signaler = signal ? t->gap_vc_signaler : 0;
++    const int64_t end = t0 + waited;
+     vc_stats_locked(hos_now_ns());
+     ReleaseSRWLockExclusive(&vc_lock);
++    if (jinra_gap_enabled) {
++        Ctx *ctx = hos_ctx();
++        JINRA_GAP_LONG("vcore_wait", t0, end, signal, signaler, vc_chain_key(t), ctx ? ctx->x[30] : 0);
++    }
+ }
+ static void vc_release(HosThread *t) {
+     if (!t->vc_held) return;

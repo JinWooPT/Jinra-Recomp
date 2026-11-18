@@ -58,6 +58,22 @@ class FinishOutputTests(unittest.TestCase):
         self.image.write_bytes(b"new synthetic image")
         (self.out / "image.bin").write_bytes(b"existing synthetic image")
 
+        assets = self.root / "tools" / "assets"
+        profile = assets / "jinra-perfil-015"
+        recipes = assets / "scene-recipes"
+        (profile / "control").mkdir(parents=True)
+        recipes.mkdir()
+        self.profile_files = [
+            (profile / "gestao.py", "jinra-perfil-015/gestao.py"),
+            (profile / "control" / "snapshot.py", "jinra-perfil-015/control/snapshot.py"),
+            (recipes / "hyrule-field.txt", "jinra_planicie_pipelines.txt"),
+            (recipes / "hyrule-field.txt", "jinra-previa-ram/planicie.txt"),
+            (recipes / "hyrule-field-priority.txt", "jinra_planicie_prioritarias.txt"),
+            (recipes / "kakariko.txt", "jinra-previa-ram/kakariko.txt"),
+        ]
+        for source, _ in self.profile_files:
+            source.write_text("synthetic fixture: " + source.name, encoding="utf-8")
+
     def clear_fixture_readonly_modes(self):
         # Test-owned temporary files only: production must never unlock destinations or pre-existing .new files.
         for path in self.root.rglob("*"):
@@ -71,7 +87,7 @@ class FinishOutputTests(unittest.TestCase):
         with mock.patch.object(make_game, "BESIDE", ["Jinra-Ocarina.exe"]):
             # Comprehensions use globals. Keep one namespace, as in production, and discover only authored setup files.
             namespace = dict(make_game.__dict__, built=str(self.built), out=str(self.out), work=str(self.work),
-                             ROOT=str(self.root / "tools"), LINUX=False if launcher else make_game.LINUX,
+                             ROOT=str(self.root / "tools"), LINUX=False if launcher else make_game.LINUX, use_fsr=False,
                              a=SimpleNamespace(fsr=False, no_fsr=False, update=None, fetch_fsr_runtime=False))
             exec(FINISH, namespace)
 
@@ -80,7 +96,17 @@ class FinishOutputTests(unittest.TestCase):
         self.assertEqual((self.out / "image.bin").read_bytes(), b"existing synthetic image")
 
     def assert_no_staging_files(self):
-        self.assertEqual(sorted(path.name for path in self.out.iterdir()), ["Jinra-Ocarina.exe", "image.bin"])
+        expected = {"Jinra-Ocarina.exe", "image.bin"}
+        if not make_game.LINUX:
+            self.assert_profile_installed()
+            expected.update(relative for _, relative in self.profile_files)
+        actual = {path.relative_to(self.out).as_posix() for path in self.out.rglob("*") if path.is_file()}
+        self.assertEqual(actual, expected)
+
+    def assert_profile_installed(self):
+        for source, relative in self.profile_files:
+            self.assertEqual((self.out / relative).read_bytes(), source.read_bytes())
+        self.assertTrue((self.out / "jinra-previa-ram" / "driver").is_dir())
 
     def stopped_output(self):
         output = io.StringIO()
@@ -112,7 +138,8 @@ class FinishOutputTests(unittest.TestCase):
 
         with mock.patch.object(make_game.shutil, "copy2", side_effect=observe_copy):
             self.finish()
-        self.assertEqual(copied, [self.source, self.image])
+        profile = [] if make_game.LINUX else [src for src, _ in self.profile_files]
+        self.assertEqual(copied, [self.source, self.image, *profile])
         self.assertEqual(self.destination.read_bytes(), self.source.read_bytes())
         self.assertEqual((self.out / "image.bin").read_bytes(), self.image.read_bytes())
         self.assert_no_staging_files()
@@ -143,7 +170,9 @@ class FinishOutputTests(unittest.TestCase):
 
         with mock.patch.object(make_game.shutil, "copy2", side_effect=observe_copy):
             self.finish(launcher=True)
-        self.assertEqual(copied, [self.source, self.image, self.root / "JinraBuilder-Setup.exe"])
+        self.assertEqual(copied, [self.source, self.image, *(src for src, _ in self.profile_files),
+                                  self.root / "JinraBuilder-Setup.exe"])
+        self.assert_profile_installed()
         self.assertEqual(binary.read_bytes(), self.source.read_bytes())
         self.assertEqual(self.destination.read_bytes(), b"new synthetic launcher")
         self.assertEqual((self.out / "image.bin").read_bytes(), self.image.read_bytes())

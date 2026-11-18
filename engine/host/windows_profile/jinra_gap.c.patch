@@ -1,0 +1,51 @@
+--- jinra_gap.c
++++ jinra_gap.c
+@@ -0,0 +1,48 @@
++#include "hos.h"
++#include "jinra_gap.h"
++#include <stdio.h>
++#include <stdlib.h>
++#define WIN32_LEAN_AND_MEAN
++#include <windows.h>
++
++int jinra_gap_enabled;
++static FILE *gap;
++static char output[64 * 1024];
++extern volatile LONG64 hos_present_count;
++
++void jinra_gap_init(void) {
++    const char *path = getenv("JINRA_GAME_GAP");
++    if (!path || !*path) return;
++    gap = fopen(path, "w");
++    if (!gap) return;
++    setvbuf(gap, output, _IOFBF, sizeof output);
++    fputs("kind,frame,tid,guest_thread,begin_ns,end_ns,signal_ns,signal_tid,key,lr,cpu_100ns,cycles\n", gap);
++    jinra_gap_enabled = 1;
++}
++
++void jinra_gap_flush(void) {
++    if (gap) fflush(gap);
++}
++
++static uint64_t filetime(FILETIME t) {
++    return (uint64_t)t.dwHighDateTime << 32 | t.dwLowDateTime;
++}
++
++void jinra_gap_note(const char *kind, int64_t begin, int64_t end, int64_t signal,
++                    uint32_t signal_tid, uint64_t key, uint64_t lr) {
++    if (!gap) return;
++    FILETIME creation, exit, kernel, user;
++    ULONG64 cycles = 0;
++    const HANDLE thread = GetCurrentThread();
++    uint64_t cpu = UINT64_MAX;
++    if (GetThreadTimes(thread, &creation, &exit, &kernel, &user))
++        cpu = filetime(kernel) + filetime(user);
++    QueryThreadCycleTime(thread, &cycles);
++    HosThread *self = hos_self();
++    const LONG64 frame = InterlockedCompareExchange64(&hos_present_count, 0, 0);
++    fprintf(gap, "%s,%lld,%lu,%llu,%lld,%lld,%lld,%lu,%llx,%llx,%llu,%llu\n",
++            kind, (long long)frame, (unsigned long)GetCurrentThreadId(),
++            self ? (unsigned long long)hos_thread_id(self) : 0, (long long)begin,
++            (long long)(end ? end : hos_now_ns()), (long long)signal, (unsigned long)signal_tid,
++            (unsigned long long)key, (unsigned long long)lr, (unsigned long long)cpu, (unsigned long long)cycles);
++}

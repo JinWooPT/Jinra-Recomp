@@ -1,0 +1,60 @@
+--- mouse_native.c
++++ mouse_native.c
+@@ -28,8 +28,10 @@
+    The sensitivity is the mouse's (the menu's Mouse sensitivity, - and =): 0.1 degrees a count at 1. HOS_MOUSE_INVERT_Y=1
+    or the menu's Invert mouse vertical flips up and down. */
+ #include "hos.h"
++#include "jinra_gap.h"
+ #include <math.h>
+ #include <stdint.h>
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #define WIN32_LEAN_AND_MEAN
+@@ -108,8 +110,46 @@
+    mouse both turn the camera instead of undoing each other. */
+ void hos_mouse_native_stick(int held) { InterlockedExchange(&stick_held, held ? 1 : 0); }
+ 
++/* Optional diagnostics before the camera update, including when the right stick turns it. */
++static void trace_camera(uint64_t cam) {
++    static FILE *csv;
++    static int initialized;
++    if (!initialized) {
++        initialized = 1;
++        const char *path = getenv("HOS_JINRA_CAMERA_TRACE");
++        if (path && *path) csv = fopen(path, "w");
++        if (csv) fputs("frame,qpc_ns,camera,state,yaw,pitch\n", csv);
++    }
++    if (!cam || !looks_like_camera(cam) || (!csv && !env_on("RX_VK_SMALL_COPY_PHASE"))) return;
++    if (jinra_gap_enabled) jinra_gap_note("camera_entry", 0, hos_now_ns(), 0, 0, cam, 0);
++    extern volatile LONG64 hos_present_count;
++    const LONG64 frame = InterlockedCompareExchange64(&hos_present_count, 0, 0);
++    const int state = geti(cam + STATE_AT);
++    const int64_t now = hos_now_ns();
++    static int phase_enabled = -1;
++    if (phase_enabled < 0) phase_enabled = env_on("RX_VK_SMALL_COPY_PHASE");
++    if (phase_enabled) {
++        typedef void (*phase_fn)(uint64_t, uint64_t, int, int64_t);
++        static phase_fn phase;
++        if (!phase) {
++            HMODULE renderer = GetModuleHandleW(L"jinra_vk.dll");
++            if (renderer) phase = (phase_fn)GetProcAddress(renderer, "jinra_small_copy_camera");
++        }
++        if (phase) phase(cam, frame, state, now);
++    }
++    if (!csv) return;
++    fprintf(csv, "%lld,%lld,%llx,%d,%.7f,%.7f\n", (long long)frame, (long long)now,
++            (unsigned long long)cam, state, getf(cam + YAW_AT), getf(cam + PITCH_AT));
++    if (!(frame % 120)) fflush(csv);
++}
++
+ /* f_80644c80's first line (nx2/oot_patches.py): cam is the player camera, the game's thread */
+ void hos_mouse_camera(uint64_t cam) {
++    static int trace = -1;
++    if (trace < 0) trace = getenv("HOS_JINRA_CAMERA_TRACE") != NULL;
++    static int phase = -1;
++    if (phase < 0) phase = env_on("RX_VK_SMALL_COPY_PHASE");
++    if (trace || phase) trace_camera(cam);
+     if (!cam || !native_on() || !looks_like_camera(cam)) return;
+     /* Only while it is the view: following Link (3) or turned by the player (4). Aiming the slingshot in first person
+        leaves this camera updating with its state 0 while another one draws (traced at Hyrule Castle); shops are reported

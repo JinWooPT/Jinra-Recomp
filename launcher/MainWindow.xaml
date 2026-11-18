@@ -94,6 +94,10 @@
                                     <Hyperlink Foreground="{StaticResource Cyan}" Click="OpenAmdLicense"><Run Text="{DynamicResource AmdLicenseText}"/></Hyperlink>
                                 </TextBlock>
                             </WrapPanel>
+                            <WrapPanel Margin="0,5,0,0" IsEnabled="{Binding IsEnabled, ElementName=EnableDlss}">
+                                <CheckBox x:Name="EnableAnr" Content="{DynamicResource AnrText}" ToolTip="{DynamicResource AnrHint}"
+                                          IsEnabled="{Binding IsChecked, ElementName=EnableDlss}"/>
+                            </WrapPanel>
                             <TextBlock Text="{DynamicResource FsrIncluded}"
                                        Foreground="{StaticResource Muted}" TextWrapping="Wrap" Margin="0,5,0,0"/>
                             <TextBlock x:Name="HardwareInfo" Foreground="{StaticResource Muted}" TextWrapping="Wrap" Margin="0,5,0,0"/>

@@ -45,6 +45,7 @@
 #include "nvsdk_ngx_helpers.h"
 #include "nvsdk_ngx_helpers_vk.h"
 #include "nvsdk_ngx_helpers_dlssg_vk.h"   // (DLSS Frame Generation: its parameters and the create/evaluate helpers)
+#include "jinra-anr-bridge.h"
 #include <cfloat>
 #include <deque>
 #include "dlss_math.h"
@@ -572,7 +573,80 @@ struct FgHint {
     bool pending = false;
 };
 
+struct AnrBridge {
+#ifdef _WIN32
+    HMODULE module = nullptr;
+#endif
+    bool tried = false, ready = false;
+    decltype(&jinra_anr_create) create = nullptr;
+    decltype(&jinra_anr_eval) eval = nullptr;
+    decltype(&jinra_anr_release) release = nullptr;
+    decltype(&jinra_anr_shutdown) shutdown = nullptr;
+
+#ifdef _WIN32
+    template<class Fn> Fn resolve(const char* name) const {
+        return reinterpret_cast<Fn>(GetProcAddress(module, name));
+    }
+
+    bool open(unsigned& max_frames) {
+        const fs::path folder = game_dir() / L"anr";
+        if (!folder.is_absolute()) return false;
+        module = LoadLibraryExW((folder / L"jinra_anr_bridge.dll").c_str(), nullptr,
+                                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (!module) {
+            logf("vk: ANR FG bridge could not load (%lu)", GetLastError());
+            return false;
+        }
+        const auto abi = resolve<decltype(&jinra_anr_bridge_version)>("jinra_anr_bridge_version");
+        const auto init = resolve<decltype(&jinra_anr_init)>("jinra_anr_init");
+        create = resolve<decltype(create)>("jinra_anr_create");
+        eval = resolve<decltype(eval)>("jinra_anr_eval");
+        release = resolve<decltype(release)>("jinra_anr_release");
+        shutdown = resolve<decltype(shutdown)>("jinra_anr_shutdown");
+        if (!abi || abi() != JINRA_ANR_BRIDGE_ABI || !init || !create || !eval || !release || !shutdown) {
+            logf("vk: ANR FG bridge ABI mismatch");
+            return false;
+        }
+        const fs::path provider = folder / L"dlssg" / L"nvngx_dlssg.dll";
+        const auto result = init(provider.c_str(), folder.c_str(), dev.instance, dev.physical, dev.device,
+                                 instance_proc(), vkGetDeviceProcAddr, &max_frames);
+        logf("vk: ANR FG Vulkan init %#x, max generated frames %u (%s)", (unsigned)result, max_frames,
+             shown(provider).c_str());
+        return NVSDK_NGX_SUCCEED(result) && max_frames != 0;
+    }
+#else
+    bool open(unsigned&) { return false; }
+#endif
+};
+
+bool anr_requested() {
+    return opts.framegen_by == FG_ENGINE_ANR;
+}
+
+bool anr_files_present() {
+#ifndef _WIN32
+    return false;
+#else
+    static const bool installed = [] {
+        const auto folder = game_dir() / L"anr";
+        std::error_code error;
+        return folder.is_absolute() &&
+               fs::is_regular_file(folder / L"jinra_anr_bridge.dll", error) &&
+               fs::is_regular_file(folder / L"dlssg" / L"nvngx_dlssg.dll", error);
+    }();
+    return installed;
+#endif
+}
+
+thread_local bool anr_made_this_set = false;
+
 struct Fg {
+    AnrBridge anr;
+    bool anr_feature = false;
+    std::atomic<bool> using_anr{false};
+    bool has_feature() const { return anr_feature || feature != nullptr; }
+    uint32_t input_width = 0, input_height = 0;
+    uint64_t anr_presented = 0, anr_resets = 0;
     std::mutex mu;
     bool tried = false, ok = false;   // (NGX's answer: once)
     unsigned most = 1;                // (the most frames it makes between two of the game's: MultiFrameCountMax)
@@ -619,6 +693,7 @@ bool fg_possible() {
 /// Whether it is asked for now: RX_VK_DLSS_FG=1 for the run, else the Frame generation by row (read each time: it changes
 /// while the game runs)
 bool fg_asked() {
+    if (anr_requested()) return opts.framegen == 2 && !opts.hdr && !dev.hdr && anr_files_present();
     static const bool forced = env_switch("RX_VK_DLSS_FG") > 0;
     return fg_possible() && (forced || opts.framegen_by == FG_ENGINE_AUTO);
 }
@@ -662,6 +737,18 @@ void fg_mul(const float* a, const float* b, float* out) {   // (row major: out =
 bool fg_start(Fg& g) {
     if (g.tried) return g.ok;
     g.tried = true;
+    if (g.using_anr.load(std::memory_order_relaxed)) {
+        if (!g.anr.tried) {
+            g.anr.tried = true;
+            unsigned available = 0;
+            g.anr.ready = g.anr.open(available);
+        }
+        g.ok = g.anr.ready;
+        g.most = 1;  // The experimental renderer uses only 2x generation.
+        g.most_known.store(g.most, std::memory_order_relaxed);
+        g.start_failed.store(!g.ok, std::memory_order_relaxed);
+        return g.ok;
+    }
     g.start_failed = true;   // (until NGX says yes, below)
     // (not on a device DLSS does not run on: an AMD or Intel GPU, without NVIDIA's extensions (dlss_device_extensions), does
     // not start NGX at its first present)
@@ -789,15 +876,45 @@ void fg_put(float out[4][4], const float* m) {
 
 /// The feature let go: the queue idle first (it may be in a set the display thread has not shown yet)
 void fg_release(Fg& g) {
-    if (!g.feature) return;
+    if (!g.has_feature()) return;
     {
         std::lock_guard qk(dev.present_mu);
         device_wait_idle_locked();
     }
-    NVSDK_NGX_VULKAN_ReleaseFeature(g.feature);
-    g.feature = nullptr;
+    if (g.anr_feature) {
+        const auto result = g.anr.release();
+        logf("vk: ANR FG released for a change of size or mode (%#x)", (unsigned)result);
+        if (NVSDK_NGX_FAILED(result)) return;
+        g.anr_feature = false;
+    } else {
+        NVSDK_NGX_VULKAN_ReleaseFeature(g.feature);
+        g.feature = nullptr;
+    }
     g.held = false;
     g.fw = g.fh = 0;
+}
+
+// Set the provider under the same lock used to collect inputs and record evaluations.
+bool fg_select_provider(Fg& g) {
+    const bool use_anr = anr_requested();
+    if (use_anr == g.using_anr.load(std::memory_order_relaxed)) return true;
+    fg_release(g);
+    if (g.has_feature()) return false;
+    if (g.params) {
+        NVSDK_NGX_VULKAN_DestroyParameters(g.params);
+        g.params = nullptr;
+    }
+    g.tried = false;
+    g.ok = false;
+    g.create_failures = g.refusals = 0;
+    g.have_last = false;
+    g.inputs_reset = true;
+    g.used = g.inputs;
+    g.last_sequence = 0;
+    g.most_known.store(0, std::memory_order_relaxed);
+    g.start_failed.store(false, std::memory_order_relaxed);
+    g.using_anr.store(use_anr, std::memory_order_relaxed);
+    return true;
 }
 
 // Why the last set DLSS-G was asked for went to the renderer's own (dlss_fg_skip); none when DLSS-G made it.
@@ -816,11 +933,18 @@ int dlss_fg_skip(unsigned* most) {
     return fg_skip.load(std::memory_order_relaxed);
 }
 
+bool anr_fg_installed() { return anr_files_present(); }
+bool anr_fg_failed() {
+    const Fg& g = fgs();
+    return g.using_anr.load(std::memory_order_relaxed) && g.start_failed.load(std::memory_order_relaxed);
+}
+bool anr_fg_made_last_set() { return anr_made_this_set; }
 bool dlss_fg_wanted() { return fg_asked(); }
 
 bool dlss_fg_runs(int frames) {
-    if (!fg_asked() || dlss_why() != DLSS_OK) return false;
+    if (!fg_asked() || (!anr_requested() && dlss_why() != DLSS_OK)) return false;
     const Fg& g = fgs();
+    if (g.using_anr.load(std::memory_order_relaxed) != anr_requested()) return true;
     if (g.start_failed.load(std::memory_order_relaxed)) return false;
     // (more frames a set than its runtime makes: the renderer's own makes them all (dlss_fg_frames' too_many). Known once
     // NGX has answered, at the first present with a fixed multiplier; until then it is taken to make them)
@@ -887,7 +1011,7 @@ void dlss_fg_inputs(VkCommandBuffer cmd, const TemporalFrame& f, const float pro
     if (!fg_asked()) return;
     Fg& g = fgs();
     std::lock_guard lk(g.mu);
-    if (g.closed || !fg_start(g)) return;
+    if (g.closed || !fg_select_provider(g) || !fg_start(g)) return;
     if (opts.framegen < 2) return void(g.have_last = false);   // (not a fixed multiplier: the next inputs start a history)
     const uint32_t rw = f.render_w, rh = f.render_h;
     if (!f.depth.image || !f.motion.image || !rw || !rh) return;
@@ -940,12 +1064,12 @@ void dlss_fg_inputs(VkCommandBuffer cmd, const TemporalFrame& f, const float pro
 
 int dlss_fg_frames(VkCommandBuffer cmd, VkImage color, VkImageView color_view, uint32_t w, uint32_t h, int count,
                    const VkImage* out, const VkImageView* out_views, bool blend, uint64_t sequence) {
-    if (!fg_possible()) return skip(FG_SKIP_OFF);
+    anr_made_this_set = false;
     Fg& g = fgs();
     std::lock_guard lk(g.mu);
-    if (g.closed) return 0;
+    if (g.closed || !fg_select_provider(g)) return 0;
     if (!fg_asked()) {   // (turned off in the menu: its feature let go, its memory back)
-        if (g.feature) fg_release(g), logf("vk: DLSS Frame Gen (NGX): off (Frame generation by): its feature let go");
+        if (g.has_feature()) fg_release(g), logf("vk: DLSS Frame Gen (NGX): off (Frame generation by): its feature let go");
         return 0;
     }
     if (++g.presents % 600 == 0) {
@@ -958,10 +1082,11 @@ int dlss_fg_frames(VkCommandBuffer cmd, VkImage color, VkImageView color_view, u
              (unsigned long long)g.refused);
         g.made = g.no_inputs = g.not_blended = g.too_many = g.refused = g.resets = g.still = g.no_interp = 0;
     }
-    if (!fg_start(g) || count < 1) return skip(dlss_why() != DLSS_OK ? FG_SKIP_DEVICE : FG_SKIP_START);
+    if (!fg_start(g) || count < 1)
+        return skip(!anr_requested() && dlss_why() != DLSS_OK ? FG_SKIP_DEVICE : FG_SKIP_START);
     if (g.refusals >= kFgRefusalsOff) {   // (given up: dlss_fg_runs says no from here)
         // (the refused sets' feature and its memory, let go once: vk_framegen.cpp still calls at 2x and up)
-        if (g.feature) fg_release(g);
+        if (g.has_feature()) fg_release(g);
         return g.refused++, skip(FG_SKIP_REFUSED);
     }
     if (!blend) return g.not_blended++, 0;
@@ -977,23 +1102,40 @@ int dlss_fg_frames(VkCommandBuffer cmd, VkImage color, VkImageView color_view, u
     }
     if (g.inputs == g.used || !g.rw) return g.no_inputs++, skip(FG_SKIP_INPUTS);
     g.used = g.inputs;
-    if (g.feature && (g.fw != w || g.fh != h)) fg_release(g);
-    if (!g.feature) {
+    if (g.has_feature() && (g.fw != w || g.fh != h ||
+        (g.anr_feature && (g.input_width != g.rw || g.input_height != g.rh)))) {
+        fg_release(g);
+        if (g.has_feature()) return skip(FG_SKIP_REFUSED);
+    }
+    if (!g.has_feature()) {
         if (g.create_failures >= 3) return g.refused++, skip(FG_SKIP_REFUSED);
         NVSDK_NGX_DLSSG_Create_Params cp{};
         cp.Width = w, cp.Height = h;
         cp.NativeBackbufferFormat = VK_FORMAT_R8G8B8A8_UNORM;   // (the window's picture, vk_framegen.cpp's frames)
         cp.RenderWidth = g.rw, cp.RenderHeight = g.rh;
         // (frame generation's own size keys, which NGX takes over the generic ones the helper sets: it warned about those)
-        NVSDK_NGX_Parameter_SetUI(g.params, NVSDK_NGX_DLSSG_Parameter_Width, w);
-        NVSDK_NGX_Parameter_SetUI(g.params, NVSDK_NGX_DLSSG_Parameter_Height, h);
-        NVSDK_NGX_Parameter_SetUI(g.params, NVSDK_NGX_DLSSG_Parameter_InternalWidth, g.rw);
-        NVSDK_NGX_Parameter_SetUI(g.params, NVSDK_NGX_DLSSG_Parameter_InternalHeight, g.rh);
-        NVSDK_NGX_Parameter_SetUI(g.params, NVSDK_NGX_DLSSG_Parameter_DynamicResolution, 0u);
-        ::mkwvk::rec::boundary(::mkwvk::rec::B_DIRECT);   // (NGX records into cmd itself)
-        const NVSDK_NGX_Result r = NGX_VK_CREATE_DLSSG(cmd, 1, 1, &g.feature, g.params, &cp);
+        ::mkwvk::rec::boundary(::mkwvk::rec::B_DIRECT);
+        NVSDK_NGX_Result r;
+        if (g.using_anr.load(std::memory_order_relaxed)) {
+            const auto before = std::chrono::steady_clock::now();
+            r = g.anr.create(cmd, &cp);
+            g.anr_feature = NVSDK_NGX_SUCCEED(r);
+            if (g.anr_feature) {
+                g.input_width = g.rw;
+                g.input_height = g.rh;
+            }
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - before).count();
+            logf("vk: ANR FG create %ux%u from %ux%u: %#x in %.2f ms", w, h, g.rw, g.rh, (unsigned)r, ms);
+        } else {
+            NVSDK_NGX_Parameter_SetUI(g.params, NVSDK_NGX_DLSSG_Parameter_Width, w);
+            NVSDK_NGX_Parameter_SetUI(g.params, NVSDK_NGX_DLSSG_Parameter_Height, h);
+            NVSDK_NGX_Parameter_SetUI(g.params, NVSDK_NGX_DLSSG_Parameter_InternalWidth, g.rw);
+            NVSDK_NGX_Parameter_SetUI(g.params, NVSDK_NGX_DLSSG_Parameter_InternalHeight, g.rh);
+            NVSDK_NGX_Parameter_SetUI(g.params, NVSDK_NGX_DLSSG_Parameter_DynamicResolution, 0u);
+            r = NGX_VK_CREATE_DLSSG(cmd, 1, 1, &g.feature, g.params, &cp);
+        }
         note_work();
-        if (NVSDK_NGX_FAILED(r) || !g.feature) {
+        if (NVSDK_NGX_FAILED(r) || !g.has_feature()) {
             g.feature = nullptr;
             g.create_failures++;
             logf("vk: DLSS Frame Gen (NGX): the feature was not made for %ux%u (%#x)%s", w, h, (unsigned)r,
@@ -1054,7 +1196,7 @@ int dlss_fg_frames(VkCommandBuffer cmd, VkImage color, VkImageView color_view, u
     o.multiFrameCount = (unsigned)count;
     NVSDK_NGX_VK_DLSSG_Eval_Params ep{};
     ep.pBackbuffer = &back, ep.pDepth = &depth, ep.pMVecs = &mvecs;
-    NVSDK_NGX_Parameter_SetULL(g.params, NVSDK_NGX_DLSSG_Parameter_BackbufferFrameID, sequence);
+    if (!g.anr_feature) NVSDK_NGX_Parameter_SetULL(g.params, NVSDK_NGX_DLSSG_Parameter_BackbufferFrameID, sequence);
     // (NGX's hint that this set should not be shown: a byte it writes, read back a few sets later for the count)
     NVSDK_NGX_Resource_VK no_interp{};
     if (!g.hint[0].buffer)
@@ -1081,7 +1223,8 @@ int dlss_fg_frames(VkCommandBuffer cmd, VkImage color, VkImageView color_view, u
         ep.pOutputInterpFrame = &made;
         o.multiFrameIndex = (unsigned)k;
         ::mkwvk::rec::boundary(::mkwvk::rec::B_DIRECT);   // (NGX records into cmd itself)
-        const NVSDK_NGX_Result r = NGX_VK_EVALUATE_DLSSG(cmd, g.feature, g.params, &ep, &o);
+        const NVSDK_NGX_Result r = g.anr_feature ? g.anr.eval(cmd, sequence, &ep, &o) :
+                                                    NGX_VK_EVALUATE_DLSSG(cmd, g.feature, g.params, &ep, &o);
         note_work();
         if (NVSDK_NGX_FAILED(r)) {
             static int told = 0;
@@ -1101,6 +1244,15 @@ int dlss_fg_frames(VkCommandBuffer cmd, VkImage color, VkImageView color_view, u
     g.refusals = 0;
     g.inputs_reset = false;
     g.last_sequence = sequence;
+    if (g.anr_feature && o.reset) {
+        ++g.anr_resets;
+        ++g.sets_made;
+        return 0;  // The provider seeds its history on reset; use the established fallback.
+    }
+    anr_made_this_set = g.anr_feature;
+    if (g.anr_feature && (++g.anr_presented == 1 || g.anr_presented % 120 == 0))
+        logf("vk: ANR FG written sets %llu, resets %llu", (unsigned long long)g.anr_presented,
+             (unsigned long long)g.anr_resets);
     g.made++;
     g.sets_made++;
     skip(FG_SKIP_NONE);
@@ -1111,16 +1263,15 @@ void dlss_fg_idle() {
     Fg& g = fgs();
     if (!g.held.load(std::memory_order_relaxed)) return;
     std::lock_guard lk(g.mu);
-    if (g.feature) fg_release(g), logf("vk: DLSS Frame Gen (NGX): frame generation Off or Auto: its feature let go");
+    if (g.has_feature()) fg_release(g), logf("vk: DLSS Frame Gen (NGX): frame generation Off or Auto: its feature let go");
 }
 
 void dlss_fg_close() {
-    if (!fg_asked()) return;
     Fg& g = fgs();
     std::lock_guard lk(g.mu);
     if (g.closed) return;
     g.closed = true;
-    if (!g.feature && !g.params) return;
+    if (!g.has_feature() && !g.params && !g.anr.shutdown) return;
     // (the swapchain's lock for the queue's idle, waited for a while: a present stuck at the exit leaves NGX to the process's
     // end rather than hanging the exit, as PR 1944's Streamline shutdown found)
     const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -1131,6 +1282,10 @@ void dlss_fg_close() {
         return;
     }
     device_wait_idle_locked();
+    if (g.anr.shutdown) {
+        const auto result = g.anr.shutdown();
+        logf("vk: ANR FG closed %#x; written sets %llu", (unsigned)result, (unsigned long long)g.anr_presented);
+    }
     if (g.feature) NVSDK_NGX_VULKAN_ReleaseFeature(g.feature), g.feature = nullptr;
     if (g.params) NVSDK_NGX_VULKAN_DestroyParameters(g.params), g.params = nullptr;
     logf("vk: DLSS Frame Gen (NGX): let go for the exit");
@@ -1138,6 +1293,9 @@ void dlss_fg_close() {
 
 #else  // (no NGX SDK in this build: DLSS is not there)
 
+bool anr_fg_installed() { return false; }
+bool anr_fg_failed() { return false; }
+bool anr_fg_made_last_set() { return false; }
 bool dlss_built() { return false; }
 const TemporalEngine* dlss_engine() { return nullptr; }
 void dlss_probe() {}

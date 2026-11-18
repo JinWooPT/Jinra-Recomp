@@ -25,6 +25,8 @@
     <sys:String x:Key="DlssText">NVIDIA DLSS 4 / 4.5 e Multi Frame Generation</sys:String>
     <sys:String x:Key="DlssHint">Descarrega o SDK oficial. Escolhe o DLSS 4 (K) ou 4.5 (M/L) nas definições do jogo.</sys:String>
     <sys:String x:Key="NvidiaLicenseText">Licença NVIDIA</sys:String>
+    <sys:String x:Key="AnrText">Instalar geração de fotogramas ANR (opcional)</sys:String>
+    <sys:String x:Key="AnrHint">Descarrega o componente verificado da Apex Compute. Requer suporte NVIDIA DLSS na compilação. Seleciona ANR em Desempenho e usa 2×, SDR e ampliação temporal.</sys:String>
     <sys:String x:Key="FsrText">AMD FSR 4 em placas compatíveis</sys:String>
     <sys:String x:Key="FsrHint">Descarrega os componentes AMD para reconstrução de imagem FSR 4. Podes preparar a instalação noutro PC.</sys:String>
     <sys:String x:Key="AmdLicenseText">Licença AMD</sys:String>

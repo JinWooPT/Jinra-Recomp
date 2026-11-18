@@ -79,6 +79,7 @@ public partial class MainWindow : Window
 
         EnableFsr4.IsChecked = Builder.HasFsr4(DestinationBox.Text);
         EnableDlss.IsChecked = Builder.HasDlss(DestinationBox.Text);
+        EnableAnr.IsChecked = Builder.HasAnr(DestinationBox.Text);
         if (repairDesktop && Builder.Ready(DestinationBox.Text)) InstallDesktopLauncher();
         ShowBuild(this, new RoutedEventArgs());
         RefreshButtons();
@@ -181,6 +182,7 @@ public partial class MainWindow : Window
         DestinationBox.Text = picker.FolderName;
         EnableFsr4.IsChecked = Builder.HasFsr4(DestinationBox.Text);
         EnableDlss.IsChecked = Builder.HasDlss(DestinationBox.Text);
+        EnableAnr.IsChecked = Builder.HasAnr(DestinationBox.Text);
         RefreshButtons();
     }
 
@@ -317,6 +319,7 @@ public partial class MainWindow : Window
         DestinationBox.Text = destination;
         WarmShaders.IsChecked = false;
         EnableDlss.IsChecked = Builder.HasDlss(destination);
+        EnableAnr.IsChecked = Builder.HasAnr(destination);
         EnableFsr4.IsChecked = Builder.HasFsr4(destination);
         if (Builder.NeedsGameUpdate(destination)) await RunOperation(true);
     }
@@ -359,7 +362,7 @@ public partial class MainWindow : Window
                 HardwareInfo.Text = profile.Description;
                 AppendLog(profile.LogLine);
                 await builder.BuildAsync(SourceBox.Text, DestinationBox.Text, WarmShaders.IsChecked == true,
-                    EnableDlss.IsChecked == true, EnableFsr4.IsChecked == true, profile, report, running.Token);
+                    EnableDlss.IsChecked == true, EnableFsr4.IsChecked == true, profile, report, running.Token, installAnr: EnableAnr.IsChecked == true);
             }
             else await builder.CheckAsync(SourceBox.Text, report, running.Token);
             ProgressBar.IsIndeterminate = false;

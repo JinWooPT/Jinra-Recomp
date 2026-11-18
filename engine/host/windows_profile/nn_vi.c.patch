@@ -1,0 +1,146 @@
+--- nn_vi.c
++++ nn_vi.c
+@@ -2,6 +2,7 @@
+    layer, and the display's vsync event, signaled at 60 Hz by a host thread. HDR and VRR are reported unsupported,
+    so the game takes its SDR path. Frames are paced at the native NVN layer's window acquire (the end of this file). */
+ #include "hos.h"
++#include "jinra_gap.h"
+ #include "../gpu/vk/vk_api.h"   /* (HOS_OPT_HDR_*, HOS_OPT_CAMERA_SPEED: the Insert menu's HDR and Camera speed, answered by the renderer) */
+ #define WIN32_LEAN_AND_MEAN
+ #include <windows.h>
+@@ -21,16 +22,75 @@
+ static HANDLE vsync_thread;
+ 
+ static int fps_max(void);   /* (below: HOS_FPS_MAX) */
++typedef int (*phase_measure_fn)(int64_t*, int64_t*, uint64_t*);
++typedef void (*phase_tag_fn)(uint64_t*, uint64_t*, uint64_t*);
++
++static void display_present_tag(uint64_t *chain, uint64_t *id, uint64_t *sequence) {
++    static phase_tag_fn fn;
++    if (!fn) {
++        HMODULE vk = GetModuleHandleW(L"jinra_vk.dll");
++        if (vk) fn = (phase_tag_fn)GetProcAddress(vk, "jinra_display_present_tag");
++    }
++    if (fn) fn(chain, id, sequence);
++}
++
++static int64_t display_vsync_period(int64_t nominal, unsigned tick) {
++    static phase_measure_fn fn;
++    static int active;
++    if (!fn && tick % 60 == 0) {
++        HMODULE vk = GetModuleHandleW(L"jinra_vk.dll");
++        if (vk) fn = (phase_measure_fn)GetProcAddress(vk, "jinra_display_phase");
++    }
++    uint64_t id;
++    int64_t refresh, latency;
++    const int ok = fn && fn(&refresh, &latency, &id) &&
++                   llabs(4 * refresh - nominal) < 250000;
++    if (!ok) {
++        if (active) hos_log("vi: phase lock waiting for a fresh timing sample");
++        active = 0;
++        return nominal;
++    }
++    int64_t adjustment = (latency - refresh / 2) / 10;
++    if (adjustment > 500000) adjustment = 500000;
++    if (adjustment < -500000) adjustment = -500000;
++    if (!active || tick % 60 == 0)
++        hos_log("vi: phase lock tick %u id %llu refresh %lld latency %lld adjust %lld",
++                tick, (unsigned long long)id, (long long)refresh, (long long)latency, (long long)adjustment);
++    active = 1;
++    return 4 * refresh + adjustment;
++}
++
++
+ static DWORD WINAPI vsync_main(void *p) {
+     (void)p;
+     const int64_t period = 1000000000LL / fps_max();
+     int64_t next = hos_now_ns() + period;
++    const int phase_enabled = env_on("HOS_VSYNC_LOCK") && fps_max() == 60;
++    unsigned tick = 0;
++    unsigned trace_tick = 0;
++    const char* trace_path = getenv("JINRA_VSYNC_TRACE");
++    FILE* trace = trace_path && *trace_path ? fopen(trace_path, "w") : NULL;
++    if (trace) {
++        setvbuf(trace, NULL, _IOFBF, 64 * 1024);
++        fputs("tick,due_ns,signal_start_ns,signal_end_ns,count\n", trace);
++    }
+     for (;;) {
++        const int64_t due = next;
+         const int64_t now = hos_now_ns();
+         if (next > now) hos_sleep_ns(next - now);
+-        next += period;
++        int64_t next_period = period;
++        if (phase_enabled) next_period = display_vsync_period(period, tick++);
++        next += next_period;
+         if (next < hos_now_ns()) next = hos_now_ns() + period;   /* (fell behind: no burst of vsyncs) */
+-        for (LONG i = 0; i < nvsync; i++) hos_system_event_signal(vsync_events[i]);
++        const int64_t signal_start = trace ? hos_now_ns() : 0;
++        const LONG events = nvsync;
++        for (LONG i = 0; i < events; i++) hos_system_event_signal(vsync_events[i]);
++        if (trace) {
++            const int64_t signal_end = hos_now_ns();
++            fprintf(trace, "%u,%lld,%lld,%lld,%ld\n", ++trace_tick,
++                    (long long)due, (long long)signal_start, (long long)signal_end, (long)events);
++            if (trace_tick % 120 == 0) fflush(trace);
++        }
+     }
+     return 0;
+ }
+@@ -171,12 +231,25 @@
+         until = frame >= 0 && frame < n ? shown_at[frame & 15] : 0;
+     }
+     const int64_t now = hos_now_ns();
++    static FILE* trace;
++    static int looked;
++    if (!looked) {
++        looked = 1;
++        const char* path = getenv("JINRA_ACQUIRE_TRACE");
++        if (path) trace = fopen(path, "w");
++        if (trace) {
++            setvbuf(trace, NULL, _IOFBF, 64 * 1024);
++            fputs("frame,begin_ns,ready_ns,deadline_ns,images\n", trace);
++        }
++    }
+     if (until > now) {
+         extern volatile int64_t hos_acquire_slept_ns;   /* (host/hos_thread.c: the FPS counter's Breakdown, its pacing) */
+         extern volatile int hos_fps_timing;
+         hos_sleep_ns(until - now);
+         if (hos_fps_timing) InterlockedAdd64(&hos_acquire_slept_ns, hos_now_ns() - now);
+     }
++    if (trace) fprintf(trace, "%lld,%lld,%lld,%lld,%d\n", (long long)shown_count,
++                       (long long)now, (long long)hos_now_ns(), (long long)until, active);
+ }
+ /* (mkw-recomp) MKW's frame pacer (0x806bcbb0, x19 when it sets the interval: nvn_native.c): its measured frame time
+    (+0x128, ticks), its running excess (+0x218) and interval (+0x214), logged with the frame rate */
+@@ -474,14 +547,17 @@
+         }
+         if (file) {
+             setvbuf(file, buffer, _IOFBF, sizeof buffer);
+-            fputs("frame,return_ns,interval_ns,present_begin_ns,renderer_begin_ns,renderer_end_ns,vcore_back_ns\n", file);
++            fputs("frame,return_ns,interval_ns,present_begin_ns,renderer_begin_ns,renderer_end_ns,vcore_back_ns,display_chain,display_id,display_seq\n", file);
+             flushed = now;
+         }
+     }
+     if (!file) return;
+-    fprintf(file, "%lld,%lld,%lld,%lld,%lld,%lld,%lld\n", (long long)frame, (long long)now,
++    uint64_t chain = 0, id = 0, seq = 0;
++    display_present_tag(&chain, &id, &seq);
++    fprintf(file, "%lld,%lld,%lld,%lld,%lld,%lld,%lld,%llu,%llu,%llu\n", (long long)frame, (long long)now,
+             (long long)(frame > 1 ? now - last : 0), (long long)phases[0], (long long)phases[1],
+-            (long long)phases[2], (long long)phases[3]);
++            (long long)phases[2], (long long)phases[3],
++            (unsigned long long)chain, (unsigned long long)id, (unsigned long long)seq);
+     last = now;
+     if (now - flushed >= 1000000000LL) {
+         fflush(file);
+@@ -507,6 +583,10 @@
+     }
+     const int64_t n = InterlockedIncrement64(&presents);
+     present_trace(n, now, phases);
++    if (jinra_gap_enabled) {
++        jinra_gap_note("present_return", 0, now, 0, 0, 0, 0);
++        if (n % 120 == 0) jinra_gap_flush();
++    }
+     {   /* HOS_MKW_INTERVAL=<0|1|2>: the interval MKW's pacer is held at, through its own override (+0x210, any
+            non-zero value is used as the interval): 1 (the default): a steady 60 fps; 2: 30; 0: the game's choice,
+            which with frames between 16.7 and 33 ms swings between the two (25-27 fps, stutters). Its timing counts

@@ -1,0 +1,183 @@
+--- control.c
++++ control.c
+@@ -23,6 +23,9 @@
+ 
+    tests/control_test.c builds this file with a fake game (HOS_CONTROL_NO_GAME) and drives it over a real socket. */
+ #include "control.h"
++#ifndef HOS_CONTROL_NO_GAME
++#include "jinra_gap.h"
++#endif
+ 
+ #include <ctype.h>
+ #include <errno.h>
+@@ -431,6 +434,29 @@
+         ctl_log("control: wrote %llu bytes to guest %#llx", (unsigned long long)wrote_n[i], (unsigned long long)wrote_at[i]);
+ }
+ 
++#ifndef HOS_CONTROL_NO_GAME
++static int64_t input_clock(void) {
++    extern int64_t hos_now_ns(void);
++    return hos_now_ns();
++}
++
++static void trace_control_input(int64_t frame, const int32_t stick[4]) {
++    static int looked;
++    static FILE* trace;
++    if (!looked) {
++        looked = 1;
++        const char* path = getenv("JINRA_INPUT_TRACE");
++        if (path) trace = fopen(path, "w");
++        if (trace) {
++            setvbuf(trace, NULL, _IOFBF, 64 * 1024);
++            fputs("frame,qpc_ns,rx,ry\n", trace);
++        }
++    }
++    if (trace) fprintf(trace, "%lld,%lld,%d,%d\n", (long long)frame,
++                       (long long)input_clock(), stick[2], stick[3]);
++}
++#endif
++
+ /* ---- the controller's read (nn_hid.c read_input, the game's thread) ---- */
+ int hos_control_input(uint64_t *buttons, int32_t stick[4]) {
+     if (!hos_control_on) return 0;
+@@ -451,6 +477,26 @@
+         if (in->exclusive && frame < end) exclusive = 1;
+     }
+     ctl_unlock(&G.mu);
++#ifndef HOS_CONTROL_NO_GAME
++    trace_control_input(frame, stick);
++#ifdef _WIN32
++    if (jinra_gap_enabled) jinra_gap_note("hid", 0, input_clock(), 0, 0, 0, 0);
++#endif
++#endif
++    static int timing = -1;
++    if (timing < 0) timing = getenv("HOS_JINRA_INPUT_TIMING") != NULL;
++    if (timing) {
++        static uint64_t previous;
++        const uint64_t current = (*buttons & 1u) | (stick[1] > 16384 ? 2u : 0u);
++        const uint64_t began = current & ~previous;
++        previous = current;
++        if (began) {
++            extern int64_t hos_now_ns(void);
++            extern void hos_log(const char *fmt, ...);
++            hos_log("timing hid %lld frame %lld mask %llu", (long long)hos_now_ns(), (long long)frame,
++                    (unsigned long long)began);
++        }
++    }
+     return exclusive;
+ }
+ 
+@@ -785,7 +831,18 @@
+             G.inputs[i].used = 1, G.inputs[i].group = group, G.inputs[i].exclusive = exclusive, G.inputs[i].start = -1;
+             G.inputs[i].conn = ci, G.inputs[i].conn_gen = c->gen, G.inputs[i].waited = p != NULL;
+         }
++#ifndef HOS_CONTROL_NO_GAME
++    const int64_t queued_at = free_slots >= n && n == 1 && (steps[0].stick_set & 4) && getenv("JINRA_INPUT_TRACE")
++                            ? input_clock() : 0;
++#endif
+     ctl_unlock(&G.mu);
++#ifndef HOS_CONTROL_NO_GAME
++    if (queued_at) {
++        extern void hos_log(const char* fmt, ...);
++        hos_log("pacing input queued %lld frame %lld rx %d", (long long)queued_at,
++                (long long)G.game->frame(), steps[0].stick[2]);
++    }
++#endif
+     if (free_slots < n) {
+         if (p) p->used = 0;
+         return reply_error(c, id, "busy", "too many inputs queued");
+@@ -1782,7 +1839,84 @@
+     if (d.n[req].type != J_OBJ) return reply_error(c, id, "bad_request", "a request is a JSON object");
+     const char *cmd = str_arg(&d, req, "cmd");
+     if (!cmd) return reply_error(c, id, "bad_request", "no cmd");
++    if (getenv("JINRA_PRIVATE_RESOURCE_PIPE") &&
++        strcmp(cmd, "status") && strcmp(cmd, "ram_resource_manager") &&
++        strcmp(cmd, "ram_resource_batch_begin") && strcmp(cmd, "ram_resource_batch_status"))
++        return reply_error(c, id, "forbidden", "Resource manager only");
+     if (!strcmp(cmd, "status")) cmd_status(ci, id);
++    else if (!strcmp(cmd, "ram_prepare_zora") && getenv("JINRA_TEST_ZORA_KEYS")) {
++        HMODULE renderer = GetModuleHandleW(L"jinra_vk.dll");
++        void (*prepare)(void) = renderer ? (void (*)(void))GetProcAddress(renderer, "jinra_timing_zora_open") : NULL;
++        if (!prepare) return reply_error(c, id, "renderer_unavailable", "Zora preparation export is missing");
++        prepare();
++        Buf b = {0};
++        reply_start(&b, id, 1);
++        reply_end(c, &b);
++    }
++    else if (!strcmp(cmd, "ram_resource_manager") && getenv("JINRA_TEST_RESOURCE_QUEUE")) {
++        extern uint64_t jinra_resource_manager_observed(void);
++        Buf b = {0};
++        reply_start(&b, id, 1);
++        buf_printf(&b, ",\"manager\":%llu", (unsigned long long)jinra_resource_manager_observed());
++        reply_end(c, &b);
++    }
++    else if (!strcmp(cmd, "ram_resource_observe") && getenv("JINRA_TEST_RESOURCE_CANDIDATE") &&
++             !getenv("JINRA_TEST_RESOURCE_BATCH_PATH")) {
++        extern int jinra_resource_arm_observation(uint64_t, uint64_t, int64_t, int);
++        int malformed = 0;
++        const double node = num_arg(&d, req, "node", 0, &malformed);
++        const double base = num_arg(&d, req, "base", 0, &malformed);
++        const double since = num_arg(&d, req, "since", 0, &malformed);
++        const char *mode = getenv("JINRA_TEST_RESOURCE_CANDIDATE");
++        const int native = !strcmp(mode, "control") ? 4 : !strcmp(mode, "large") ? 3 :
++                           !strcmp(mode, "selected") ? 2 : !strcmp(mode, "native");
++        if (malformed || node <= 0 || base <= 0 || node >= 0x1p39 || base >= 0x1p39 ||
++            since < 0 || since >= 0x1p62)
++            return reply_error(c, id, "bad_request", "invalid or duplicate resource observation");
++        const int armed = jinra_resource_arm_observation((uint64_t)node, (uint64_t)base, (int64_t)since, native);
++        Buf b = {0};
++        reply_start(&b, id, 1);
++        buf_printf(&b, ",\"armed\":%s", armed ? "true" : "false");
++        reply_end(c, &b);
++    }
++    else if (!strcmp(cmd, "ram_resource_selection_status") && getenv("JINRA_TEST_RESOURCE_CANDIDATE")) {
++        extern long jinra_resource_selection_status(int);
++        const long state = jinra_resource_selection_status(bool_arg(&d, req, "cancel", 0));
++        Buf b = {0};
++        reply_start(&b, id, 1);
++        buf_printf(&b, ",\"selection_state\":%ld", state);
++        reply_end(c, &b);
++    }
++    else if (!strcmp(cmd, "ram_resource_batch_begin") && getenv("JINRA_TEST_RESOURCE_BATCH_PATH")) {
++        extern int jinra_resource_arm_batch(const char *, int, int64_t, int64_t);
++        int bad = 0;
++        const double begin = num_arg(&d, req, "begin", 0, &bad);
++        const double end = num_arg(&d, req, "end", 0, &bad);
++        const int observe = bool_arg(&d, req, "observe", 0);
++        if (bad || begin < 0 || end >= 0x1p62 || end <= begin ||
++            !jinra_resource_arm_batch(getenv("JINRA_TEST_RESOURCE_BATCH_PATH"), observe, (int64_t)begin, (int64_t)end))
++            return reply_error(c, id, "failed", "resource batch was not scheduled");
++        reply_ok(c, id);
++    }
++    else if (!strcmp(cmd, "ram_resource_batch_status") && getenv("JINRA_TEST_RESOURCE_BATCH_PATH")) {
++        extern unsigned jinra_resource_batch_status(long *);
++        long state = 0;
++        const unsigned selected = jinra_resource_batch_status(&state);
++        Buf b = {0};
++        reply_start(&b, id, 1);
++        buf_printf(&b, ",\"state\":%ld,\"selected\":%u", state, selected);
++        reply_end(c, &b);
++    }
++    else if (!strcmp(cmd, "ram_checkpoint") && getenv("JINRA_TEST_IMPORT_SNAPSHOT_DIR")) {
++        const char *label = str_arg(&d, req, "label");
++        if (!label || !*label || strlen(label) > 48 ||
++            label[strspn(label, "abcdefghijklmnopqrstuvwxyz0123456789_")])
++            return reply_error(c, id, "bad_request", "invalid checkpoint label");
++        HMODULE renderer = GetModuleHandleW(L"jinra_vk.dll");
++        int (*snapshot)(const char*) = renderer ? (void*)GetProcAddress(renderer, "jinra_ram_imports_snapshot") : NULL;
++        if (!snapshot || !snapshot(label)) return reply_error(c, id, "failed", "import census failed");
++        reply_ok(c, id);
++    }
+     else if (!strcmp(cmd, "press") || !strcmp(cmd, "stick") || !strcmp(cmd, "sequence")) cmd_input(ci, &d, req, id, cmd);
+     else if (!strcmp(cmd, "release")) cmd_release(ci, &d, req, id);
+     else if (!strcmp(cmd, "saves")) cmd_saves(ci, id);
+@@ -2310,6 +2444,9 @@
+ static void game_quit(void) {   /* (as the window's close: the pipelines made since the last save kept, then out) */
+     rx_close_asked();
+     hos_log("control: exiting");
++    extern void ram_audit_finish(void);
++    ram_audit_finish();
++    jinra_gap_flush();
+     hos_log_flush();
+     ExitProcess(0);
+ }

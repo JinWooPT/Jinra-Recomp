@@ -920,6 +920,8 @@ struct Capture {
     size_t nbytes = 0;
     std::vector<uint32_t> late;      // (indices into pages: copied again by the replay once late_value is done)
     uint64_t late_value = 0;
+    std::vector<uint64_t> trial_late_parts;
+    bool trial_late_in_place = false;
 #ifdef _WIN32
     struct TracePage { uint64_t address, value, part, completed; };
     uint64_t trace_id = 0, trace_part = 0, trace_whole = 0;
@@ -2247,6 +2249,8 @@ std::unique_ptr<Capture> capture_make() {
     }
     if (!c) c = std::make_unique<Capture>();
     c->pages.clear(), c->copied.clear(), c->slots.clear(), c->nbytes = 0, c->late.clear(), c->late_value = 0;
+    c->trial_late_parts.clear();
+    c->trial_late_in_place = false;
     if (c->map) cap_buf_free(c->buffer, c->alloc, c->map, c->bsize, false, c->slice), c->buffer = VK_NULL_HANDLE, c->map = nullptr;
     stage_put(*c);
     // (only the pools mirrored in VRAM, the ones the mirrors are filled from, and only their part of the write marks:
@@ -2321,6 +2325,12 @@ std::unique_ptr<Capture> capture_make() {
                     const uint64_t pv = wb_pages.get(pages[i]);
                     if (pv > done) {
                         v = std::max(v, pv);
+                        if (trial_fast_exposure()) {
+                            const uint64_t part = wb_parts.get(pages[i]);
+                            if (!part) c->trial_late_in_place = true;
+                            else if (c->trial_late_parts.empty() || c->trial_late_parts.back() != part)
+                                c->trial_late_parts.push_back(part);
+                        }
 #ifdef _WIN32
                         if (tracing) {
                             const uint64_t part = wb_parts.get(pages[i]);
@@ -2532,6 +2542,9 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
         // RX_VK_MIRROR_MB=1024 on an 8 GB card it was most of a capture's 2.4-3 ms, six submits a frame: Hyrule Field at
         // 35-45 fps instead of 55, issue 995)
         const auto tw = std::chrono::steady_clock::now();
+        const bool part_done = trial_fast_exposure() && !c->trial_late_in_place &&
+                               trial_wait_capture_parts(c->trial_late_parts);
+        if (!part_done) {
 #ifdef _WIN32
         if (c->trace_id) {
             capture_trace::dependency(c->trace_id, c->trace_part, c->trace_whole);
@@ -2558,6 +2571,22 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
         } else
 #endif
             vk_timeline_wait(c->late_value);
+        }
+        if (trial_exposure_stats()) {
+            static std::atomic<uint64_t> count{0}, parts{0}, waited_us{0}, part_us{0};
+            const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - tw).count();
+            waited_us.fetch_add(us, std::memory_order_relaxed);
+            if (part_done) {
+                parts.fetch_add(1, std::memory_order_relaxed);
+                part_us.fetch_add(us, std::memory_order_relaxed);
+            }
+            const uint64_t total = count.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (total == 1 || total % 512 == 0)
+                logf("vk: exposure trial capture count=%llu parts=%llu waited_us=%llu part_us=%llu",
+                     (unsigned long long)total, (unsigned long long)parts.load(),
+                     (unsigned long long)waited_us.load(), (unsigned long long)part_us.load());
+        }
 #ifdef _WIN32
         if (arrival_take) gpu_wait_end = capture_trace::qpc();
 #endif
@@ -2994,6 +3023,44 @@ void note_copied_window(uint64_t guest, uint64_t size, uint64_t owner, uint64_t 
     }
 }
 
+
+// Import adjacent Market render-target ranges within one existing guest allocation.
+constexpr uint64_t market_colour_offset = 0x5460e00ull;
+constexpr uint64_t market_resolve_offset = 0x36d8600ull;
+constexpr uint64_t market_image_bytes = 18720ull << 10;
+constexpr uint64_t market_owner_bytes = 0x2af00000ull;
+
+bool market_import_candidate(const GuestPool& owner, uint64_t guest, uint64_t size,
+                             uint64_t chunk, const char* kind, uint64_t& first, uint64_t& last) {
+    static bool attempted = false;   // under pools_mu, once per process
+    if (attempted || !dev.external_memory_host || !kind ||
+        std::strcmp(kind, "market-colour") || size != market_image_bytes || chunk != (4ull << 20) ||
+        owner.hi - owner.lo != market_owner_bytes || guest - owner.lo != market_colour_offset ||
+        !preview_market_window())
+        return false;
+    const uint64_t lo = (owner.lo + market_resolve_offset) / chunk * chunk;
+    uint64_t hi = (guest + size + chunk - 1) / chunk * chunk;
+    // The earlier texture can extend into the tail of the eventual import.
+    // Use the existing mapping's endpoint instead of importing it in pieces.
+    if (const auto tail = imported.lower_bound(hi); tail != imported.begin()) {
+        hi = std::max(hi, std::prev(tail)->second.hi);
+    }
+    if (lo < owner.lo || hi > owner.hi || hi - lo > (68ull << 20) || lo % align || hi % align) return false;
+    const auto* stop = host->guest_base() + hi;
+    for (auto* ptr = host->guest_base() + lo; ptr < stop;) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(ptr, &info, sizeof info) || info.State != MEM_COMMIT || !info.Protect ||
+            (info.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return false;
+        auto* next = static_cast<uint8_t*>(info.BaseAddress) + info.RegionSize;
+        if (next <= ptr) return false;
+        ptr = next;
+    }
+    attempted = true;
+    first = lo;
+    last = hi;
+    return true;
+}
+
 Pool* pool_lookup(uint64_t guest, uint64_t size, const char* kind, uint64_t program) {
     if (guest_pools.empty()) return nullptr;
     bg_drain();
@@ -3077,9 +3144,14 @@ Pool* pool_lookup(uint64_t guest, uint64_t size, const char* kind, uint64_t prog
             }
         }
         const bool mid_owner = mid_hi > mid_lo && mid_lo % align == 0 && mid_hi % align == 0;
+        uint64_t market_lo = 0, market_hi = 0;
+        const bool prepare_market = market_import_candidate(owner, guest, size, chunk, kind, market_lo, market_hi);
         auto plan = [&](bool spanned, bool widen = false) {   // (the range, the imported pools it takes in; spanned: span_game_pools's chunks too)
             lo = want_lo, hi = std::max(want_hi, imp != imported.end() ? imp->second.hi : 0);
-            if (widen && mid_owner) {
+            if (widen && prepare_market) {
+                lo = market_lo;
+                hi = market_hi;
+            } else if (widen && mid_owner) {
                 lo = mid_lo;
                 hi = mid_hi;
             } else if (widen) {
@@ -3114,14 +3186,28 @@ Pool* pool_lookup(uint64_t guest, uint64_t size, const char* kind, uint64_t prog
         uint64_t previous_lo = 0, previous_hi = 0;
         Pool p;
         bool ok = false;
-        for (int pass = (wide_owner || mid_owner) ? 0 : 1; pass < 3 && !ok; pass++) {
+        for (int pass = (prepare_market || wide_owner || mid_owner) ? 0 : 1; pass < 3 && !ok; pass++) {
             plan(pass == 1, pass == 0);
+            if (prepare_market && pass == 0 && (lo != market_lo || hi != market_hi)) {
+                logf("vk: Market relative import deferred: overlap extends the window");
+                continue;
+            }
             if ((pass == 0 && hi - lo > block) || (lo == previous_lo && hi == previous_hi)) continue;
             previous_lo = lo;
             previous_hi = hi;
             const auto t0 = std::chrono::steady_clock::now();
             ok = import_pool(lo, hi, p);
             const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (prepare_market && pass == 0) {
+                if (ok) {
+                    logf("vk: vram transfer import bytes=%llu heap=%u local=%u", (unsigned long long)(hi - lo),
+                         p.import_heap, p.import_heap < dev.memory.memoryHeapCount &&
+                         (dev.memory.memoryHeaps[p.import_heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) ? 1u : 0u);
+                }
+                logf("vk: Market relative import %s qpc=%llu bytes=%llu offset=%llx ms=%.3f",
+                     ok ? "ready" : "failed", (unsigned long long)load_path_qpc(),
+                     (unsigned long long)(hi - lo), (unsigned long long)(lo - owner.lo), ms);
+            }
             import_count.fetch_add(1, std::memory_order_relaxed);
             import_ns.fetch_add((uint64_t)(ms * 1000000), std::memory_order_relaxed);
             static double total_ms;
@@ -3763,14 +3849,15 @@ bool memory_rb_refresh(VkCommandBuffer up) {
     return true;
 }
 
-BufferRef gpu_buffer(uint64_t gpu, uint64_t size, bool allow_import) {
+BufferRef gpu_buffer_for_image(uint64_t gpu, uint64_t size, bool allow_import, uint32_t format_tag) {
     uint64_t avail = 0;
     if (!host->gpu_ptr(gpu, &avail) || avail < size) return {};
     const uint64_t guest = host->gpu_guest(gpu);
     std::lock_guard lk(pools_mu);
     Pool* p = nullptr;
     if (allow_import) {
-        p = pool_of(guest, size, {"texture-read", diagnostic_compute_program});
+        const char* kind = format_tag == 0x25 ? "market-colour" : format_tag == 0x0a ? "market-resolve" : "texture-read";
+        p = pool_of(guest, size, {kind, diagnostic_compute_program});
     } else if (auto it = imported.upper_bound(guest); it != imported.begin()) {
         Pool& existing = std::prev(it)->second;
         if (guest < existing.hi && size <= existing.hi - guest) p = &existing;
@@ -3779,6 +3866,10 @@ BufferRef gpu_buffer(uint64_t gpu, uint64_t size, bool allow_import) {
     if (p->last_value < mem_rec_value) p->last_value = mem_rec_value;   // (in use: not given back under it, imports_give_back)
     note_in_place_read();   // (the pool itself, read by the GPU where the caller's work runs)
     return {p->buffer, guest - p->lo, size, p->address + (guest - p->lo)};
+}
+
+BufferRef gpu_buffer(uint64_t gpu, uint64_t size, bool allow_import) {
+    return gpu_buffer_for_image(gpu, size, allow_import, 0);
 }
 
 thread_local uint64_t diagnostic_compute_program = 0;
@@ -5780,6 +5871,7 @@ void diagnostic_memory_frame(uint64_t frame) {
          (unsigned long long)tex_shadow_arena.recommits());
 #endif
 }
+
 
 void memory_stats(int64_t* mirrors, uint64_t* mirror_mb, int64_t* sync_bytes, int64_t* sync_copies, int64_t* wb_bytes) {
     *mirrors = st_mirrors, *mirror_mb = mirror_bytes >> 20, *sync_bytes = st_sync_bytes, *sync_copies = st_sync_copies;

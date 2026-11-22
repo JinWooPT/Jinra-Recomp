@@ -1531,6 +1531,8 @@ MkwVkRenderer table;
 } // namespace
 } // namespace mkwvk
 
+namespace mkwvk { void compact_vram_release_stop(); }
+
 // The window is being closed (host/display.c, host/posix/display_sdl.c, before they end the process): while the
 // shaders are prepared, their workers are stopped and what they made is kept first (10 s at most: a driver can take longer on one
 // pipeline). Looked up by name, so an executable and a back end of different versions still close
@@ -1544,6 +1546,7 @@ void mkwvk_close_asked(void) {
     mkwvk::jinra_lazy_graphics_stats();
     using namespace mkwvk;
     programs_census_log("close");
+    compact_vram_release_stop();
     module_ids_flush();
     fsr4_close();             // (AMD FSR 4's tuned layers: their background builds stopped first, what they made then saved below)
     pipeline_cache_close();   // (in play: the pipelines made since the last save, kept for the next start)

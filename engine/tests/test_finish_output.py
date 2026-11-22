@@ -70,6 +70,11 @@ class FinishOutputTests(unittest.TestCase):
             (recipes / "hyrule-field.txt", "jinra-previa-ram/planicie.txt"),
             (recipes / "hyrule-field-priority.txt", "jinra_planicie_prioritarias.txt"),
             (recipes / "kakariko.txt", "jinra-previa-ram/kakariko.txt"),
+            (recipes / "market-entry.txt", "jinra_pipelines_mercado_018.txt"),
+            (recipes / "hyrule-first-turn.txt", "jinra_pipelines_hyrule_018.txt"),
+            (recipes / "hyrule-late-turn.txt", "jinra_pipelines_hyrule_tarde_018.txt"),
+            (recipes / "windows-memory-profile.flag", ".jinra-previa-memoria"),
+            (recipes / "market-exit-compaction.flag", "jinra-compactar-vram.flag"),
         ]
         for source, _ in self.profile_files:
             source.write_text("synthetic fixture: " + source.name, encoding="utf-8")

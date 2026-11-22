@@ -5,13 +5,16 @@
 #define VMA_STATIC_VULKAN_FUNCTIONS 0
 #define VMA_DYNAMIC_VULKAN_FUNCTIONS 1
 #include "vk_internal.h"
-#include <vk_mem_alloc.h>
+#include "vk_mem_alloc_jinra.h"
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <vector>
 #include <cstring>
 #include <mutex>
+#include <condition_variable>
+#include <deque>
+#include <thread>
 #include <unordered_map>
 #ifdef _WIN32
 #include <windows.h>
@@ -177,6 +180,110 @@ void observe_vma_mappings(VmaVulkanFunctions& functions) {
 } // namespace
 #endif
 
+namespace {
+thread_local bool ending_texture_compaction;
+bool defer_compact_release;
+
+struct EmptyVramBlock {
+    VkDevice device;
+    VkDeviceMemory memory;
+    uint64_t ready;
+};
+
+void release_empty_vram(EmptyVramBlock block, const char* path,
+                        const VkAllocationCallbacks* callbacks = nullptr) {
+    const uint64_t begin = load_path_qpc();
+    (::vkx::vkFreeMemory)(block.device, block.memory, callbacks);
+    logf("vk: compact block release path=%s ready=%llu begin=%llu end=%llu",
+         path, static_cast<unsigned long long>(block.ready), static_cast<unsigned long long>(begin),
+         static_cast<unsigned long long>(load_path_qpc()));
+}
+
+class CompactReleaseWorker {
+    std::mutex mutex;
+    std::condition_variable available;
+    std::deque<EmptyVramBlock> pending;
+    std::thread worker;
+    bool active = false;
+    bool closing = false;
+
+    void run() {
+        std::unique_lock lock(mutex);
+        for (;;) {
+            available.wait(lock, [&] { return closing || !pending.empty(); });
+            if (pending.empty()) return;
+            const EmptyVramBlock block = pending.front();
+            pending.pop_front();
+            active = true;
+            lock.unlock();
+            release_empty_vram(block, "worker");
+            lock.lock();
+            active = false;
+        }
+    }
+
+public:
+    bool enqueue(EmptyVramBlock block) {
+        std::lock_guard lock(mutex);
+        // Limit the memory still counted by the driver after VMA has returned it.
+        if (closing || pending.size() + static_cast<size_t>(active) >= 2) return false;
+        try {
+            if (!worker.joinable()) worker = std::thread([this] { run(); });
+            pending.push_back(block);
+        } catch (const std::exception&) {
+            return false;
+        }
+        available.notify_one();
+        return true;
+    }
+
+    bool idle_for_market_exit() {
+        std::lock_guard lock(mutex);
+        return !closing && !active && pending.empty();
+    }
+
+    void stop() {
+        {
+            std::lock_guard lock(mutex);
+            if (closing) return;
+            closing = true;
+            available.notify_one();
+        }
+        if (worker.joinable()) worker.join();
+    }
+};
+
+// The game owns the Vulkan device for the life of the process. The window's
+// explicit exit drains the worker before DLL detach, outside the loader lock.
+CompactReleaseWorker& compact_worker() {
+    static auto* const state = new CompactReleaseWorker;
+    return *state;
+}
+
+VKAPI_ATTR void VKAPI_CALL compact_free(VkDevice device, VkDeviceMemory memory,
+                                       const VkAllocationCallbacks* callbacks) {
+    if (!ending_texture_compaction) {
+        (::vkx::vkFreeMemory)(device, memory, callbacks);
+        return;
+    }
+    // The render thread has waited for the texture copies and destroyed the
+    // old images before finishing the pass. The callback contains an empty block.
+    const EmptyVramBlock block{device, memory, load_path_qpc()};
+    if (defer_compact_release && !callbacks && compact_worker().enqueue(block)) return;
+    release_empty_vram(block, defer_compact_release ? "fallback" : "render", callbacks);
+}
+
+struct CompactFreeScope {
+    bool previous = ending_texture_compaction;
+    CompactFreeScope() { ending_texture_compaction = true; }
+    ~CompactFreeScope() { ending_texture_compaction = previous; }
+};
+} // namespace
+
+void compact_vram_release_stop() {
+    if (defer_compact_release) compact_worker().stop();
+}
+
 bool vma_init(PFN_vkGetInstanceProcAddr gipa) {
     VmaVulkanFunctions f{};
     f.vkGetInstanceProcAddr = gipa;
@@ -188,6 +295,10 @@ bool vma_init(PFN_vkGetInstanceProcAddr gipa) {
 #ifdef _WIN32
     observe_vma_mappings(f);
 #endif
+    if (!f.vkFreeMemory && memory_preview_enabled() && !getenv("RX_VK_RECORDER")) {
+        defer_compact_release = true;
+        f.vkFreeMemory = compact_free;
+    }
     VmaAllocatorCreateInfo ci{};
     ci.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT |
                (dev.memory_budget ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0);
@@ -216,6 +327,8 @@ const uint64_t kImageBlock = (getenv("RX_VK_IMAGE_BLOCK_MB") ? (uint64_t)std::ma
 // image made there then took 30-70 ms (RTX 5070). RX_VK_TARGET_BLOCKS=0: in the textures' blocks, as before
 VmaPool target_image_pool = VK_NULL_HANDLE;
 VmaPool small_target_image_pool = VK_NULL_HANDLE;
+std::atomic<VmaPool> grouped_target_image_pool{};
+std::atomic<uint64_t> grouped_target_last_allocation{};
 uint32_t target_memory_type;
 bool target_pool_tried = false;
 VmaPool images_pool();
@@ -241,6 +354,17 @@ VmaPool target_images_pool() {
     pi.blockSize = kImageBlock;
     if (vmaCreatePool(vma, &pi, &target_image_pool) != VK_SUCCESS) target_image_pool = VK_NULL_HANDLE;
     if (census_prefix && target_image_pool) vmaSetPoolName(vma, target_image_pool, "render-targets");
+    if (target_image_pool && memory_preview_enabled()) {
+        VmaPoolCreateInfo transient = pi;
+        transient.blockSize = 128ull << 20;
+        transient.maxBlockCount = 2;
+        VmaPool group = VK_NULL_HANDLE;
+        if (vmaCreatePool(vma, &transient, &group) == VK_SUCCESS) {
+            grouped_target_image_pool.store(group, std::memory_order_release);
+            if (census_prefix) vmaSetPoolName(vma, group, "render-targets-transient");
+            logf("vk: Jinra grupo de alvos temporários: 2 blocos de 128 MiB");
+        }
+    }
     if (target_image_pool && env_on("RX_VK_RT_SMALL_POOL")) {
         pi.blockSize = 16ull << 20;
         if (vmaCreatePool(vma, &pi, &small_target_image_pool) == VK_SUCCESS) {
@@ -345,7 +469,7 @@ VmaDefragmentationPassMoveInfo compact_pass{};
 bool compact_in_pass = false;
 bool compact_over(uint64_t* freed_bytes, uint32_t* freed_blocks) {
     VmaDefragmentationStats st{};
-    vmaEndDefragmentation(vma, compact_ctx, &st);
+    { CompactFreeScope scope; vmaEndDefragmentation(vma, compact_ctx, &st); }
     compact_ctx = VK_NULL_HANDLE;
     if (freed_bytes) *freed_bytes = st.bytesFreed;
     if (freed_blocks) *freed_blocks = st.deviceMemoryBlocksFreed;
@@ -381,11 +505,13 @@ void image_compact_ignore(size_t i) {
 bool image_compact_pass_end(uint64_t* freed_bytes, uint32_t* freed_blocks) {
     if (!compact_ctx || !compact_in_pass) return false;
     compact_in_pass = false;
-    if (vmaEndDefragmentationPass(vma, compact_ctx, &compact_pass) == VK_INCOMPLETE) return true;
+    VkResult status;
+    { CompactFreeScope scope; status = vmaEndDefragmentationPass(vma, compact_ctx, &compact_pass); }
+    if (status == VK_INCOMPLETE) return true;
     return compact_over(freed_bytes, freed_blocks);
 }
 
-bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated, bool target, bool textures) {
+bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated, bool target, bool textures, bool grouped_target) {
     VmaAllocationCreateInfo ai{};
     ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
     // (in VRAM or not at all: an image VMA puts in system memory when VRAM is full is read over PCIe every frame,
@@ -427,6 +553,19 @@ bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& al
                 }
             }
         }
+        if (grouped_target && pool == target_image_pool) {
+            if (VmaPool group = grouped_target_image_pool.load(std::memory_order_acquire)) {
+                pai.pool = group;
+                if (census_prefix) device_image_pool = "render-targets-transient";
+                const VkResult result = vmaCreateImage(vma, &ci, &pai, &image, &allocation, nullptr);
+                device_image_pool = nullptr;
+                if (result == VK_SUCCESS) {
+                    grouped_target_last_allocation.store(GetTickCount64(), std::memory_order_relaxed);
+                    return true;
+                }
+                pai.pool = pool;
+            }
+        }
         if (census_prefix) {
             device_image_pool = pool == target_image_pool ? "render-targets" : pool == texture_pool ? "textures" : "images";
         }
@@ -453,8 +592,31 @@ bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& al
     return true;
 }
 void destroy_image(VkImage image, VmaAllocation allocation) {
+    const VmaPool group = grouped_target_image_pool.load(std::memory_order_relaxed);
+    if (group && allocation && allocation->GetParentPool() == group) {
+        const CompactFreeScope scope;
+        vmaDestroyImage(vma, image, allocation);
+        return;
+    }
     vmaDestroyImage(vma, image, allocation);
 }
+
+bool release_idle_render_target_block(uint64_t now) {
+    if (!defer_compact_release || !compact_worker().idle_for_market_exit()) return false;
+    const VmaPool group = grouped_target_image_pool.load(std::memory_order_acquire);
+    const bool group_idle = now - grouped_target_last_allocation.load(std::memory_order_relaxed) >= 1500;
+    for (VmaPool pool : {group_idle ? group : VK_NULL_HANDLE, target_image_pool, small_target_image_pool}) {
+        if (!pool) continue;
+        const CompactFreeScope scope;
+        const uint64_t bytes = pool->m_BlockVector.JinraReleaseEmptyBlock(128ull << 20);
+        if (!bytes) continue;
+        logf("vk: Jinra empty render target block qpc=%llu bytes=%llu",
+             (unsigned long long)load_path_qpc(), (unsigned long long)bytes);
+        return true;
+    }
+    return false;
+}
+
 #ifdef _WIN32
 void jinra_capture_block_log(const char* label, char status, VmaAllocation allocation, uint64_t bytes,
                              uint64_t age, uint64_t highest_fence, uint64_t completed_fence) {
@@ -629,6 +791,8 @@ void vma_log_heaps() {
                       (unsigned long long)(b[h].usage >> 20), (unsigned long long)(b[h].budget >> 20));
     logf("%s", line);
 }
+
+
 bool vram_usage(uint64_t* used, uint64_t* budget, uint64_t* block_free) {
     VmaBudget b[VK_MAX_MEMORY_HEAPS]{};
     vmaGetHeapBudgets(vma, b);

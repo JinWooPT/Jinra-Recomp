@@ -14,8 +14,8 @@ internal sealed record BuildUpdate(string Text, double? Progress = null, bool Is
 
 internal sealed class Builder
 {
-    internal const string Version = "0.1.8";
-    internal const string GameVersion = "0.1.8";
+    internal const string Version = "0.1.9";
+    internal const string GameVersion = "0.1.9";
     private const string EngineVersion = GameVersion + "-4aee236";
     private const string ExpectedBuild = "E0F3CCFAF50065AE4EA01EB5AEB13B1A";
     private static readonly JsonSerializerOptions Json = new() { PropertyNameCaseInsensitive = true };

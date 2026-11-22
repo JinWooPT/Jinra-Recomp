@@ -64,6 +64,7 @@
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
 namespace mkwvk {
+BufferRef gpu_buffer_for_image(uint64_t gpu, uint64_t size, bool allow_import, uint32_t format_tag);
 namespace {
 
 uint64_t mix(uint64_t h, uint64_t v) {
@@ -288,6 +289,41 @@ std::mutex pool_mu;
 std::unordered_map<uint64_t, std::vector<Pooled>> target_pool;   // by pool_key_of
 uint64_t pool_bytes, pool_n, st_pool_reused, st_pool_made, st_pool_destroyed;
 bool pool_pressed;   // (VRAM near what the driver allows: texture_frame's budget)
+
+// Recognize guest regions only after the normal retirement logic finds repeated
+// overwritten render targets there. A match changes allocation placement only.
+constexpr uint64_t transient_frame_mask = (1ull << 30) - 1;
+std::array<std::atomic<uint64_t>, 256> transient_target_regions{};
+std::atomic<bool> use_transient_targets{false};
+
+std::atomic<uint64_t>& transient_region_slot(uint64_t region) {
+    return transient_target_regions[(region ^ (region >> 8)) % transient_target_regions.size()];
+}
+
+bool transient_target_shape(const Texture& tex) {
+    return tex.pool_key && tex.type == VK_IMAGE_TYPE_2D && tex.levels == 1 &&
+           tex.layers == 1 && tex.samples == VK_SAMPLE_COUNT_1_BIT;
+}
+
+void note_transient_target(const Texture& tex) {
+    if (!use_transient_targets.load(std::memory_order_relaxed) || !transient_target_shape(tex)) return;
+    const uint64_t region = tex.gpu >> 24;
+    auto& slot = transient_region_slot(region);
+    const uint64_t old = slot.load(std::memory_order_relaxed);
+    const uint64_t count = (old >> 32) == region ? std::min<uint64_t>((old & 3) + 1, 3) : 1;
+    slot.store((region << 32) | ((frame_no & transient_frame_mask) << 2) | count,
+               std::memory_order_relaxed);
+}
+
+bool target_in_transient_region(const Texture& tex) {
+    if (!use_transient_targets.load(std::memory_order_relaxed) || !transient_target_shape(tex)) return false;
+    const uint64_t region = tex.gpu >> 24;
+    const uint64_t seen = transient_region_slot(region).load(std::memory_order_relaxed);
+    const uint64_t age = (frame_no - ((seen >> 2) & transient_frame_mask)) & transient_frame_mask;
+    return (seen >> 32) == region && (seen & 3) >= 3 && age <= 10000;
+}
+
+
 bool compact_on() {   // (the textures in a pool of their own, compacted: compact_step. On unless RX_VK_COMPACT=0)
     static const bool v = vram_compact::enabled(getenv("RX_VK_COMPACT"));
     return v;
@@ -449,6 +485,29 @@ struct Staging {
     VmaAllocation allocation = nullptr;
 };
 uint64_t completed_value = 0;
+
+uint64_t completed_target_recording = 0;
+uint64_t st_retired_target_reused = 0;
+
+bool take_completed_target(uint64_t key, VkImage& image, VmaAllocation& allocation,
+                           std::unordered_map<uint64_t, VkImageView>& views) {
+    if (par_active.load(std::memory_order_relaxed)) return false;
+    // The same compatibility key as the ordinary pool, with no wait for the GPU.
+    const auto count = std::min<size_t>(dead.size(), 96);
+    for (auto it = dead.rbegin(), end = it + count; it != end; ++it) {
+        if (it->pool_key != key || !it->image || !it->allocation ||
+            it->value > completed_target_recording || it->value >= rec_value) continue;
+        image = it->image;
+        allocation = it->allocation;
+        views = std::move(it->view_map);
+        ++st_pool_reused;
+        ++st_retired_target_reused;
+        dead.erase(std::prev(it.base()));
+        return true;
+    }
+    return false;
+}
+
 // (GPU writes into guest memory by buffers: GPU address -> (end, the submission that wrote it last))
 std::map<uint64_t, std::pair<uint64_t, uint64_t>> gpu_wrote;
 std::mutex gpu_wrote_mu;
@@ -597,12 +656,41 @@ VkImageView make_view(Texture* tex, VkImageViewType type, VkFormat f, VkImageAsp
 }
 
 /// A failed allocation is not a permanent negative cache entry. At most one failing attempt per texture/frame.
+
+struct ImageCostTrace {
+    const char* kind;
+    uint32_t width, height, format;
+    LARGE_INTEGER begin;
+    ImageCostTrace(const char* name, uint32_t w, uint32_t h, uint32_t fmt)
+        : kind(name), width(w), height(h), format(fmt) {
+        QueryPerformanceCounter(&begin);
+    }
+    ~ImageCostTrace() {
+        LARGE_INTEGER end;
+        QueryPerformanceCounter(&end);
+        static const double hz = [] {
+            LARGE_INTEGER frequency;
+            QueryPerformanceFrequency(&frequency);
+            return double(frequency.QuadPart);
+        }();
+        const double ms = (end.QuadPart - begin.QuadPart) * 1000.0 / hz;
+        if (ms >= 0.15)
+            logf("vk: image-cost %s %llu %llu %u %u %u %lu %.3f", kind,
+                (unsigned long long)begin.QuadPart, (unsigned long long)end.QuadPart,
+                width, height, format, GetCurrentThreadId(), ms);
+    }
+};
+
 template<class Make>
 VkImageView cached_image_view(Texture* tex, uint64_t key, Make&& make) {
     if (auto it = tex->views.find(key); it != tex->views.end()) return it->second;
     if (tex->view_failed_frame == frame_no) return VK_NULL_HANDLE;
     VkResult result = VK_SUCCESS;
-    const VkImageView view = make(&result);
+    VkImageView view;
+    {
+        ImageCostTrace trace(tex->pool_key ? "target_view" : "texture_view", tex->width, tex->height, tex->format);
+        view = make(&result);
+    }
     if (!view && (result == VK_ERROR_OUT_OF_HOST_MEMORY || result == VK_ERROR_OUT_OF_DEVICE_MEMORY)) {
         tex->view_failed_frame = frame_no;
         return VK_NULL_HANDLE;
@@ -1227,7 +1315,9 @@ bool upload_unswizzle_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
     if (!unswizzle_ready()) return false;
     // The existing CPU upload handles textures whose backing storage has not been imported yet.
     static const bool no_import = env_on("JINRA_TEST_UNSWIZZLE_NO_IMPORT");
-    const BufferRef src = gpu_buffer(tex.gpu, total, !no_import);
+    const uint32_t format_tag = tex.width == 2880 && tex.height == 1620 && tex.layers == 1 && tex.levels == 1 &&
+        total == (18720ull << 10) && (tex.nvn_format == 0x25 || tex.nvn_format == 0x0a) ? tex.nvn_format : 0;
+    const BufferRef src = gpu_buffer_for_image(tex.gpu, total, !no_import, format_tag);
     const uint64_t align = std::max<uint64_t>(dev.props.limits.minStorageBufferOffsetAlignment, 16);
     if (!src || (src.offset % align)) return false;
     for (uint32_t level = 0; level < tex.levels; level++) {   // (every level must be possible before any is done)
@@ -2195,6 +2285,13 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
     x.create_flags = ci.flags;
     // (RX_VK_COMPACT) an image that is not a render target's: from the textures' own pool, the one compacted
     const bool in_textures = compact_on() && !x.sparse && !(as_target && !is_bc(x.format) && !is_astc(x.format));
+    const auto allocate_image = [&](bool prefer_large = false, bool texture_pool = false) {
+        const char* kind = !as_target ? "texture_image"
+            : (ci.usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) ? "depth_image" : "target_image";
+        ImageCostTrace trace(kind, ci.extent.width, ci.extent.height, ci.format);
+        return create_image(ci, x.image, x.allocation, false, prefer_large, texture_pool,
+                            prefer_large && target_in_transient_region(x));
+    };
     if (x.sparse) {
         ci.flags |= VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT;
         bool ok = vkCreateImage(dev.device, &ci, nullptr, &x.image) == VK_SUCCESS;
@@ -2229,10 +2326,12 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
              x.sparse_req.formatProperties.imageGranularity.width, x.sparse_req.formatProperties.imageGranularity.height,
              x.sparse_req.imageMipTailFirstLod, (unsigned long long)(x.sparse_req.imageMipTailSize >> 10),
              x.sparse_req.formatProperties.flags & VK_SPARSE_IMAGE_FORMAT_SINGLE_MIPTAIL_BIT ? ", one for all layers" : " a layer");
-    } else if (in_textures && create_image(ci, x.image, x.allocation, false, false, true)) {
+    } else if (in_textures && allocate_image(false, true)) {
         // (made in the textures' pool; one refused there is made as any other, below)
-    } else if (!(pool_key && pool_take(pool_key, x.image, x.allocation, x.views)) && (st_pool_made += pool_key != 0, true) &&
-               !create_image(ci, x.image, x.allocation, false, as_target && !is_bc(x.format) && !is_astc(x.format)) &&
+    } else if (!(pool_key && (pool_take(pool_key, x.image, x.allocation, x.views) ||
+                              (target_in_transient_region(x) &&
+                               take_completed_target(pool_key, x.image, x.allocation, x.views)))) && (st_pool_made += pool_key != 0, true) &&
+               !allocate_image(as_target && !is_bc(x.format) && !is_astc(x.format)) &&
                // (a compressed image refused: made again without its raw attachment usage, then without its raw storage
                // usage, as #1332 does; its raw views are then not made, as before)
                !((ci.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) && is_bc(x.format) &&
@@ -4000,6 +4099,31 @@ struct Compact {
     bool pressed = false;
 } compact;
 const Texture* present_source = nullptr;   // (what the present shows this frame: do_present holds its image and view)
+
+bool market_exit_compaction_started = false;
+bool preview_compaction_has_started() { return market_exit_compaction_started; }
+
+bool market_exit_compaction_loading_now();
+bool market_exit_compaction_window(uint64_t frame) {
+    return market_exit_compaction_loading_now() && !market_exit_compaction_started && frame % 12 == 0;
+}
+
+
+void market_exit_compaction_finished() {
+    static bool logged = false;
+    if (!market_exit_compaction_started || logged) return;
+    logged = true;
+    logf("vk: Market exit compaction finished qpc=%llu passes=%llu moved=%llu",
+         (unsigned long long)load_path_qpc(), (unsigned long long)compact.passes,
+         (unsigned long long)compact.moved);
+}
+
+
+bool market_exit_compaction_loading_now() {
+    static const bool enabled = GetFileAttributesW(L"jinra-compactar-vram.flag") != INVALID_FILE_ATTRIBUTES;
+    return enabled && preview_market_exit_window();
+}
+
 void compact_step(uint64_t completed) {
     if (!compact_on()) return;
     if (compact.in_pass) {
@@ -4017,19 +4141,34 @@ void compact_step(uint64_t completed) {
                  (unsigned long long)(compact.moved_bytes >> 20), (unsigned long long)compact.passes,
                  (unsigned long long)compact.ignored, blocks, (unsigned long long)(freed >> 20),
                  (unsigned long long)(compact.all_freed >> 20));
+            market_exit_compaction_finished();
             compact.next_check = frame_no + vram_compact::rest(compact.pressed);
         }
         return;   // (the images the GPU is done with are freed now, before the next pass opens)
     }
     if (!image_compact_active()) {
-        if (frame_no < compact.next_check) return;
-        compact.next_check = frame_no + 120;
+        const bool in_market_exit = market_exit_compaction_window(frame_no);
+        const bool early = frame_no < compact.next_check;
+        if (early && !in_market_exit) return;
+        if (!early) compact.next_check = frame_no + 120;
         static const uint64_t min_free = (uint64_t)(getenv("RX_VK_COMPACT_MB") ? std::max(1, atoi(getenv("RX_VK_COMPACT_MB"))) : 512) << 20;
         uint64_t block_bytes = 0, free_bytes = 0, kept = 0;   // (kept: the blocks made at the start, which no run gives back)
         if (!textures_pool_usage(&block_bytes, &free_bytes, &kept) ||
             vram_compact::returnable(block_bytes, free_bytes, kept) < vram_compact::run_from(min_free, compact.pressed))
             return;
-        if (!image_compact_begin(64ull << 20, 12)) return;
+        const bool tracked_loading = !market_exit_compaction_started && market_exit_compaction_loading_now();
+        const bool small = tracked_loading;
+        const uint64_t pass_bytes = (small ? 32ull : 64ull) << 20;
+        const uint32_t pass_moves = small ? 6 : 12;
+        if (!image_compact_begin(pass_bytes, pass_moves)) return;
+        if (tracked_loading) {
+            market_exit_compaction_started = true;
+            logf("vk: Market exit compaction limits qpc=%llu bytes=%llu textures=%u",
+                 (unsigned long long)load_path_qpc(), (unsigned long long)pass_bytes, pass_moves);
+            logf("vk: Market exit compact qpc=%llu early=%u free=%llu blocks=%llu",
+                 (unsigned long long)load_path_qpc(), (unsigned)early,
+                 (unsigned long long)free_bytes, (unsigned long long)block_bytes);
+        }
         compact.runs++, compact.moved = compact.moved_bytes = compact.ignored = compact.passes = 0;
         logf("vk: VRAM compaction %llu begins: the textures' blocks hold %llu MB, %llu MB of it free space",
              (unsigned long long)compact.runs, (unsigned long long)(block_bytes >> 20), (unsigned long long)(free_bytes >> 20));
@@ -4044,6 +4183,7 @@ void compact_step(uint64_t completed) {
              (unsigned long long)compact.moved, (unsigned long long)(compact.moved_bytes >> 20), (unsigned long long)compact.passes,
              (unsigned long long)compact.ignored, blocks_now, (unsigned long long)(freed_now >> 20),
              (unsigned long long)(compact.all_freed >> 20));
+        market_exit_compaction_finished();
         compact.next_check = frame_no + vram_compact::rest(compact.pressed);
         return;
     }
@@ -4126,6 +4266,7 @@ void compact_step(uint64_t completed) {
                  (unsigned long long)(compact.moved_bytes >> 20), (unsigned long long)compact.passes,
                  (unsigned long long)compact.ignored, blocks, (unsigned long long)(freed >> 20),
                  (unsigned long long)(compact.all_freed >> 20));
+            market_exit_compaction_finished();
             compact.next_check = frame_no + vram_compact::rest(compact.pressed);
         }
         return;
@@ -4160,13 +4301,22 @@ uint64_t preset_texture_budget(uint64_t preset_mb, bool preset_applies, bool vra
     return integrated ? std::min(b, own) : b;
 }
 
+void texture_recording_completed(uint64_t value) {
+    completed_target_recording = value;
+}
+
 int64_t texture_readback_wait_ns() { return st_readback_wait_ns.load(std::memory_order_relaxed); }
 int64_t texture_frame_ns() { return st_texture_frame_ns.load(std::memory_order_relaxed); }
 
 void texture_frame(uint64_t completed) {
     const TraceTimer timed{st_texture_frame_ns};   // (the frame trace's tex_frame_ms)
     upload_frame_report();
-    frame_upload_ns.store(0, std::memory_order_relaxed);
+    const int64_t last_upload_ns = frame_upload_ns.exchange(0, std::memory_order_relaxed);
+    const bool steady_targets = memory_preview_enabled() && preview_hyrule_targets_ready();
+    if (!steady_targets && use_transient_targets.load(std::memory_order_relaxed)) {
+        for (auto& slot : transient_target_regions) slot.store(0, std::memory_order_relaxed);
+    }
+    use_transient_targets.store(steady_targets, std::memory_order_relaxed);
     if (const int64_t d = st_deferred_frame.exchange(0, std::memory_order_relaxed)) {
         // (the views and descriptor sets resolved to the placeholder this frame go stale, as when textures go: the next frame
         // looks those textures up again, and uploads them)
@@ -4178,6 +4328,7 @@ void texture_frame(uint64_t completed) {
     }
     completed_value = completed;
     frame_no++;
+    prepare_hyrule_turn_on_loading(frame_no);
     drawn_writeback_frame();
     {   // (staging arenas the GPU is done with, beyond 256 MB of them, and any over 64 MB: freed. A scene change stages
         // hundreds of MB to over a GB (the course maps, the terrain's ASTC arrays), and that host memory was kept)
@@ -4264,6 +4415,20 @@ void texture_frame(uint64_t completed) {
         it = dead.erase(it);
     }
     pool_trim();
+
+    // Keep the working pool during uploads and only return whole, empty blocks.
+    // Space the attempts out so recently busy pools can keep their spare blocks.
+    static uint64_t last_target_upload = 0, next_target_release = 0;
+    const uint64_t now = GetTickCount64();
+    if (!steady_targets || last_upload_ns >= 1000000) last_target_upload = now;
+    if (steady_targets && now >= next_target_release && now - last_target_upload >= 1500 &&
+        !image_compact_active()) {
+        next_target_release = now + 2000;
+        release_idle_render_target_block(now);
+    }
+    if (steady_targets && frame_no % 600 == 0)
+        logf("vk: Jinra reutilização de alvos concluídos: %llu",
+             (unsigned long long)st_retired_target_reused);
     // A budget: RX_VK_VRAM_MB of textures (default 4096), and less when the driver says the process is near what it
     // may have (other programs use the GPU too). The least recently used go first, down to 7/8 of it; nothing the
     // last 8 presents used, nothing recorded work may still read.
@@ -4746,7 +4911,11 @@ void texture_frame(uint64_t completed) {
     }
     for (const Evict& e : evict) {   // (and each one's bookkeeping and its end, as before)
         Texture* tex = e.tex;
-        if (e.shifted) n_dead++, b_dead += tex->bytes;
+        if (e.shifted) {
+            ++n_dead;
+            b_dead += tex->bytes;
+            note_transient_target(*tex);
+        }
         {   // why it goes, and whether its texels go with it (evict_reason.h). The flush above can fail: then they did
             const bool lost = evict_reason::texels_lost(tex->gpu_written, e.overwritten, e.flush && flushed_ok.count(tex));
             tally.add(evict_reason::classify(e.shifted, e.overwritten), lost, tex->bytes, tex->released);

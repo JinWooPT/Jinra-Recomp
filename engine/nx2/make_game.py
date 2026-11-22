@@ -1369,9 +1369,18 @@ def prepare_shaders(cmd, folder=None, silence=PREPARE_SILENCE):
     some GPUs, issue 711): jinra --prepare-shaders (host/hos_main.c, gpu/vk/vk_main.cpp), the same work as that first start, in
     the game's folder and environment, as the builders' Play starts it. A PC whose Vulkan can't (exit 3), a run silent for `silence` seconds (then stopped), or
     any other failure leaves the work to the first start, as before: never a failed build. Returns its exit code (None: stopped)"""
+    env = game_env()
+    working_dir = folder or os.path.dirname(cmd[0]) or None
+    if not LINUX and "__GL_SHADER_DISK_CACHE_PATH" not in env:
+        # Shader preparation skips the Windows runtime profile that selects this cache when playing.
+        profile_dir = os.path.join(os.path.abspath(working_dir or os.curdir), "jinra-previa-ram")
+        driver_cache = os.path.join(profile_dir, "driver")
+        if (os.path.isdir(driver_cache) and os.path.isfile(os.path.join(profile_dir, "planicie.txt"))
+                and os.path.isfile(os.path.join(profile_dir, "kakariko.txt"))):
+            env["__GL_SHADER_DISK_CACHE_PATH"] = driver_cache
+            env.setdefault("__GL_SHADER_DISK_CACHE", "1")
     try:
-        code = run(cmd, check=False, show=show_prepared, cwd=folder or os.path.dirname(cmd[0]) or None,
-                   base=game_env(), silence=silence)
+        code = run(cmd, check=False, show=show_prepared, cwd=working_dir, base=env, silence=silence)
     except OSError as e:
         not_prepared(str(e))
         return 1
@@ -2455,7 +2464,12 @@ def main(a=None):
         for source, relative in (("hyrule-field.txt", "jinra_planicie_pipelines.txt"),
                                  ("hyrule-field.txt", "jinra-previa-ram/planicie.txt"),
                                  ("hyrule-field-priority.txt", "jinra_planicie_prioritarias.txt"),
-                                 ("kakariko.txt", "jinra-previa-ram/kakariko.txt")):
+                                 ("kakariko.txt", "jinra-previa-ram/kakariko.txt"),
+                                 ("market-entry.txt", "jinra_pipelines_mercado_018.txt"),
+                                 ("hyrule-first-turn.txt", "jinra_pipelines_hyrule_018.txt"),
+                                 ("hyrule-late-turn.txt", "jinra_pipelines_hyrule_tarde_018.txt"),
+                                 ("windows-memory-profile.flag", ".jinra-previa-memoria"),
+                                 ("market-exit-compaction.flag", "jinra-compactar-vram.flag")):
             profile_files.append((os.path.join(plans, source), os.path.join(out, relative)))
         cache_dir = os.path.join(out, "jinra-previa-ram", "driver")
         check_cache_paths(out, [cache_dir, os.path.dirname(cache_dir)] +

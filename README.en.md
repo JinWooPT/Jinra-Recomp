@@ -13,7 +13,7 @@ Local recompilation tool for **The Legend of Zelda: Ocarina of Time** for Ninten
 
 ## Updates and saves
 
-Select **Updates** to check for the latest stable release. Jinra verifies the download size and SHA-256. If the engine changes, the launcher updates the existing installation using the extracted game files and compatible build objects. To install 0.1.8, close the game, open **Jinra-Ocarina → Updates** and apply the update to your existing game folder. This version changes the engine. The launcher rebuilds the required modules locally and reuses compatible build objects still on disk.
+Select **Updates** to check for the latest stable release. Jinra verifies the download size and SHA-256. If the engine changes, the launcher updates the existing installation using the extracted game files and compatible build objects. To install 0.1.9, close the game, open **Jinra-Ocarina → Updates** and apply the update to your existing game folder. This version changes the engine. The launcher rebuilds the required modules locally and reuses compatible build objects still on disk.
 
 In your emulator, open the Ocarina of Time save folder. In the launcher, choose **Import saves** and select the folder that directly contains `slot_00`, `slot_01`, and the other slot folders. You can select it before the first build or import into an existing installation while the game is closed. Jinra imports all valid slots, replaces matching slot numbers, and keeps the previous saves in `saves-backup`.
 

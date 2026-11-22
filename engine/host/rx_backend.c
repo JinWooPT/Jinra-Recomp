@@ -205,6 +205,12 @@ static const MkwVkHost vk_host = {
 
 static const MkwVkRenderer *vk;   /* the Vulkan back end, when it was chosen and started */
 static HMODULE vk_module;   /* (the last back end loaded: rx_close_asked) */
+typedef void (*preview_scene_fn)(unsigned, unsigned);
+static void *volatile preview_scene_callback;
+void rx_preview_scene(unsigned scene, unsigned event) {
+    const preview_scene_fn call = (preview_scene_fn)InterlockedCompareExchangePointer(&preview_scene_callback, NULL, NULL);
+    if (call) call(scene, event);
+}
 
 /* The game registers its first textures and samplers before the window's thread starts the renderer (NVN is up
    first): those calls are kept here and given to the renderer rx_start chose, in order. Without that the Vulkan back
@@ -303,6 +309,8 @@ int rx_start(void *hwnd) {
         const MkwVkRenderer *r = load_vulkan(dll);
         if (r && r->start(hwnd)) {
             vk = r;
+            InterlockedExchangePointer(&preview_scene_callback,
+                (void *)GetProcAddress(vk_module, "jinra_preview_scene"));
             hos_log("rx: renderer: Vulkan (%s)", dll);
             flush_early();
             return 1;

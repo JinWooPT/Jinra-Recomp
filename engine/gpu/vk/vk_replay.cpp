@@ -555,7 +555,9 @@ Recording& begin_recording(uint64_t value) {
     r.trace_seq = 0;
 #endif
     memory_recording_part(r.part);
-    memory_recording_value(value, completed());
+    const uint64_t gpu_completed = completed();
+    memory_recording_value(value, gpu_completed);
+    texture_recording_completed(gpu_completed);
     texture_begin_recording(r.upload, value);
     draw_begin_recording(r.slot, r.cmd, value);
     return r;
@@ -2943,6 +2945,7 @@ void invalidate(uint64_t gpu, uint64_t size) {
             }
         }
     }
+    trial_exposure_readback(gpu, size);
     // (textures the GPU wrote there: their texels into memory before the CPU reads it, as vmap_changing does. The game
     // waited for the work that wrote them; the replay is caught up first)
     {   // (RX_VK_READBACK_OFF_FILE=<path> (A/B): while that file exists, not)
@@ -3207,6 +3210,86 @@ uint32_t crc32(const uint8_t* p, size_t n, uint32_t c = 0xFFFFFFFFu) {
     return c;
 }
 } // namespace
+
+// The main timeline remains the fallback for any
+// write-back without a submitted recording or any in-place dependency.
+bool trial_wait_capture_parts(const std::vector<uint64_t>& parts) {
+    if (!rec_timeline || parts.empty() || per_queue_fences_off()) return false;
+    uint64_t sequence = 0;
+    uint64_t latest_part = 0;
+    {
+        std::lock_guard lock(rec_map_mu);
+        for (const uint64_t part : parts) {
+            const auto producer = part_rec.find(part);
+            if (producer == part_rec.end()) return false;
+            latest_part = std::max(latest_part, part);
+            sequence = std::max(sequence, producer->second);
+        }
+    }
+    if (memory_in_place_part() > latest_part) return false;
+    int ok = 0;
+    wait_rec_seq(sequence, 250000000, &ok);
+    return ok != 0;
+}
+
+namespace {
+// The CPU reads this exact range after invalidate. Remember a result only
+// when the backing memory is no longer awaiting a GPU write-back.
+std::mutex trial_exposure_mu;
+std::atomic<int64_t> trial_exposure_frame{0};
+struct TrialExposure {
+    std::array<uint32_t, 4> words{};
+    int64_t present = -1;
+    uint64_t writer = 0;
+};
+std::map<uint64_t, TrialExposure> trial_exposure_meters;
+}
+
+void trial_note_exposure_meter(uint64_t address) {
+    if (!address) return;
+    std::lock_guard lock(trial_exposure_mu);
+    if (trial_exposure_meters.size() >= 32 && !trial_exposure_meters.count(address)) {
+        trial_exposure_meters.clear();
+    }
+    const bool added = trial_exposure_meters.try_emplace(address).second;
+    if (added) logf("vk: exposure trial found meter");
+}
+
+void trial_exposure_readback(uint64_t gpu, uint64_t size) {
+    if (size != 0x1040 || !trial_exposure_stats()) return;
+    const uint64_t address = host->gpu_guest(gpu);
+    std::lock_guard lock(trial_exposure_mu);
+    const auto found = trial_exposure_meters.find(address);
+    if (found == trial_exposure_meters.end()) return;
+    TrialExposure& meter = found->second;
+    static uint64_t reads = 0, kept = 0, pending = 0, empty = 0, fresh = 0;
+    const uint64_t writer = memory_writeback_value(address, size, nullptr);
+    if (!writer || writer > completed()) {
+        ++pending;
+    } else {
+        std::array<uint32_t, 4> words{};
+        if (!host->gpu_read(gpu, words.data(), sizeof words)) return;
+        const bool has_samples = (words[0] | words[1] | words[2] | words[3]) != 0;
+        const int64_t now = trial_exposure_frame.load(std::memory_order_relaxed);
+        if (has_samples) {
+            meter = {words, now, writer};
+            ++fresh;
+        } else {
+            ++empty;
+            // The same finished submission still owns the range and the
+            // game cleared it after the previous read. Never race a pending
+            // write or copy the result between different meter addresses.
+            if (trial_fast_exposure() && writer == meter.writer && now >= meter.present &&
+                now - meter.present <= 1) {
+                kept += host->gpu_write(gpu, meter.words.data(), sizeof meter.words) != 0;
+            }
+        }
+    }
+    if (++reads % 512 == 0)
+        logf("vk: exposure trial reads=%llu fresh=%llu pending=%llu empty=%llu reused=%llu",
+             (unsigned long long)reads, (unsigned long long)fresh, (unsigned long long)pending,
+             (unsigned long long)empty, (unsigned long long)kept);
+}
 
 // Called while replaying, including workers joined before the next signal is issued.
 // The current logical value may already have completed before a stopped queue resumes.
@@ -3669,6 +3752,7 @@ void status_tick() {
 // Steam Deck, where MangoHud's log stays empty under gamescope. Taken once the present is handed to the swapchain
 // (present_out), or without a window (HOS_HEADLESS) once the picture's offscreen copy is submitted: a headless run wrote none)
 void frame_log_present() {
+    if (trial_exposure_stats()) trial_exposure_frame.fetch_add(1, std::memory_order_relaxed);
     static FILE* fl = getenv("RX_VK_FRAME_LOG") ? std::fopen(getenv("RX_VK_FRAME_LOG"), "w") : nullptr;
     static std::chrono::steady_clock::time_point first, prev;
     static uint64_t frames;

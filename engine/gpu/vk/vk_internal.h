@@ -2,6 +2,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdio>
 #include <array>
 #include <atomic>
 #include <mutex>
@@ -234,6 +235,32 @@ void memory_recording_value(uint64_t value, uint64_t completed);
 // mirror made): a CPU read of GPU results that returned before such a part let the game write what that part still reads
 void memory_recording_part(uint64_t part);
 uint64_t memory_in_place_part();
+// Installed Windows memory improvements, read once before rendering starts.
+inline bool memory_preview_enabled() {
+#ifdef _WIN32
+    static const bool enabled = [] {
+        auto* marker = std::fopen(".jinra-previa-memoria", "rb");
+        if (!marker) return false;
+        std::fclose(marker);
+        return true;
+    }();
+    return enabled;
+#else
+    return false;
+#endif
+}
+
+inline bool trial_fast_exposure() {
+    static const bool on = memory_preview_enabled();
+    return on;
+}
+inline bool trial_exposure_stats() {
+    static const bool on = memory_preview_enabled();
+    return on;
+}
+void trial_note_exposure_meter(uint64_t address);
+void trial_exposure_readback(uint64_t gpu, uint64_t size);
+bool trial_wait_capture_parts(const std::vector<uint64_t>& parts);
 /// RX_VK_TEX_CAPTURE (on with the capture; =0 off): the storage of a texture uploaded from guest memory joins the
 /// capture (its pool up to 256 MB, else its 2 MB regions), and what the capture took of it is kept for the uploads
 void memory_note_texture_upload(uint64_t guest, uint64_t size);
@@ -305,7 +332,10 @@ bool has_stencil(VkFormat f);
 bool vma_init(PFN_vkGetInstanceProcAddr gipa);
 /// (textures: from the textures' own pool, the one image_compact_* moves allocations in: vk_texture.cpp's compaction)
 bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated = false, bool target = false,
-                  bool textures = false);
+                  bool textures = false, bool grouped_target = false);
+bool release_idle_render_target_block(uint64_t now);
+bool preview_hyrule_targets_ready();
+void texture_recording_completed(uint64_t value);
 // the textures' pool compacted: VMA's defragmentation, a pass at a time (vk_texture.cpp's compact_step)
 struct ImageMove {
     VmaAllocation src;   // (the allocation to move: it stays the texture's, and points at the new place once the pass ends)
@@ -342,6 +372,11 @@ bool vram_usage(uint64_t* used, uint64_t* budget, uint64_t* block_free = nullptr
 bool vram_usage_now(uint64_t* used, uint64_t* budget);
 void vma_log_heaps();
 void vma_log_image_blocks();
+void market_vram_attribution(uint64_t present);
+void prepare_hyrule_turn_on_loading(uint64_t frame);
+bool preview_compaction_has_started();
+bool preview_market_window();
+bool preview_market_exit_window();
 void diagnostic_memory_census(uint64_t frame);   // (the image pools' blocks: what they hold, and their free ranges)
 PFN_vkGetInstanceProcAddr instance_proc();   // vk_main.cpp
 /// (the Insert menu's Bug report) The device the game runs on and its driver, as the issue form asks them: "NVIDIA

@@ -9,7 +9,7 @@
     <RootNamespace>JinraRecomp</RootNamespace>
     <Product>Jinra-Recomp</Product>
     <Description>Launcher e compilador local de Ocarina of Time para Windows</Description>
-    <Version>0.1.8</Version>
+    <Version>0.1.9</Version>
     <ApplicationIcon>Assets/Jinra.ico</ApplicationIcon>
     <RuntimeFrameworkVersion>10.0.12</RuntimeFrameworkVersion>
   </PropertyGroup>

@@ -1530,6 +1530,10 @@ void prewarm_scene_keys(const char* path, const char* name, std::once_flag& once
     });
 }
 void prewarm_known_scene(bool from_scene) {
+    if (!from_scene) {
+        static std::once_flag market_once;
+        prewarm_scene_keys("jinra_pipelines_mercado_018.txt", "Market first step", market_once, false);
+    }
     const char* override_path = getenv("JINRA_TEST_SCENE_KEYS");
     const bool scene_trigger = !override_path || env_on("JINRA_TEST_SCENE_TRIGGER");
     if (scene_trigger != from_scene) return;
@@ -3668,6 +3672,10 @@ bool table_track_open(int logged, int seen, int unlimited) {
     return logged < 60 && (unlimited || seen < kTableTrackLooks);
 }
 
+thread_local BufferRef trial_meter_buffer{};
+bool trial_meter_program(uint64_t key) {
+    return key == 0x435a0138b9013040ull || key == 0x592079442d7129daull;
+}
 void build_descriptors(const NvnState& s, const Program& p) {
     dw().reset();
     dw().prog = &p;
@@ -3788,6 +3796,11 @@ void build_descriptors(const NvnState& s, const Program& p) {
                 // end are whatever the constant buffer holds there, bound only when they look like a buffer
                 const bool plausible = d.count == 1 || (size && size <= (256ull << 20) && host->gpu_guest(base));
                 BufferRef b = addr && plausible ? gpu_buffer_bind(base, n, d.is_written && !bare) : BufferRef{};
+                if (trial_exposure_stats() && trial_meter_program(p.key) && d.is_written &&
+                    b.buffer && addr == base && n == 0x1040 && !(b.offset & 3)) {
+                    trial_meter_buffer = b;
+                    trial_note_exposure_meter(host->gpu_guest(addr));
+                }
                 // (AyyBeeDee20738, PR 138) a table entry's region that does not fit its pool this moment bound nothing, and the next
                 // frame bound it again: its reads flipped between the data and 0, the picture between bright and dark. Smaller,
                 // down to 1 MB, rather than nothing (and past what is bound the shaders' search now goes on to the page table)
@@ -4093,6 +4106,70 @@ std::string state_list_snapshot(bool* present) { return state_list_bytes(present
 #ifdef _WIN32
 
 void diagnostic_small_copy_loading();
+
+
+
+// The actual destination takes precedence over prefetched scene assets.
+static std::atomic<unsigned> preview_initial_asset{0}, preview_active_scene{0};
+static std::atomic<uint64_t> preview_destination{0};
+extern "C" __declspec(dllexport) void jinra_preview_scene(unsigned scene, unsigned event) {
+    if (event == 0) {
+        unsigned unobserved = 0;
+        preview_initial_asset.compare_exchange_strong(unobserved, scene, std::memory_order_relaxed);
+        return;
+    }
+    if (event == 1) {
+        preview_active_scene.store(scene, std::memory_order_relaxed);
+        return;
+    }
+    const unsigned from = preview_active_scene.load(std::memory_order_relaxed);
+    uint64_t old = preview_destination.load(std::memory_order_relaxed);
+    const uint64_t now = GetTickCount64();
+    do {
+        if ((old & 3) == scene && now - (old >> 4) <= 12000) return;
+    } while (!preview_destination.compare_exchange_weak(
+        old, (now << 4) | (from << 2) | scene, std::memory_order_relaxed));
+    if (scene != 3)
+        logf("vk: Jinra scene loading: %s", scene == 1 ? "Market_Child" : "HyruleField_Child");
+}
+
+static unsigned preview_loading_scene() {
+    const uint64_t requested = preview_destination.load(std::memory_order_relaxed);
+    if (requested && GetTickCount64() - (requested >> 4) <= 12000) return requested & 3;
+    if (preview_active_scene.load(std::memory_order_relaxed) == 0)
+        return preview_initial_asset.load(std::memory_order_relaxed);
+    return 0;
+}
+
+bool preview_hyrule_targets_ready() {
+    return preview_active_scene.load(std::memory_order_relaxed) == 2 && !preview_loading_scene();
+}
+
+bool preview_market_window() {
+    return preview_loading_scene() == 1;
+}
+
+bool preview_market_exit_window() {
+    const uint64_t state = preview_destination.load(std::memory_order_relaxed);
+    return (state & 15) == ((1 << 2) | 2) && GetTickCount64() - (state >> 4) <= 4000;
+}
+
+void prepare_hyrule_turn_on_loading(uint64_t frame) {
+    if (frame % 12 || !scene_cache_ready.load(std::memory_order_acquire)) return;
+    const unsigned loading = preview_loading_scene();
+    if (loading != 2 && (loading || preview_active_scene.load(std::memory_order_relaxed) != 2)) return;
+    static std::once_flag once;
+    prewarm_scene_keys("jinra_pipelines_hyrule_018.txt", "Hyrule first turn", once, true, false);
+
+    // Keep the original cache preparation timing. Queue these keys after the
+    // transition's early texture peak, before the player can turn the camera.
+    const uint64_t requested = preview_destination.load(std::memory_order_relaxed);
+    if ((requested & 3) == 2 &&
+        (preview_compaction_has_started() || GetTickCount64() - (requested >> 4) >= 4000)) {
+        static std::once_flag extra;
+        prewarm_scene_keys("jinra_pipelines_hyrule_tarde_018.txt", "Hyrule late keys", extra, true, false);
+    }
+}
 
 extern "C" __declspec(dllexport) void jinra_timing_scene_open() {
     diagnostic_small_copy_loading();
@@ -9788,6 +9865,7 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
     dclock.t_pipe = slow_dispatch_timing() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     end_pass(cmd);
     static const bool no_grid_patch = env_on("RX_VK_NO_GRID_PATCH");
+    trial_meter_buffer = {};
     grid_patch_want = indirect && !no_grid_patch, grid_patch_at = UINT64_MAX;
     build_descriptors(s, p);
     grid_patch_want = false;
@@ -9841,6 +9919,14 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
     if (temporal_stand_in(cmd, s, p)) return void(st_dispatches++);
     if (taau_stand_in(cmd, s, p)) return void(st_dispatches++);
     if (!p.compute_pipeline) SKIP_HERE();
+    if (trial_fast_exposure() && trial_meter_program(p.key) && trial_meter_buffer.buffer) {
+        vkCmdFillBuffer(cmd, trial_meter_buffer.buffer, trial_meter_buffer.offset, 16, 0);
+        full_barrier(cmd, "exposure meter clear");
+        static std::atomic<uint64_t> resets{0};
+        const uint64_t count = resets.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (count == 1 || count % 512 == 0)
+            logf("vk: exposure trial resets=%llu", (unsigned long long)count);
+    }
     dump_ssbos(cmd, p, "before");
     if (!p.dispatched.load(std::memory_order_relaxed)) compute_variant_note(p.key, p.variant);   // (which variant: this install's own)
     if (!p.dispatched.exchange(true, std::memory_order_relaxed)) compute_note(p.key), state_record_compute(p.key);

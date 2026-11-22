@@ -1,5 +1,5 @@
---- hos_main.c
-+++ hos_main.c
+--- a/host/hos_main.c
++++ b/host/hos_main.c
 @@ -431,6 +431,8 @@
      static const char *const prefixes[] = {"RX_", "HOS_", "JINRA_", "EDEN_", "NVN_", "SDL_"};
      int ok = 0;
@@ -9,7 +9,27 @@
      if (!ok || !strcmp(name, "HOS_ENV_FILE") || !strcmp(name, "SDL_DYNAMIC_API")) return 0;
      /* nor the libraries SDL loads by name (SDL_VULKAN_LIBRARY, SDL_OPENGL_LIBRARY, SDL_VIDEO_GL_DRIVER,
         SDL_VIDEO_EGL_DRIVER...): a bare file name is looked for beside the game and in the current folder on Windows */
-@@ -1119,6 +1121,40 @@
+@@ -902,6 +904,11 @@
+ }
+ 
+ /* (the Main sequence's "Event" test: an event is playing) */
++static void oot_preview_scene(const char *map, unsigned event) {
++    extern void rx_preview_scene(unsigned scene, unsigned event);
++    rx_preview_scene(!strcmp(map, "Market_Child") ? 1 : !strcmp(map, "HyruleField_Child") ? 2 : 3, event);
++}
++
+ static int oot_event_playing(Ctx *c) {
+     const uint64_t events = oot_singleton(c, OOT_EVENTMGR_SLOT);
+     return events && recomp_load64(c, events + 104);
+@@ -1022,6 +1029,7 @@
+                     set_bool ? "the game data manager" : "the game's Bool setter");
+         }
+     }
++    if (ok && result) oot_preview_scene(banc, 2);
+     teleport.requested_at = now;
+     teleport.check_at = now + 1500000000LL;
+     teleport.destination = index;
+@@ -1119,6 +1127,46 @@
      oot_gamedata_bool(c, 0xcea220d3u, &child);     /* Sequence_IsChildhood */
      const uint64_t events = oot_singleton(c, OOT_EVENTMGR_SLOT);
      const int flags = (events && recomp_load64(c, events + 104) ? 1 : 0) | (loading ? 2 : 0) | (child ? 4 : 0);
@@ -47,10 +67,16 @@
 +        } else preview_low_draw_samples = 0, preview_frames = 0;
 +    } else preview_low_draw_samples = 0, preview_frames = 0;
 +#endif
++    oot_preview_scene(map, 1);
++    if (flags & 3) {
++        char pending[80];
++        if (oot_gamedata_string(c, 0xee27bf71u, pending, sizeof pending) &&
++            pending[0] && strcmp(pending, map)) oot_preview_scene(pending, 2);
++    }
      AcquireSRWLockExclusive(&oot_map_lock);
      memcpy(oot_map, map, sizeof oot_map);
      oot_flags = flags;
-@@ -1290,6 +1326,15 @@
+@@ -1290,6 +1338,15 @@
      if (flying && oot_event_playing(c)) flying = 0;
      if (!flying) flying_actor = 0;
      const int64_t now = hos_now_ns();
@@ -66,7 +92,7 @@
      __atomic_store_n(&flight_player_seen, now, __ATOMIC_RELAXED);
      if (marked_actor != actor || now - last_player_tick > 2000000000LL) marked_controller = 0;
      last_player_tick = now;
-@@ -1652,7 +1697,7 @@
+@@ -1652,7 +1709,7 @@
      hos_occlusion_off = e && e[0] == '1';
      if (hos_occlusion_off) hos_log("occlusion off: the game makes no occlusion queries (JINRA_OCCLUSION_OFF=1)");
  }
@@ -75,7 +101,7 @@
     and no swap it closed before the title with no word of why, and adding swap let it play. Below that, the log says so and
     a message says it once at boot; the game starts anyway. The text, or 0 when there is enough */
  #define HOS_MEMORY_NEEDED_MB 10240ull
-@@ -1729,6 +1774,124 @@
+@@ -1729,6 +1786,124 @@
      return 0;
  }
  
@@ -200,7 +226,7 @@
  int main(int argc, char **argv) {
  #else
  static int game_main(int argc, char **argv) {
-@@ -1740,6 +1903,7 @@
+@@ -1740,6 +1915,7 @@
          hos_relaunch_keep_env();
      }
      load_jinra_env();
@@ -208,7 +234,7 @@
  #endif
      occlusion_switch();
      {
-@@ -1795,6 +1959,7 @@
+@@ -1795,6 +1971,7 @@
          }
      }
      hos_log("Jinra-Recomp %s", JINRA_VERSION);
@@ -216,7 +242,7 @@
      removed_switch_notes();
      void hos_control_start(const char *version);
      hos_control_start(JINRA_VERSION);   /* (HOS_CONTROL=<socket>: the control bridge, host/control.c) */
-@@ -1967,6 +2132,8 @@
+@@ -1967,6 +2144,8 @@
      hos_prof_start();   /* HOS_PROFILE=<seconds> */
      void hos_chain_start(void);
      hos_chain_start();  /* HOS_CHAIN=<path> */
@@ -225,7 +251,7 @@
  #ifdef _WIN32
      timeBeginPeriod(1);   /* 1 ms timer resolution: the 60 Hz vsync and the game's frame pacing sleep in short steps */
      no_power_throttling();
-@@ -2005,7 +2172,7 @@
+@@ -2005,7 +2184,7 @@
      (void)p;
      ExitProcess((UINT)game_main(game_argc, game_argv));
  }
@@ -234,7 +260,7 @@
     in OoT, vk_draw.cpp predict_run) are built into the driver's disk cache alone, not into jinra_vk_pipelines.bin, which is read in whole
     at every start. NVIDIA's cache holds 1 GiB by default and cleans itself down to that as it is written: a full preparation filled
     it to the limit (1026 MB) and the pipelines it dropped were compiled again in play. Mesa's (RADV, ANV) has the same 1 GiB default.
-@@ -2017,7 +2184,7 @@
+@@ -2017,7 +2196,7 @@
  }
  #include <errno.h>
  #include <sys/stat.h>
